@@ -1,0 +1,1 @@
+Apply over the latest HSI build after the CUDA detection patch. Restart the application/kernel. Read modules/preprocessing/README.md for selection order, the GPU-resident path (correction and lambda binning), numerical tolerance, and timing. Existing config/calibration files are preserved. Default backend is auto.

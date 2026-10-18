@@ -6,7 +6,7 @@ import sys
 import time
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from BiningTools import LambdaBinner
+from modules.spectral_processing import LambdaBinner
 # ── config ────────────────────────────────────────────────
 CTI_PATH = os.path.join(
     os.getenv("GENICAM_GENTL64_PATH", ""),

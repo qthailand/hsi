@@ -16,28 +16,67 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QScrollArea,
     QSizePolicy,
+    QFileDialog,
+    QMessageBox,
 )
 
 from config import AppConfig
-from utils.display import DisplayMapper
-from widgets.live_image_canvas import (
+from modules.live_view.mapping import DisplayMapper
+from modules.live_view.image_canvas import (
     FOCUS_ROI_DEFAULT_HEIGHT,
     FOCUS_ROI_MIN_HEIGHT,
 )
-from widgets.camera_controls import CameraControls
-from widgets.spectrum import LiveLineSpectrumWidget
-from widgets.cube_preview import RealtimeCubePreviewWidget
-from widgets.dark_frame_panel import DarkFramePanel
-from widgets.display_controls import DisplayControls
+from modules.camera.widget import CameraControls
+from modules.live_view.spectrum import LiveLineSpectrumWidget
+from modules.cube_preview.widget import RealtimeCubePreviewWidget
+from modules.dark.widget import DarkFramePanel
+from modules.acquisition.widget import CorrectionStatusDisplay
+from modules.live_view.display_controls import DisplayControls
 from widgets.sharpness_panel import SharpnessPanel
-from widgets.histogram_plot import HistogramPlot
+from modules.live_view.histogram import HistogramPlot
 from windows.image_viewer import ImageViewer
-from windows.spectrogram_viewer import SpectrogramViewer
-from modules.bsq_calibration import CalibrationWindow
+from modules.spectrogram_viewer.window import SpectrogramViewer
 
 
 class ScanWindow(QWidget):
+    snapshot_ready = pyqtSignal(object)
+    snapshot_failed = pyqtSignal(int, str)
     cube_ready = pyqtSignal(object, object)
+    calibration_requested = pyqtSignal(object, object)
+
+    def request_snapshot(self, request_id):
+        controller = getattr(self, 'controller', None)
+        worker = getattr(controller, 'preview_thread', None)
+        if worker is None or not worker.isRunning():
+            self.snapshot_failed.emit(request_id, 'Camera acquisition is not running')
+        elif controller.dark_lib.is_collecting:
+            self.snapshot_failed.emit(request_id, 'Finish dark capture before grabbing a frame')
+        else:
+            worker.request_snapshot(request_id)
+
+    def request_processed_frame(self):
+        """Ask the camera for the next preprocessed frame (before binning); it arrives in ``save_processed_frame``."""
+        controller = getattr(self, 'controller', None)
+        worker = getattr(controller, 'preview_thread', None)
+        if worker is None or not worker.isRunning():
+            QMessageBox.warning(self, 'Save Frame', 'Camera acquisition is not running')
+        elif controller.dark_lib.is_collecting:
+            QMessageBox.warning(self, 'Save Frame', 'Finish dark capture before saving a frame')
+        else:
+            worker.request_processed_frame()
+
+    def save_processed_frame(self, packet):
+        """Ask for a file name and write ``packet.image`` as an 8/16-bit PNG (values unscaled)."""
+        from modules.image import png_name, save_png
+        tags = (('dark',) if packet.dark_applied else ()) + (('smile',) if packet.stage == 'post_smile' else ())
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save preprocessed frame', png_name('scan', packet.camera_bin, tags), 'PNG (*.png)')
+        if not path:
+            return
+        try:
+            save_png(path, packet.image)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Save Frame', str(exc))
 
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -52,18 +91,21 @@ class ScanWindow(QWidget):
         
         # ── Dark frame ───────────────────────────────────────────
         self.dark_panel = DarkFramePanel()
+        self.correction_status = CorrectionStatusDisplay(self)
+        self.correction_status.dark.setFixedWidth(180)
+        self.correction_status.smile.setFixedWidth(180)
 
         # ── Stage — rotation ─────────────────────────────────────
         self.degree_per_second_spin = QDoubleSpinBox()
         self.degree_per_second_spin.setDecimals(3)
         self.degree_per_second_spin.setRange(0.001, 100.0)
-        self.degree_per_second_spin.setValue(1.0)
+        self.degree_per_second_spin.setValue(float(getattr(config, "rotation_speed_dps", 1.0)))
         self.degree_per_second_spin.setSuffix(" deg/s")
 
         self.degree_spin = QDoubleSpinBox()
         self.degree_spin.setDecimals(3)
         self.degree_spin.setRange(0.001, 360000.0)
-        self.degree_spin.setValue(10.0)
+        self.degree_spin.setValue(float(getattr(config, "rotation_degree", 10.0)))
         self.degree_spin.setSuffix(" deg")
 
         rotation_layout = QFormLayout()
@@ -77,13 +119,13 @@ class ScanWindow(QWidget):
         self.distance_mm_spin = QDoubleSpinBox()
         self.distance_mm_spin.setDecimals(3)
         self.distance_mm_spin.setRange(0.001, 100000.0)
-        self.distance_mm_spin.setValue(10.0)
+        self.distance_mm_spin.setValue(float(getattr(config, "linear_distance_mm", 10.0)))
         self.distance_mm_spin.setSuffix(" mm")
 
         self.speed_um_s_spin = QDoubleSpinBox()
         self.speed_um_s_spin.setDecimals(3)
         self.speed_um_s_spin.setRange(0.001, 1000000.0)
-        self.speed_um_s_spin.setValue(1000.0)
+        self.speed_um_s_spin.setValue(float(getattr(config, "linear_speed_um_s", 1000.0)))
         self.speed_um_s_spin.setSuffix(" um/s")
 
         linear_layout = QFormLayout()
@@ -103,6 +145,11 @@ class ScanWindow(QWidget):
         self.focus_roi_height_spin.setSuffix(" px")
 
         self.focus_roi_full_btn = QPushButton("Full Height")
+
+        self.save_frame_btn = QPushButton("Save Frame PNG…")
+        self.save_frame_btn.setToolTip(
+            "Save the next frame after the active preprocessing (dark/hot-pixel, orientation, "
+            "Smile) and before wavelength binning, as an 8/16-bit PNG")
 
         focus_roi_layout = QHBoxLayout()
         focus_roi_layout.addWidget(QLabel("Focus ROI Height"))
@@ -124,6 +171,7 @@ class ScanWindow(QWidget):
             "y": 0,
             "sharpness": 0.0,
             "temp": -999.0,
+            "camera_fps": None,
         }
 
         # ── LEFT PANEL ───────────────────────────────────────────
@@ -145,6 +193,7 @@ class ScanWindow(QWidget):
 
         left_layout.addWidget(self.display_controls)
         left_layout.addLayout(focus_roi_layout)
+        left_layout.addWidget(self.save_frame_btn)
 
         spectrum_label = QLabel("Live Spectrum (horizontal selector)")
         spectrum_label.setStyleSheet("font-size: 11px; color: gray;")
@@ -161,15 +210,28 @@ class ScanWindow(QWidget):
         controls_layout.setContentsMargins(4, 4, 4, 4)
         controls_layout.setSpacing(6)
 
+        controls_body = QHBoxLayout()
+        controls_body.setSpacing(10)
+        settings_column = QVBoxLayout()
+        settings_column.setSpacing(6)
+
         top_row = QHBoxLayout()
         top_row.addLayout(self.camera_layout)
-        top_row.addWidget(self.dark_panel)
-        controls_layout.addLayout(top_row)
+        top_row.addWidget(self.dark_panel, stretch=1)
+        settings_column.addLayout(top_row)
 
         stage_row = QHBoxLayout()
         stage_row.addWidget(self.rotation_group)
         stage_row.addWidget(self.linear_group)
-        controls_layout.addLayout(stage_row)
+        settings_column.addLayout(stage_row)
+
+        status_column = QVBoxLayout()
+        status_column.setSpacing(6)
+        status_column.addWidget(self.correction_status.dark, stretch=1)
+        status_column.addWidget(self.correction_status.smile, stretch=1)
+        controls_body.addLayout(settings_column, stretch=1)
+        controls_body.addLayout(status_column)
+        controls_layout.addLayout(controls_body)
 
         controls_layout.addStretch()
 
@@ -183,6 +245,7 @@ class ScanWindow(QWidget):
         self._pending_cube = None
         self._pending_wavelengths = None
         self._pending_spectrogram = None
+        self._pending_spectrogram_metadata = None
         self._cal_win = None  # ★ keep reference
         self._spectro_viewer = None
 
@@ -261,18 +324,21 @@ class ScanWindow(QWidget):
         self.open_cube_viewer_btn.clicked.connect(self._on_open_cube_viewer)
         self.open_calibration_btn.clicked.connect(self._on_open_calibration)
         self.open_spectrogram_btn.clicked.connect(self._on_open_spectrogram)
+        self.save_frame_btn.clicked.connect(self.request_processed_frame)
         self.controller = None
 
     # ── status bar interface ─────────────────────────────────────
 
     def status_info(self) -> str:
         s = self._status
+        cam_fps = "" if s["camera_fps"] is None else f" (cam {s['camera_fps']:.1f})"
         temp_str = ""
         if s["temp"] > -900:
             temp_str = f"  ·  \U0001f321 {s['temp']:.1f}\u00b0C"
         return (
             f"{s['state']}  ·  "
-            f"FPS {s['fps']:.1f}  ·  "
+            f"FPS {s['fps']:.1f}"
+            f"{cam_fps}  ·  "
             f"Frame {s['frame']:,}  ·  "
             f"Recorded {s['recorded']:,}  ·  "
             f"Y {s['y']}  ·  "
@@ -301,9 +367,14 @@ class ScanWindow(QWidget):
 
     # ── spectrogram ─────────────────────────────────────────────
 
-    def set_spectrogram_ready(self, spectrogram):
-        """Called after scan completes with keep_spectrogram=True."""
+    def set_spectrogram_ready(self, spectrogram, metadata=None):
+        """Called after scan completes with keep_spectrogram=True.
+
+        ``metadata`` (bin, exposure, gain, raw_inverted, m/c, ...) is stored with the data
+        when the spectrogram is saved to HDF5.
+        """
         self._pending_spectrogram = spectrogram
+        self._pending_spectrogram_metadata = metadata
         n, h, w = spectrogram.shape
         self.open_spectrogram_btn.setEnabled(True)
         self.open_spectrogram_btn.setText(
@@ -318,7 +389,7 @@ class ScanWindow(QWidget):
         if self._pending_spectrogram is None:                  
             return
         self._spectro_viewer = SpectrogramViewer()
-        self._spectro_viewer.load(self._pending_spectrogram)
+        self._spectro_viewer.load(self._pending_spectrogram, self._pending_spectrogram_metadata)
         self._spectro_viewer.show()
 
     # ── calibration ──────────────────────────────────────────────
@@ -326,14 +397,7 @@ class ScanWindow(QWidget):
     def _on_open_calibration(self):
         if self._pending_cube is None:
             return
-
-        self._cal_win = CalibrationWindow()
-        self._cal_win.load_from_memory(
-            cube_array=self._pending_cube,
-            wavelengths=self._pending_wavelengths,
-            name="ScanResult"
-        )
-        self._cal_win.show()
+        self.calibration_requested.emit(self._pending_cube, self._pending_wavelengths)
 
     # ── stage controls ───────────────────────────────────────────
 
@@ -388,6 +452,10 @@ class ScanWindow(QWidget):
     def set_fps(self, fps: float):
         self._status["fps"] = fps
 
+    def set_camera_frame_rate(self, hz: float):
+        """Camera AcquisitionFrameRate (Hz) shown next to the measured FPS."""
+        self._status["camera_fps"] = float(hz)
+
     def set_frame_index(self, index: int):
         self._status["frame"] = index
 
@@ -401,17 +469,29 @@ class ScanWindow(QWidget):
         self._status["sharpness"] = score
         self.sharpness_panel.set_value(score)
 
+    def reset_sharpness_scale(self):
+        """Forget the sharpness peak (the scores of a new gain/exposure/bin are not comparable)."""
+        self.sharpness_panel.reset()
+
     def set_temperature(self, temp_c: float):
         self._status["temp"] = temp_c
+        self.camera_controls.show_sensor_temperature(temp_c)
+        self.dark_panel.set_current_temperature(temp_c)
+
+    def stage_spins(self):
+        """The four stage scan spin boxes (rotation speed/degree, linear distance/speed)."""
+        return (self.degree_per_second_spin, self.degree_spin,
+                self.distance_mm_spin, self.speed_um_s_spin)
 
     # ── lifecycle ────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        if self.controller is not None and self.controller.cleanup() is False:
+            event.ignore()
+            return
         self.cube_preview.cleanup()
         if self._cal_win is not None:
             self._cal_win.close()
         if self._spectro_viewer is not None:                    
             self._spectro_viewer.close()
-        if self.controller is not None:
-            self.controller.cleanup()
         super().closeEvent(event)

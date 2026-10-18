@@ -5,7 +5,7 @@ import numpy as np
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QWidget, QVBoxLayout
 
-from widgets.live_image_canvas import LiveImageCanvas
+from modules.live_view.image_canvas import LiveImageCanvas
 
 
 class ImageViewer(QWidget):

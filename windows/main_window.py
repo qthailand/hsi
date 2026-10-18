@@ -1,5 +1,12 @@
 # windows/main_window.py
-"""HSI System main window with macOS-style title bar."""
+"""HSI System main window with macOS-style title bar.
+
+The window is a thin application shell: it owns the MDI area, the scan window and the
+menus, and it hosts the feature modules through :mod:`windows.integrations` (listed in
+:mod:`windows.registry`). It implements the *host* interface those integrations use
+(``config``, ``frame_exchange``, ``scan_controller``, ``open_widget``, ``grab_for``,
+``show_status``, ``warn``, ``error``, ``ensure_scan_window``, ``parent_widget``).
+"""
 
 from __future__ import annotations
 
@@ -16,19 +23,19 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QAction,
     QMenuBar,
-    QToolBar,
     QVBoxLayout
 )
-from PyQt5.QtGui import QPixmap, QColor, QIcon
+from PyQt5.QtGui import QPixmap, QColor, QIcon, QBrush
 
 
 from config import load_app_config
-from utils.cube import load_envi_cube_for_viewer
-from widgets.title_bar import IOSTitleBar
+from modules.cube_io import load_envi_cube_for_viewer
+from modules.ui_kit.title_bar import IOSTitleBar
+from modules.ui_kit import theme
 from windows.scan_window import ScanWindow
+from windows.registry import default_integrations
 from controllers.scan_controller import ScanController
-from widgets.resizable_subwindow import ResizableMdiSubWindow
-from modules.bsq_calibration import CalibrationWindow
+from modules.ui_kit.resizable_subwindow import ResizableMdiSubWindow
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +43,31 @@ _STATUS_POLL_MS = 250
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    """The application shell (see the module docstring)."""
+
+    def __init__(self, persist_settings: bool = False):
+        """Build the shell and open the scan window.
+
+        Args:
+            persist_settings: Write camera/stage settings the user changes back to
+                ``config/*.json`` for the next start. Only the application entry point
+                (``main.py``) sets it, so tests and tools never overwrite the user's settings.
+        """
         super().__init__()
+        self.persist_settings = bool(persist_settings)
 
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setWindowTitle("HSI System")
-        self.config = load_app_config("backend.json")
+        from modules.compute_runtime import initialize_compute
+        self.compute_capabilities = initialize_compute()
+        self.config = load_app_config()
+        from modules.frame_exchange import FrameExchange
+        self.frame_exchange = FrameExchange(self)
+        self.frame_exchange.capture_requested.connect(self._request_snapshot)
+
+        # Feature modules (Smile, wavelength calibration, ...): wiring lives in windows.integrations
+        self.integrations = default_integrations(self)
 
         # ── 1. actions ───────────────────────────────────────
         self.scan_action = QAction("Scan", self)
@@ -57,24 +82,25 @@ class MainWindow(QMainWindow):
         # ── 2. menubar (สร้างก่อน) ────────────────────────────
         menubar = QMenuBar(self)
         menubar.setNativeMenuBar(False)
-        menubar.setStyleSheet("""
-            QMenuBar {
-                background-color: #2b2b2b;
+        menubar.setStyleSheet(f"""
+            QMenuBar {{
+                background-color: {theme.SIDEBAR};
                 color: #e0e0e0;
                 padding: 2px 6px;
-            }
-            QMenuBar::item:selected {
-                background-color: #4a4a4a;
+            }}
+            QMenuBar::item:selected {{
+                background-color: {theme.FIELD_HOVER};
                 border-radius: 4px;
-            }
-            QMenu {
-                background-color: #2b2b2b;
+            }}
+            QMenu {{
+                background-color: {theme.SIDEBAR};
                 color: #e0e0e0;
-                border: 1px solid #555;
-            }
-            QMenu::item:selected {
-                background-color: #505050;
-            }
+                border: 1px solid {theme.BORDER};
+            }}
+            QMenu::item:selected {{
+                background-color: {theme.ACCENT};
+                color: white;
+            }}
         """)
 
         file_menu = menubar.addMenu("File")
@@ -84,16 +110,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.exit_action)
 
         modules_menu = menubar.addMenu("Modules")
-        act_open_a = QAction("Open BSQ Generator", self)
-        act_open_a.triggered.connect(self.open_module_a)
-        modules_menu.addAction(act_open_a)
-
-        # # ── 3. toolbar ───────────────────────────────────────
-        # toolbar = QToolBar("Quick Actions", self)
-        # toolbar.setMovable(False)
-        # toolbar.addAction(self.scan_action)
-        # toolbar.addAction(self.open_envi_action)
-        # self.addToolBar(toolbar)
+        for integration in self.integrations:
+            for label, callback in integration.menu_entries():
+                action = QAction(label, self)
+                action.triggered.connect(callback)
+                modules_menu.addAction(action)
 
         # ── 4. ★ ห่อ title bar + menubar ลงใน widget เดียว ★─
         self._top_container = QWidget()
@@ -106,13 +127,13 @@ class MainWindow(QMainWindow):
         _top_vbox.addWidget(menubar)          # ← menubar อยู่ใต้ title bar
 
         self.setMenuWidget(self._top_container)  # ← เซ็ตทั้งก้อน
-        # ไม่ต้องเรียก inject_menubar อีก
 
         # ── 5. MDI area ──────────────────────────────────────
         self.mdi = QMdiArea()
 
         self.mdi.setViewMode(QMdiArea.SubWindowView)  # ✅ สำคัญมาก
         self.mdi.setOption(QMdiArea.DontMaximizeSubWindowOnActivation, True)
+        self.mdi.setBackground(QBrush(QColor(theme.PAGE)))
 
         self.setCentralWidget(self.mdi)
 
@@ -122,6 +143,61 @@ class MainWindow(QMainWindow):
 
         self._create_status_timer()
         self.create_scan_window()
+
+    # ── host interface for the integrations ───────────────────────
+
+    @property
+    def scan_controller(self):
+        """The current ``ScanController``, or ``None`` while no scan window is open."""
+        return self.scan_window.controller if self.scan_window is not None else None
+
+    @property
+    def parent_widget(self) -> QWidget:
+        """Widget to use as the parent of dialogs."""
+        return self
+
+    def ensure_scan_window(self):
+        """Create the scan window if needed, or bring it forward."""
+        self.create_scan_window()
+
+    def open_widget(self, widget: QWidget, title: str, size=None) -> QMdiSubWindow:
+        """Show ``widget`` in an MDI sub-window.
+
+        Args:
+            widget: The widget to embed; the sub-window deletes it when closed.
+            title: Sub-window title.
+            size: ``(width, height)`` in pixels, or ``None`` to fill the MDI work area.
+        """
+        sub = QMdiSubWindow()
+        sub.setWidget(widget)
+        sub.setWindowTitle(title)
+        sub.setAttribute(Qt.WA_DeleteOnClose)
+        self.mdi.addSubWindow(sub)
+        sub.show()
+        if size is None:
+            sub.resize(self.mdi.size().width() - 20, self.mdi.size().height() - 20)
+        else:
+            sub.resize(*size)
+        return sub
+
+    def grab_for(self, widget) -> None:
+        """Ask the camera for one oriented frame on behalf of ``widget`` (``begin_grab``/``snapshot_failed``)."""
+        try:
+            widget.begin_grab(self.frame_exchange.request())
+        except Exception as exc:
+            widget.snapshot_failed(None, str(exc))
+
+    def show_status(self, text: str) -> None:
+        """Show a message in the status bar."""
+        self.statusBar().showMessage(text)
+
+    def warn(self, title: str, text: str) -> None:
+        """Show a warning dialog."""
+        QMessageBox.warning(self, title, text)
+
+    def error(self, title: str, text: str) -> None:
+        """Show an error dialog."""
+        QMessageBox.critical(self, title, text)
 
     # ── status bar polling ────────────────────────────────────────
 
@@ -160,9 +236,37 @@ class MainWindow(QMainWindow):
                 self.scan_window = None
                 logger.error(r)
 
+        # Re-read config/*.json so a camera changed in camera.json is used when Scan is reopened.
+        if self.scan_window is None and getattr(self, "_scan_opened_once", False):
+            try:
+                self.config = load_app_config()
+            except Exception as exc:
+                logger.exception("Cannot reload configuration")
+                QMessageBox.critical(self, "Configuration", f"Cannot reload config, keeping the previous one:\n{exc}")
+        self._scan_opened_once = True
+        logger.info("Opening scan window with camera_backend=%s", self.config.camera_backend)
+
         scan = ScanWindow(config=self.config)
-        scan.cube_ready.connect(self.create_cube_viewer)
-        scan.controller = ScanController(scan, config=self.config)
+        scan.cube_ready.connect(self._create_scan_cube_viewer)
+        from windows.integrations import RadiometricIntegration
+        for integration in self.integrations:
+            if isinstance(integration, RadiometricIntegration):
+                scan.calibration_requested.connect(integration.open_cube)
+        try:
+            scan.controller = ScanController(scan, config=self.config,
+                                             persist_settings=self.persist_settings)
+        except Exception as exc:
+            # No camera (or it failed to open): keep the main window usable, e.g. for Open ENVI.
+            logger.exception("Cannot open the camera")
+            scan.close()
+            scan.deleteLater()
+            QMessageBox.critical(self, "Camera Error", f"Cannot open the camera:\n{exc}")
+            return
+        scan.controller.preview_thread.snapshot_ready.connect(scan.snapshot_ready)
+        scan.snapshot_ready.connect(self.frame_exchange.publish)
+        scan.snapshot_failed.connect(self.frame_exchange.reject)
+        for integration in self.integrations:
+            integration.attach_scan(scan.controller)
 
         sub = ResizableMdiSubWindow()
         sub.setWidget(scan)
@@ -199,8 +303,22 @@ class MainWindow(QMainWindow):
             logger.exception("Failed to open ENVI cube: %s", e)
             QMessageBox.critical(self, "Open ENVI Failed", str(e))
 
-    def create_cube_viewer(self, cube, wavelengths=None, title=None):
-        from windows.cube_viewer import CubeViewerWindow
+    def _create_scan_cube_viewer(self, cube, wavelengths=None):
+        """Open a viewer for the cube just scanned, carrying the camera's bit depth and the scan's
+        temperatures (``ScanController.last_scan_temperatures``) to its export header."""
+        camera_bits = None
+        if self.scan_controller is not None:
+            try:
+                from modules.acquisition import camera_bit_info
+                camera_bits = camera_bit_info(self.scan_controller.backend)
+            except Exception:
+                logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
+            camera_bits = {**(camera_bits or {}), **self.scan_controller.last_scan_temperatures}
+        self.create_cube_viewer(cube, wavelengths, camera_bits=camera_bits)
+
+    def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None):
+        """Open a Cube Viewer; ``camera_bits`` (``camera_bit_info``) goes into the ENVI export header."""
+        from modules.cube_viewer.window import CubeViewerWindow
 
         mapper = None
         if self.scan_window is not None:
@@ -220,6 +338,8 @@ class MainWindow(QMainWindow):
                         'default_exposure_ms'):
                 if hasattr(self.config, key):
                     cfg[key] = getattr(self.config, key)
+        if camera_bits:
+            cfg = {**cfg, **camera_bits}
 
         try:
             viewer = CubeViewerWindow(
@@ -228,7 +348,7 @@ class MainWindow(QMainWindow):
                 resolution=self.config.resolution,
                 display_mapper=mapper,
                 config=cfg,
-                camera_bin=getattr(self.scan_window, '_camera_bin', 1),
+                camera_bin=self.scan_controller.camera_bin if self.scan_controller is not None else 1,
             )
         except Exception as e:
             QMessageBox.critical(self, "Viewer Error", str(e))
@@ -250,24 +370,18 @@ class MainWindow(QMainWindow):
         px.fill(QColor(color))
         return QIcon(px)
 
-    def open_module_a(self):
-        """สร้าง CalibrationWindow เป็น SubWindow ข้างใน MdiArea"""
-
-        # สร้าง Widget จาก Module
-        widget = CalibrationWindow()
-
-        # ห่อเป็น SubWindow
-        sub = QMdiSubWindow()
-        sub.setWidget(widget)
-        sub.setWindowTitle("BSQ Generation (ENVI Input Mode)")
-        sub.setAttribute(Qt.WA_DeleteOnClose)
-
-        self.mdi.addSubWindow(sub)
-        sub.show()
-
-        # ปรับขนาดเริ่มต้นให้เต็ม MdiArea
-        sub.resize(self.mdi.size().width() - 20, self.mdi.size().height() - 20)
+    def _request_snapshot(self, request_id):
+        if self.scan_window is None:
+            self.frame_exchange.reject(request_id, "Open Scan before grabbing a frame")
+        else:
+            self.scan_window.request_snapshot(request_id)
 
     def closeEvent(self, event):
         self.mdi.closeAllSubWindows()
+        for sub in self.mdi.subWindowList():
+            controller = getattr(sub.widget(), 'controller', None)
+            stage = getattr(controller, 'stage', None)
+            if stage is not None and stage.isRunning():
+                event.ignore()
+                return
         super().closeEvent(event)

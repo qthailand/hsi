@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 import qdarktheme
 import pyqtgraph as pg
+from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import QApplication
+from modules.ui_kit.theme import ACCENT_DARK, PLOT_BACKGROUND, PLOT_FOREGROUND, dashboard_stylesheet
 import sklearn
 import sys
 import os
@@ -22,27 +24,32 @@ logging.basicConfig(
 
 
 def _init_pyqtgraph_theme():
-    """Configure pyqtgraph defaults to match qdarktheme dark palette.
+    """Configure pyqtgraph defaults to match the dashboard card colours.
 
     Must be called before any PlotWidget is constructed.
     """
     pg.setConfigOptions(
         antialias=True,
-        background="#1a1a1a",
-        foreground="#e0e0e0",
+        background=PLOT_BACKGROUND,
+        foreground=PLOT_FOREGROUND,
     )
 
 
 def main():
+    from modules.compute_runtime import initialize_compute
+    initialize_compute()
     _init_pyqtgraph_theme()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setStyleSheet(qdarktheme.load_stylesheet("dark"))
+    app.setStyleSheet(dashboard_stylesheet(qdarktheme.load_stylesheet("dark")))
+    palette = app.palette()
+    palette.setColor(QPalette.Highlight, QColor(ACCENT_DARK))   # MDI title bars and other Fusion highlights
+    app.setPalette(palette)
 
     from windows.main_window import MainWindow
 
-    main_win = MainWindow()
+    main_win = MainWindow(persist_settings=True)   # remember camera/stage settings for the next start
     main_win.resize(1400, 900)
     main_win.show()
 

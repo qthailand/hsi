@@ -1,0 +1,13 @@
+{
+  "resolution": 2,
+  "resolution_source": "config",
+  "fwhm_step_factor": 1.0,
+  "raw_inverted": true,
+  "preprocessing_backend": "auto",
+  "profile_timing": true,
+  "rgb_target_wavelengths": [
+    645.0,
+    555.0,
+    465.0
+  ]
+}

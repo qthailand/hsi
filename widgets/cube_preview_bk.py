@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
 )
 
-from workers.cube_render import CubeRenderWorker
+from modules.cube_preview.render import CubeRenderWorker
 
 logger = logging.getLogger("HSI")
 

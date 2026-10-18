@@ -1,0 +1,20 @@
+{
+  "shape": [
+    256,
+    1024
+  ],
+  "threads": 2,
+  "repeat": 300,
+  "exact_equal": true,
+  "timing_scope": "dark + hot pixels + orientation + binning; excludes fetch, GUI, recording, smile and other diagnostics",
+  "legacy_ms": {
+    "median": 0.2875755,
+    "p95": 0.44481815,
+    "p99": 0.52565527
+  },
+  "packaged_ms": {
+    "median": 0.28728,
+    "p95": 0.49344635000000014,
+    "p99": 0.6477869799999999
+  }
+}

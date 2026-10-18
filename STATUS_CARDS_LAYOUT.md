@@ -1,0 +1,1 @@
+Apply over the status cards patch and restart HSI. Dark and Smile cards now use a separate vertical layout on the right of the camera/dark/stage controls. The left preview sidebar contains no status cards. Processing and signals are unchanged.

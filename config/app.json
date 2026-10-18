@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "sections": {
+    "camera": "camera.json",
+    "scan": "scan.json",
+    "processing": "processing.json",
+    "dark": "dark.json",
+    "smile": "smile.json"
+  },
+  "wavelength_base": "calibration/wavelength/base.json",
+  "active_wavelength": "calibration/wavelength/profile_901fd679d50f49e3b437effb4befb7f6.json"
+}

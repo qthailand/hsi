@@ -1,2 +1,6 @@
+*.pyc
+*.npz
 *.dll
-**/__pycache__/
+__pycache__/
+modules/camera/poa
+modules/camera/ximea

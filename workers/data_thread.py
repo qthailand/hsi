@@ -1,4 +1,4 @@
-from BiningTools import LambdaBinner
+from modules.spectral_processing import LambdaBinner
 import logging
 import time
 
@@ -20,6 +20,7 @@ def _rgb_band_indices(lambda_raw):
 
 class DataThread(QThread):
     completed = Signal(object, object)
+    rgb_ready = Signal(object)
     config = None
     spectrograms = None
     pixelSize = 0
@@ -32,6 +33,14 @@ class DataThread(QThread):
     def __init__(self, parent: QObject = None):
         super().__init__(parent)
         self.finished.connect(self.deleteLater)
+        # Slot lives on this QThread object (GUI-thread affinity), so the
+        # emit from run() is delivered as a queued call on the GUI thread.
+        self.rgb_ready.connect(self._apply_rgb)
+
+    def _apply_rgb(self, rgb):
+        widget = self.imageWidget
+        if widget is not None:
+            widget.setImage(rgb, autoLevels=False, levels=[0.0, 1.0])
 
     def run(self):
         try:
@@ -41,7 +50,7 @@ class DataThread(QThread):
             cc = float(self.config['c'])
             step = float(self.config['resolution'])
             self.inverted = self.config.get('raw_inverted', True)
-            binner = LambdaBinner(mm, cc, step=step, method='numba',
+            binner = LambdaBinner(mm, cc, step=step,
                                   threads=8).fit_from(self.spectrograms)
             binner.warmup()  # อุ่น JIT ครั้งเดียว (จะช่วยให้ครั้งจริงเร็วขึ้น)
             hypercube_binned, lambda_out = binner.transform_to_cube(
@@ -70,7 +79,7 @@ class DataThread(QThread):
                 _norm(hypercube_binned[i_g, :, :].T),
                 _norm(hypercube_binned[i_b, :, :].T),
             ], axis=-1)  # (scan_lines, slit_height, 3)
-            self.imageWidget.setImage(rgb, autoLevels=False, levels=[0.0, 1.0])
+            self.rgb_ready.emit(rgb)
             self.completed.emit(hypercube_binned, lambda_out.round(2))
 
         except Exception:

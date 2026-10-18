@@ -1,0 +1,9 @@
+{
+  "camera_backend": "poa",
+  "camera_id": 0,
+  "camera_index": 0,
+  "cti_path": "C:\\Program Files\\SVS-VISTEK GmbH\\SVCam Kit\\TLGigE\\bin\\sv_gev_tl_x64.cti",
+  "default_gain": 1,
+  "default_exposure_ms": 1.0,
+  "default_bin": 2
+}

@@ -33,7 +33,7 @@ def main():
     print("\n[STEP 2] Loading config...")
     try:
         from config import load_app_config
-        config = load_app_config("backend.json")
+        config = load_app_config()
         print(f"[STEP 2] OK — config loaded")
         print(f"  m={config.m}, c={config.c}, resolution={config.resolution}")
         print(f"  camera_backend={config.camera_backend}")
@@ -50,21 +50,8 @@ def main():
     backend_type = str(getattr(config, 'camera_backend', 'poa')).lower()
 
     try:
-        if backend_type == "genicam":
-            from workers.backends.genicam import GenICamBackend
-            backend = GenICamBackend(
-                camera_index=getattr(config, 'camera_index', 0),
-                gain=config.default_gain,
-                exposure_ms=config.default_exposure_ms,
-                cti_path=getattr(config, 'cti_path', None),
-                default_bin=config.default_bin,
-            )
-        else:
-            from workers.backends.poa_camera import POACameraBackend
-            backend = POACameraBackend(
-                gain=config.default_gain,
-                exposure_ms=config.default_exposure_ms,
-            )
+        from modules.camera import create_backend
+        backend = create_backend(config)
 
         print(f"[STEP 3a] Backend class: {backend.__class__.__name__}")
 
@@ -159,7 +146,7 @@ def main():
     print("\n[STEP 6] Testing DarkFrameLibrary...")
 
     try:
-        from workers import DarkFrameLibrary
+        from modules.dark import DarkFrameLibrary
         dark_lib = DarkFrameLibrary(
             folder=config.dark_frame_folder,
             n_frames=config.dark_frame_n_frames,
@@ -186,14 +173,14 @@ def main():
     print("\n[STEP 7] Testing LambdaBinner...")
 
     try:
-        from BiningTools import LambdaBinner
+        from modules.spectral_processing import LambdaBinner
 
         bin_factor = int(getattr(config, 'default_bin', 1) or 1)
         mm = float(config.m) * bin_factor
         cc = float(config.c)
         step = float(config.resolution)
 
-        binner = LambdaBinner(m=mm, c=cc, step=step, method="numba")
+        binner = LambdaBinner(m=mm, c=cc, step=step)
         test_width = backend.info.width or 804
         binner.fit(test_width)
         binner.warmup()

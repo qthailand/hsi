@@ -57,7 +57,7 @@ def apply_dark(frame: np.ndarray, dark_mean: np.ndarray | None,
 
 def create_binner(width: int, camera_bin: int, m: float, c: float,
                   resolution: float, method: str = "numba"):
-    from BiningTools import LambdaBinner
+    from modules.spectral_processing import LambdaBinner
     mm = m * camera_bin
     binner = LambdaBinner(m=mm, c=c, step=resolution, method=method)
     binner.fit(width)
@@ -69,7 +69,7 @@ def load_dark_reference(folder: str, bin_value: int,
                         exposure_ms: float, gain: float) -> tuple:
     """โหลด dark จาก DarkFrameLibrary — เหมือน ScanController"""
     try:
-        from workers import DarkFrameLibrary
+        from modules.dark import DarkFrameLibrary
         lib = DarkFrameLibrary(folder=folder, n_frames=1)
         result = lib.load(bin=bin_value, exposure=exposure_ms, gain=gain)
         if result is None:
