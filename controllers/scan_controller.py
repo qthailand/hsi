@@ -20,6 +20,13 @@ Settings:
     bin, target temperature and the stage scan values are written back to
     ``camera.json``/``scan.json`` (debounced) so the next start uses them. Start-up values
     are never written: the camera may have clamped them (e.g. a fake camera in tests).
+    A wavelength range the user set (and the worker applied) is written to this camera
+    backend's entry of ``processing.json`` ``wavelength_range_nm``.
+
+Wavelength range:
+    The worker bins (and records) only the bins inside the range; changes are applied at a
+    frame boundary in preview, refused during a scan (the control is locked), and Start Scan
+    waits for a change still being applied (the user presses Start again).
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ HISTOGRAM_UPDATE_INTERVAL_SEC = 0.25
 SETTINGS_SAVE_DELAY_MS = 1000       # write camera/stage settings once edits pause this long
 #: scan.json keys of ``ScanWindow.stage_spins()``, in the same order.
 STAGE_SETTING_KEYS = ("rotation_speed_dps", "rotation_degree", "linear_distance_mm", "linear_speed_um_s")
+#: processing.json key of the per-backend wavelength range.
+RANGE_SETTING_KEY = "wavelength_range_nm"
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +87,11 @@ class ScanController:
     _dirty_settings = frozenset()       # setting keys edited since the last save
     _scan_temps = ()
     dark_reference = None
+    _range_requested = None             # range last sent to the worker (or applied), (lo, hi) nm or None
+    _range_applied = None               # range the worker reported in use
+    _range_dirty = False                # a user edit is waiting for the worker's answer
+    _range_saved = None                 # user range the worker applied, written by _save_settings
+    _range_bands = ()                   # kept bins (k0, k1) or None, for the sharpness reset; () = none seen
 
     def __init__(self, win, config: AppConfig, persist_settings: bool = False):
         """Open the camera, wire the window and start the live preview.
@@ -121,7 +135,6 @@ class ScanController:
         self.preview_thread.saturation_ceiling_ready.connect(self._on_saturation_ceiling)
         self.preview_thread.frame_ready.connect(self.on_preview_frame)
         self.preview_thread.processed_frame_ready.connect(self.win.save_processed_frame)
-        self.preview_thread.cube_frames_ready.connect(self._on_cube_frames)
         self.preview_thread.bin_applied.connect(self._on_bin_applied)
         self.preview_thread.bin_failed.connect(self._on_bin_failed)
         self.preview_thread.params_applied.connect(self._on_params_applied)
@@ -143,6 +156,13 @@ class ScanController:
             self.preview_thread.set_wavelength_lookup(self._stored_wavelength_profile)
             # FWHM stored per setting sets the bin width when resolution_source is "fwhm".
             self.preview_thread.set_resolution_lookup(self._stored_fwhm_nm)
+        # The configured range applies from the first frame (nothing pending, nothing saved).
+        self.preview_thread.wavelength_range_applied.connect(self._on_wavelength_range_applied)
+        self.preview_thread.wavelength_range_failed.connect(self._on_wavelength_range_failed)
+        start_range = (getattr(self.config, RANGE_SETTING_KEY, None) or {}).get(self._range_backend())
+        self.preview_thread.set_wavelength_range(start_range)
+        self._range_requested = self._range_applied = self.preview_thread.wavelength_range
+        self.win.set_wavelength_range(self._range_requested)
 
         self.stage: StageThread | None = None
 
@@ -396,6 +416,8 @@ class ScanController:
         controls.exp_spin.valueChanged.connect(lambda *_: self._schedule_settings_save("default_exposure_ms"))
         for spin, key in zip(self.win.stage_spins(), STAGE_SETTING_KEYS):
             spin.valueChanged.connect(lambda *_, key=key: self._schedule_settings_save(key))
+        for edited in self.win.wavelength_range_edits():
+            edited.connect(self._on_wavelength_range_edited)
 
         self.win.focus_roi_height_spin.valueChanged.connect(
             self.on_focus_roi_height_changed
@@ -470,12 +492,16 @@ class ScanController:
 
         if state == self.PREVIEW:
             self.viewer.set_scanning_ui(False)
+            self.win.set_scanning(False)
             self.win.set_bin_enabled(True)
+            self.win.set_wavelength_range_enabled(True)
             self.win.dark_panel.set_interactive(True)
 
         elif state == self.SCANNING:
             self.viewer.set_scanning_ui(True)
+            self.win.set_scanning(True)          # camera/stage settings locked and folded away
             self.win.set_bin_enabled(False)
+            self.win.set_wavelength_range_enabled(False)
             self.win.dark_panel.set_interactive(False)
             if self.enable_cube_preview:
                 self.win.cube_preview.reset()
@@ -495,7 +521,9 @@ class ScanController:
 
         elif state == self.ERROR:
             self.viewer.set_scanning_ui(False)
+            self.win.set_scanning(False)
             self.win.set_bin_enabled(True)
+            self.win.set_wavelength_range_enabled(True)
             self.win.dark_panel.set_interactive(True)
 
     # ══════════════════════════════════════════════════════════════
@@ -600,10 +628,15 @@ class ScanController:
     # ══════════════════════════════════════════════════════════════
 
     def _poll_temperature(self, now: float):
-        """Read the sensor temperature every ``_temp_interval`` s (GUI thread)."""
+        """Read the sensor temperature and cooler state every ``_temp_interval`` s (GUI thread)."""
         if now - self._last_temp_update < self._temp_interval:
             return
         self._last_temp_update = now
+        try:
+            state = self.backend.cooling_state()
+        except Exception:
+            state = None
+        self.win.camera_controls.set_cooling_state(state)
         try:
             self._last_temp = self.backend.get_temperature()
         except Exception:
@@ -702,21 +735,35 @@ class ScanController:
         dirty, self._dirty_settings = self._dirty_settings, frozenset()
         if store is None or self.backend is None or not dirty:
             return
-        values = {key: self._current_setting(key) for key in dirty}
+        save_range = RANGE_SETTING_KEY in dirty
+        values = {key: self._current_setting(key) for key in dirty - {RANGE_SETTING_KEY}}
         values = {key: value for key, value in values.items() if value is not None}
         camera = {k: v for k, v in values.items() if k not in STAGE_SETTING_KEYS}
         scan = {k: v for k, v in values.items() if k in STAGE_SETTING_KEYS}
+        backend, saved = self._range_backend(), self._range_saved
         try:
             if camera:
                 store.update_section("camera", camera)
             if scan:
                 store.update_section("scan", scan)
+            if save_range:
+                # Only this camera's entry: the file keeps the other backends' ranges.
+                store.update_section_entry("processing", RANGE_SETTING_KEY, backend,
+                                           None if saved is None else [float(saved[0]), float(saved[1])])
         except Exception as e:
             logger.exception("Could not save camera/stage settings: %s", e)
             return
+        if save_range:
+            ranges = dict(getattr(self.config, RANGE_SETTING_KEY, None) or {})
+            ranges.pop(backend, None)
+            if saved is not None:
+                ranges[backend] = tuple(saved)
+            self.config.wavelength_range_nm = ranges
+            values[RANGE_SETTING_KEY] = {backend: saved}
         logger.info("Settings saved for the next start: %s", values)
         for key, value in values.items():
-            setattr(self.config, key, value)
+            if key != RANGE_SETTING_KEY:
+                setattr(self.config, key, value)
 
     def _refresh_dark_reference(self, collecting_message: str):
         """Look up the stored dark for the current bin/exposure/gain automatically.
@@ -828,6 +875,65 @@ class ScanController:
             self.win.dark_panel.set_error("Switching bin…")
         except Exception as e:
             logger.exception("Failed to request bin change: %s", e)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Wavelength range
+    # ══════════════════════════════════════════════════════════════
+
+    def _range_backend(self) -> str:
+        """Key of this camera in the per-backend ``wavelength_range_nm`` setting."""
+        return str(self.config.camera_backend).lower()
+
+    def _on_wavelength_range_edited(self, *_):
+        """The user committed a range edit (toggle, Enter or focus leaving Start/End): queue it."""
+        if self.preview_thread is None:
+            return                              # window closing: cleanup already stopped the worker
+        requested = self.win.requested_wavelength_range()
+        if requested == self._range_requested:
+            return                              # focus left without a change
+        if self.state == self.SCANNING:
+            self.win.set_wavelength_range(self._range_requested)
+            return
+        if requested is not None and not requested[0] < requested[1]:
+            self.win.set_wavelength_range(self._range_requested)
+            self.win.set_status("Wavelength range: Start must be below End")
+            return
+        self.preview_thread.request_wavelength_range(requested)
+        self._range_requested = requested
+        self._range_dirty = True
+
+    def _on_wavelength_range_applied(self, info: dict):
+        """The worker reports the bins in use (after a range change or any binner fit)."""
+        self._range_applied = info["range_nm"]
+        bands = info["bands"]                   # None without a range: full-grid refits change nothing here
+        if bands != self._range_bands:
+            if self._range_bands != ():
+                self.win.reset_sharpness_scale()     # the score is a mean over the binned frame
+            self._range_bands = bands
+        if self._range_dirty:
+            if info["range_nm"] == self._range_requested:
+                self._range_dirty = False
+                self._range_saved = info["range_nm"]
+                self._schedule_settings_save(RANGE_SETTING_KEY)
+            # else: an older range; the user's edit is still queued
+        else:
+            self._range_requested = info["range_nm"]
+            if self.win.requested_wavelength_range() != info["range_nm"]:
+                self.win.set_wavelength_range(info["range_nm"])
+        self.win.set_wavelength_range_axis(info)     # after the check state: unchecked shows the full span
+
+    def _on_wavelength_range_failed(self, requested, message: str):
+        """A range was refused, or cleared because it no longer fits the camera setting."""
+        self.win.set_status(f"Wavelength range not applied: {message}")
+        if self._range_dirty and requested == self._range_requested:
+            self._range_dirty = False
+            self._range_requested = self._range_applied
+            self.win.set_wavelength_range(self._range_applied)
+
+    def _wavelength_range_metadata(self) -> dict:
+        """Range provenance of the bins in use, for the scan metadata (empty without a range)."""
+        reader = getattr(self.preview_thread, "wavelength_range_metadata", None)
+        return reader() if reader is not None else {}
 
     # ══════════════════════════════════════════════════════════════
     #  Preview frame handling
@@ -962,7 +1068,8 @@ class ScanController:
 
         Lifecycle:
             1. Guard — reject if dark capture is in progress
-            2. Guard — reject unless currently in PREVIEW state
+            2. Guard — reject unless currently in PREVIEW state, and while a
+            wavelength range or bin change is still being applied (status message)
             3. Clear previous recording buffers (binned frames, saturation,
             full-res spectrograms)
             4. Arm preview thread for scan mode — full-res spectrogram capture
@@ -980,6 +1087,14 @@ class ScanController:
             return
         if self.stage is not None:
             logger.warning("Stage is still stopping or returning home")
+            return
+        if getattr(self.preview_thread, "wavelength_range_pending", False):
+            # Started now, the scan would record the previous range (changes are refused while scanning).
+            self.win.set_status("Wavelength range is being applied - press Start again")
+            return
+        if getattr(self.preview_thread, "bin_pending", False):
+            # Started now, the bin would be applied mid-scan (two frame widths in one cube).
+            self.win.set_status("Bin change is being applied - press Start again")
             return
 
         # ── reset buffers ─────────────────────────────────────
@@ -1022,6 +1137,7 @@ class ScanController:
             stage_type = self.win.stage_type()
             self.stage = StageThread(stage_type=stage_type)
             self.stage.trim_extra_ms = float(getattr(self.config, "scan_trim_extra_ms", 0.0))
+            self.stage.device = str(getattr(self.config, "stage_device", "") or "")
 
             if stage_type == "rotation":
                 self.stage.degree_per_second = self.win.rotation_speed_dps()
@@ -1043,6 +1159,7 @@ class ScanController:
 
             if not hasattr(self.stage, "stagebefore"):
                 self._set_recording(True)
+                self.win.start_scan_clock()
 
             self.stage.start()
 
@@ -1053,11 +1170,18 @@ class ScanController:
                 self.stage.deleteLater()
                 self.stage = None
 
-    def _set_recording(self, active: bool):
-        """Arm/disarm per-frame recording (GUI flag + worker buffer)."""
+    def _set_recording(self, active: bool, start_ns=None):
+        """Arm/disarm per-frame recording (GUI flag + worker buffer).
+
+        ``start_ns``: host time before which the worker records no frame (the start of
+        the stage's constant-speed window), or ``None``.
+        """
         self.recording = bool(active)
         if self.preview_thread is not None:
-            self.preview_thread.set_recording(self.recording)
+            self.preview_thread.set_recording(self.recording, start_ns=start_ns)
+            if self.recording:
+                # The live preview reads the recording's own list while it grows.
+                self._show_in_cube_preview(self.preview_thread.live_recorded_frames())
 
     def _disarm_stage_recording(self):
         self._set_recording(False)
@@ -1070,7 +1194,11 @@ class ScanController:
 
     def on_stage_started(self):
         if self.state == self.SCANNING:
-            self._set_recording(True)
+            # The stage noted its move start before signalling, so frames taken while
+            # it accelerates are not recorded at all (nor shown in the live preview).
+            start_ns = self.stage.steady_window()[0] if self.stage is not None else None
+            self._set_recording(True, start_ns)
+            self.win.start_scan_clock()         # status line: elapsed / expected move time
 
     def on_stage_finished(self):
         # v1 behavior: build the cube as soon as the scan move ends (endpoint or
@@ -1125,22 +1253,12 @@ class ScanController:
             if self.stage is not None and self.stage.isRunning():
                 self.win.set_status("Scan stopped — stage returning home")
 
-    def _on_cube_frames(self, frames):
-        """Real-time cube preview: receives every recorded frame, batched."""
-        if not self.recording:
-            return
-        self._push_preview_frames(frames)
-
-    def _push_preview_frames(self, frames):
-        if not frames:
-            return
-        self.session.note_preview_frames(len(frames))
+    def _show_in_cube_preview(self, frames, shift=0):
+        """Point the real-time cube preview at ``frames`` (read in place, never copied)."""
         if not self.enable_cube_preview:
             return
         wl = self.current_wavelengths
-        self.win.cube_preview.push_frames(
-            frames, wl.copy() if wl is not None else None, frames[0].shape[1],
-        )
+        self.win.cube_preview.set_frame_source(frames, wl.copy() if wl is not None else None, shift)
 
     def finish_scan(self):
         """Finalise a scan sequence and build the pushbroom cube.
@@ -1163,14 +1281,17 @@ class ScanController:
             return
 
         # ── disarm preview thread ─────────────────────────────
+        range_metadata = self._wavelength_range_metadata()     # the bins this scan recorded
         self.preview_thread.set_scanning(False)
         self.preview_thread.set_keep_spectrogram(False)
         # Keep only frames taken while the stage moved at constant speed (camera
         # timestamps, GenICam); a manual stop has no end time yet, so only the start
         # is trimmed then.
         window = self.stage.steady_window() if self.stage is not None else (None, None)
-        images = self.preview_thread.take_recorded_frames(*window)
+        images = self.preview_thread.take_recorded_frames(
+            *window, reference_ns=getattr(self.stage, 'motion_start_ns', None))
         raw = self.preview_thread.take_recorded_raw()
+        self.win.set_recorded_count(len(images))     # the frames kept for the cube (after the trim)
 
         # ── temperatures of this scan (cube header / spectrogram metadata) ──
         try:
@@ -1182,6 +1303,7 @@ class ScanController:
         self.last_scan_temperatures = self._scan_temperature_metadata()
         if isinstance(getattr(self, '_raw_metadata', None), dict):
             self._raw_metadata.update(self.last_scan_temperatures)
+            self._raw_metadata.update(range_metadata)
 
         # ── state transition ──────────────────────────────────
         self._set_state(self.PREVIEW)
@@ -1196,9 +1318,9 @@ class ScanController:
             self._publish_reference_outcome(outcome)
             return
 
-        # Batches still in flight are dropped once recording stops; the
-        # recorder is ordered, so the preview is missing exactly the tail.
-        self._push_preview_frames(outcome.tail)
+        # The preview now shows the cube's own (trimmed) list; points and bands stay.
+        recorder = getattr(self.preview_thread, 'recorder', None)
+        self._show_in_cube_preview(images, recorder.last_trim[0] if recorder is not None else 0)
 
         if outcome.kind == "empty":
             logger.warning("No frames recorded")

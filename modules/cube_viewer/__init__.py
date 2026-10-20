@@ -1,4 +1,4 @@
-"""Interactive hyperspectral cube viewer: band browser, RGB composite, click-to-spectrum, export.
+"""Interactive hyperspectral cube viewer: band browser, RGB composite, point / rectangle / lasso spectra with CSV / XLSX export.
 
 Public API:
 
@@ -6,6 +6,11 @@ Public API:
   constructible without arguments and is not listed in ``__widgets__``.
 * ``CubeImageCanvas`` - single-band image canvas with zoom/pan and ``pixel_clicked``.
 * ``RGBCompositeControls`` - single-band / RGB mode toggle, band spin boxes, stretch.
+
+Spectra (submodules, imported directly): ``roi_stats`` (exact ROI statistics, numpy
+only), ``spectra`` (``SpectrumSet`` / ``SpectrumRecord``), ``spectra_export`` (plain CSV,
+XLSX, clipboard TSV), ``roi_draw`` (rectangle / lasso tools and overlays), ``jobs``
+(background ``JobRunner``) and ``spectra_panel`` (the sidebar SPECTRA panel).
 
 Data conventions:
     * Cube: 3-D array ``(slit, scan, wavelength)`` = ``(H, W, bands)``, any numeric
@@ -15,11 +20,14 @@ Data conventions:
     * Image pixel ``(ix, iy)`` = ``(column, row)`` = ``(scan, slit)``; ``cube[iy, ix, :]``
       is the spectrum of that pixel.
     * ``config`` dict (``m`` nm/pixel at bin 1, ``c`` nm, optional ``pixel_size``) and
-      ``camera_bin`` are only forwarded to the export dialog.
+      ``camera_bin`` are forwarded to the export dialog; a numeric ``full_scale`` is also
+      the saturation level counted in the spectra statistics, and the camera scalars go
+      into the XLSX spectra metadata.
 
 Threading:
-    GUI thread only.  Exports run in a ``QThread`` owned by the export dialog, which
-    uses the adapters in ``modules.cube_io.export_workers``.
+    GUI thread only.  Large ROI statistics run on the viewer's ``JobRunner`` worker
+    thread; exports run in a ``QThread`` owned by the export dialog, which uses the
+    adapters in ``modules.cube_io.export_workers``.
 
 Example:
     >>> import numpy as np

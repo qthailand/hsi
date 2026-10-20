@@ -12,11 +12,21 @@ config/scan.json: stage type.
   scan_trim_extra_ms (optional, default 0): with GenICam, the recorded scan keeps only
   frames taken at constant stage speed (the controller's acceleration/deceleration time is
   cut off each end); this extra time in ms is cut off both ends as well.
+  stage_device (optional): the stage controller to open, e.g.
+  "/dev/serial/by-id/usb-XIMC_..._if00" (Linux; stays the same across reboots, unlike
+  /dev/ttyACM0) or a libximc URI ("xi-com:..."). Missing or "" = the device libximc
+  enumerates (Windows), else on Linux the first /dev/serial/by-id link naming XIMC.
 config/processing.json: orientation, spectral resolution (bin width) and RGB targets.
   resolution: bin width in nm. resolution_source: "config" (default; always use resolution)
   or "fwhm" (bin width = fwhm_step_factor x the median FWHM saved for the camera setting,
   at least 2 spectral pixels; resolution is used when no matching FWHM is saved).
   fwhm_step_factor: default 1.0 (one bin per FWHM; 0.5 = Nyquist).
+  wavelength_range_nm (optional): recorded wavelength range per camera backend, e.g.
+  {"genicam": [900.0, 1650.0]}. Only the bins whose every pixel lies inside the range are
+  binned, shown and recorded (the same bins as without a range, bit for bit); the raw
+  spectrogram stays full sensor and the cube's wavelength list gives the kept bands. Missing,
+  {} or null = the full calibrated range. Set it with the Wavelength Range box in the Scan
+  window (saved for the next start only by main.py, and only after a change you made).
 config/dark.json: reference directory and capture frame count.
 config/smile.json: model directory.
 calibration/wavelength/base.json: base slope/intercept when no profile is selected.

@@ -165,6 +165,10 @@ class CenteredPixmapLabel(QLabel, ZoomPanMixin):
         self._click_points.clear()
         self.update()
 
+    def click_points(self) -> list[tuple[int, int]]:
+        """The dots' image ``(x, y)`` pixels, in the order they were added (a copy)."""
+        return list(self._click_points)
+
     def set_shape_overlay(self, outline: np.ndarray, text: str = ""):
         """Draw a closed yellow outline (e.g. a detected circle / square) with a label.
 
@@ -356,7 +360,8 @@ class RealtimeCubePreviewWidget(QWidget):
         |  band lines (snap to the nearest band)       |
         +----------------------------------------------+
 
-    Feed it with :meth:`push_frame` / :meth:`push_frames`; call :meth:`reset` before a
+    Feed it with :meth:`push_frame` / :meth:`push_frames`, or point it at a list that
+    grows elsewhere with :meth:`set_frame_source`; call :meth:`reset` before a
     new scan and :meth:`cleanup` when done.  The composite uses the three bands
     nearest to ``rgb_target_wavelengths`` initially; the user can drag the R/G/B
     lines in the plot to change them.  Clicking the image plots the spectrum of that
@@ -401,6 +406,8 @@ class RealtimeCubePreviewWidget(QWidget):
         self._stretched_rgb8: np.ndarray | None = None   # what is shown, before the saturation overlay
         self._pending_click: tuple[int, int] | None = None
         self._fit_on_next_image = True   # the first image of a scan starts fitted to the canvas
+        self._source: list | None = None              # list shown via set_frame_source
+        self._source_wavelengths: np.ndarray | None = None
 
         self._spectrum_history: list[tuple[int, int, np.ndarray]] = []
         self._saturation_mask: np.ndarray | None = None  # ★ (n_frames, H)
@@ -553,6 +560,8 @@ class RealtimeCubePreviewWidget(QWidget):
         self._stretched_rgb8 = None
         self._pending_click = None
         self._fit_on_next_image = True
+        self._source = None
+        self._source_wavelengths = None
         self._spectrum_history.clear()
         self._saturation_mask = None  # ★
         self.frame_label.setText("Frames: 0")
@@ -599,6 +608,52 @@ class RealtimeCubePreviewWidget(QWidget):
             self._worker.set_wavelengths(wavelengths)
             self._init_band_lines(bands, wavelengths)
         self._worker.push_frames(frames)
+
+    def set_frame_source(self, frames: list, wavelengths: np.ndarray | None = None, shift: int = 0):
+        """Show ``frames`` itself: a list its owner keeps appending to (e.g. a scan recording).
+
+        The list is read by reference while it grows (never copied), and can be swapped
+        for another list of the same frames - e.g. the finished, trimmed cube - without
+        losing the clicked points, spectra, R/G/B bands, zoom or stretch.
+
+        Args:
+            frames: List of 2-D ``(slit, wavelength)`` arrays.
+            wavelengths: 1-D band wavelengths in nm, or ``None`` (band indices).
+            shift: Frames removed from the start since the previous list; clicked
+                points and spectra move left by as much (points that leave the image
+                are dropped) and a shape-check outline is cleared.
+        """
+        if shift:
+            self._shift_points(shift, len(frames))
+        self._source = frames
+        if wavelengths is not None:
+            self._source_wavelengths = wavelengths
+        self._sync_source_bands()
+        self._worker.set_frames(frames)
+
+    def _sync_source_bands(self):
+        """Set up the band axis once the source list has a frame (as ``push_frames`` does)."""
+        frames = self._source
+        if not frames:
+            return
+        bands = int(frames[0].shape[1])
+        if self._bands != bands and bands > 0:
+            self._bands = bands
+            self._wavelengths = self._source_wavelengths
+            self._worker.set_wavelengths(self._source_wavelengths)
+            self._init_band_lines(bands, self._source_wavelengths)
+
+    def _shift_points(self, shift: int, width: int):
+        """Move clicked points and spectra ``shift`` columns left; drop those outside ``width``."""
+        points = [(x - shift, y) for x, y in self.image_label.click_points()]
+        self.image_label.clear_click_points()
+        for x, y in points:
+            if 0 <= x < width:
+                self.image_label.add_click_point(x, y)
+        self._spectrum_history = [(x - shift, y, s) for x, y, s in self._spectrum_history
+                                  if 0 <= x - shift < width]
+        self._redraw_all_spectra()
+        self._clear_shape_check()
 
     def cleanup(self):
         """Stop the render thread (idempotent).  Also done on ``close()`` and when the widget is destroyed."""
@@ -862,6 +917,8 @@ class RealtimeCubePreviewWidget(QWidget):
 
     def _on_frames_count(self, n: int):
         self.frame_label.setText(f"Frames: {n}")
+        if self._bands == 0:
+            self._sync_source_bands()         # the source list was empty when it was set
 
     def _on_spectrum_ready(self, x_data, spectrum, img_x, img_y):
         self.pixel_label.setText(f"Pixel  x={img_x}  y={img_y}")

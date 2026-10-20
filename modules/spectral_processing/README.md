@@ -44,6 +44,7 @@ axis = wavelength_axis_from_frame_width(1024, 0.2903, 399.791)   # float32 nm
 * Raw spectrogram: `(frames, spatial, spectral)`; single sensor frame / spectral image: `(slit, wavelength)`; cube: `(slit, scan, wavelength)`.
 * Wavelength of spectral pixel `j` is `m * j + c` nm (`m` in nm/pixel, `c` in nm); outputs are float32 nm.
 * Binning works in uint16: integer mean with rounding, clamped to 65535. Bin edges start at `c` and are `step` nm apart; empty bins are dropped (`n_bins` can be smaller than the nominal count).
+* Wavelength range: `range_bins(lo, hi)` returns the contiguous bins `k0:k1` whose every spectral pixel (`m * j + c`) lies inside `[lo, hi]` (float64, the same on NumPy 1.x and 2.x); `subset(k0, k1)` returns a NEW binner with the same `v_` that computes only those bins, bit-identical to `transform(x)[..., k0:k1]`. Never refit a narrower grid for a range (the edges are a linspace over the width, so they would move) and never change a fitted binner in place (GPU backends cache its tables by identity).
 * `transform` returns a new array; `transform_to_cube` returns a non-contiguous transposed view `(n_bins, spatial, frames)` (band-first, as used by the writers in `modules.cube_io`).
 * `parse_envi_wavelengths` converts micrometres to nm only when the `wavelength units` entry says so, and returns `None` (with a log warning) on missing or mismatching data.
 
@@ -51,7 +52,7 @@ axis = wavelength_axis_from_frame_width(1024, 0.2903, 399.791)   # float32 nm
 
 | Name | Purpose |
 |------|---------|
-| `LambdaBinner(m, c, step=2.0, threads=None)` | binner; `fit(v)`, `fit_from(array)`, `transform`, `transform_to_cube`, `warmup`, `lambda_out`, `n_bins` |
+| `LambdaBinner(m, c, step=2.0, threads=None)` | binner; `fit(v)`, `fit_from(array)`, `transform`, `transform_to_cube`, `warmup`, `lambda_out`, `n_bins`, `range_bins(lo, hi)`, `subset(k0, k1)`, `source_bins` |
 | `wavelength_axis_from_frame_width(width, m, c)` | float32 nm axis |
 | `spectrum_from_corrected_row(corrected_frame, selected_y)` | contiguous 1-D row (may be a view); `selected_y` is clamped |
 | `parse_envi_wavelengths(envi_image, cube)` | float32 nm array or `None` |

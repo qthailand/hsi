@@ -1,6 +1,7 @@
 # windows/cube_viewer.py
 """Cube viewer window with single-band and RGB composite modes.
-Both modes use 1-click-1-spectrum with shared tab20 colored dots and legend.
+Both modes share one set of spectra: point clicks and rectangle / lasso areas, listed in the
+sidebar's SPECTRA panel and drawn as tab20-coloured curves (areas with a +-std band).
 
 Data conventions:
     The cube is ``(slit, scan, wavelength)`` = ``(H, W, bands)`` of any numeric dtype
@@ -8,10 +9,17 @@ Data conventions:
     works).  ``wavelengths`` is a 1-D array in nm with one value per band, or ``None``.
     The viewer keeps a reference to the cube (no copy) and sets it to ``None`` when closed.
     Image pixel ``(ix, iy)`` is ``(column, row)`` = ``(scan, slit)``.
+    Spectra are :class:`~modules.cube_viewer.spectra.SpectrumRecord` objects in
+    ``CubeViewerWindow.spectrum_set``; their statistics come from
+    :mod:`modules.cube_viewer.roi_stats` (pixel-centre rule, exact integer sums, std ddof=0).
 
 Threading:
-    All widgets live in the GUI thread.  Export runs in a ``QThread`` owned by
-    ``ExportDialog`` (workers from ``modules.cube_io.export_workers``).
+    All widgets live in the GUI thread.  A point spectrum is read synchronously.  An area
+    is computed inline when the cube is an in-RAM ndarray and its bounding box holds at
+    most ``inline_bytes`` (8 MiB) of cube data; otherwise - and always for memory maps - it
+    goes to the ``JobRunner`` worker thread (``modules.cube_viewer.jobs``), which
+    ``closeEvent`` shuts down before the cube is released.  Export runs in a ``QThread``
+    owned by ``ExportDialog`` (workers from ``modules.cube_io.export_workers``).
 
 Example:
     >>> import numpy as np
@@ -23,11 +31,19 @@ Example:
 
 from __future__ import annotations
 
+import html
+import math
+import mmap
+import os
+from functools import partial
+from pathlib import Path
+
 import numpy as np
+import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QThread, QTimer
-from PyQt5.QtGui import QKeySequence, QImage, QPixmap
+from PyQt5.QtGui import QColor, QKeySequence, QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QSlider, QGroupBox, QComboBox, QPushButton,
     QFileDialog, QProgressBar, QMessageBox, QDialog,
     QSplitter, QShortcut, QScrollArea, QSizePolicy, QFrame,
@@ -36,7 +52,15 @@ from PyQt5.QtWidgets import (
 
 from modules.live_view.mapping import DisplayMapper
 from modules.cube_viewer.canvas import CubeImageCanvas
-from modules.cube_preview.widget import CenteredPixmapLabel, TAB20_HEX
+from modules.cube_viewer.jobs import JobRunner
+from modules.cube_viewer.roi_draw import TOOLS, _RoiPixmapLabel, roi_selection
+from modules.cube_viewer.roi_stats import point_stats, polygon_mask, roi_stats, snap_rect
+from modules.cube_viewer.spectra import SpectrumSet
+from modules.cube_viewer.spectra_export import (
+    HAVE_OPENPYXL, export_csv, export_xlsx, exportable, spectra_text,
+)
+from modules.cube_viewer.spectra_panel import SpectraPanel
+from modules.cube_preview.widget import TAB20_HEX
 from modules.live_view.spectrum import SpectrumPlot
 from modules.live_view.display_controls import DisplayControls
 from modules.cube_viewer.controls import RGBCompositeControls
@@ -45,6 +69,81 @@ from modules.ui_kit.zoom_pan import ZoomPanMixin
 from modules.cube_io.export_workers import (
     GeoTIFFWorker, HypercubeWorker, SpectrogramWorker,
 )
+
+# Areas whose bounding box holds at most this much cube data (px x bands x itemsize) are
+# computed in the GUI thread when the cube is in RAM: about 22k px of a 185-band uint16
+# cube, ~5.5 ms (a float32 box at the limit: ~10 ms, the exact float merge costs more).
+INLINE_BYTES = 8 << 20
+# A lasso mask is rasterised in the GUI thread when its edges cross at most this many pixel
+# rows in total (polygon_mask costs ~0.15 us per edge-row crossing: ~10 ms at the limit; a
+# 300-vertex freehand lasso has a few thousand).  Larger ones are rasterised in the worker.
+INLINE_MASK_CROSSINGS = 1 << 16
+_CURVE_WIDTH = 1.5
+_FILL_ALPHA = 50
+_MESSAGE_MS = 6000
+# While the Space sweep plays or the band slider is dragged, the band marker moves at most
+# this often: each move repaints every curve under it (pyqtgraph strokes the whole 1.5 px
+# curve for any exposed strip; about 0.5 ms per noisy point curve, 0.2-0.3 ms per area).
+_MARKER_SWEEP_MS = 250
+_AXIS_ORDER = "(slit, scan, wavelength) = (rows, columns, bands)"
+_CONFIG_SCALARS = ("m", "c", "pixel_size", "resolution", "bit_depth", "sensor_bit_depth",
+                   "full_scale")
+_TOOL_HINTS = {
+    "point": "Point tool: click a pixel to add its spectrum",
+    "rect": "Rect tool: drag over the image (Esc cancels)",
+    "lasso": "Lasso tool: hold the left button and draw around an area; release closes it",
+}
+
+
+def _cube_in_ram(cube) -> bool:
+    """True for an ndarray whose data is not (a view of) a memory map."""
+    if not isinstance(cube, np.ndarray):
+        return False
+    obj = cube
+    while obj is not None:
+        if isinstance(obj, (np.memmap, mmap.mmap)):
+            return False
+        obj = getattr(obj, "base", None)
+    return True
+
+
+def _lasso_crossings(vertices: np.ndarray) -> int:
+    """Pixel-centre rows crossed by the closed polygon's edges (polygon_mask's work)."""
+    rows = np.floor(vertices[:, 1] - 0.5)
+    return int(np.abs(np.diff(np.append(rows, rows[:1]))).sum())
+
+
+def _finite_range(*arrays) -> tuple:
+    """``(min, max)`` over the finite values of the arrays, ``(inf, -inf)`` when none."""
+    lo, hi = math.inf, -math.inf
+    for arr in arrays:
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            lo = min(lo, float(finite.min()))
+            hi = max(hi, float(finite.max()))
+    return lo, hi
+
+
+def _fill_brush(color: str):
+    """Brush of a record's +-std band: the record colour at alpha ~50."""
+    qcolor = QColor(color)
+    qcolor.setAlpha(_FILL_ALPHA)
+    return pg.mkBrush(qcolor)
+
+
+class _PlotEntry:
+    """The plot items of one record: its curve and, for areas, the +-std fill."""
+
+    __slots__ = ("curve", "fill", "lo", "hi", "y_mean", "y_std")
+
+    def __init__(self, curve, fill=None, lo=None, hi=None, y_mean=(math.inf, -math.inf),
+                 y_std=(math.inf, -math.inf)):
+        self.curve = curve
+        self.fill = fill
+        self.lo = lo                # off-scene PlotCurveItems the fill is built from
+        self.hi = hi
+        self.y_mean = y_mean        # finite (min, max) of the mean
+        self.y_std = y_std          # finite (min, max) of mean -+ std
 
 
 # ══════════════════════════════════════════════════════════════
@@ -238,17 +337,30 @@ class CubeViewerWindow(QWidget):
     """Interactive viewer for a ``(slit, scan, wavelength)`` hyperspectral cube.
 
     Shows one band at a time (slider, play/pause sweep, left/right keys) or an RGB
-    composite; each left click on the image adds a spectrum curve (tab20 colour
-    coded dot and legend entry) to the plot below.  Zoom with the wheel, pan with
-    the middle button, ``+``/``-``/``0``/``1`` keys.  Includes display controls,
-    cube info and an "Export Datacube" dialog (``E``).  Keyboard: Left/Right band,
-    Space play/pause, R reset, E export.
+    composite.  The SPECTRA panel in the sidebar picks the tool:
+
+    * Point (default, today's behaviour): each left click adds the pixel's spectrum - a
+      tab20-coloured dot labelled ``(ix,iy)`` and a curve of that name.
+    * Rect / Lasso: drag a rectangle or draw a freehand area; its per-band mean is
+      plotted with a shaded +-std band (population std, ddof=0).  Pixels count when their
+      centre is inside (``roi_stats``).  Esc cancels a drawing.
+
+    The panel's tree lists every spectrum: the check box shows / hides its curve, std band
+    and outline (and keeps it out of the export), F2 / double click renames it (legend,
+    image tag and export header follow), Del deletes, and the context menu sets the colour,
+    toggles the std band and copies the table.  'Export...' writes the checked spectra as a
+    plain CSV or an XLSX workbook (:meth:`export_spectra`).  Zoom with the wheel, pan with
+    the middle button, ``+``/``-``/``0``/``1`` keys.  Includes display controls, cube info
+    and an "Export Datacube" dialog (``E``).  Keyboard: Left/Right band, Space play/pause,
+    R reset (band 0 and fit-to-window zoom; the spectra are kept), E export.  While the
+    spectra tree has the focus these keys act on the tree.  A dashed marker in the plot
+    shows the current band (during the sweep and a slider drag it follows every 250 ms).
 
     Unlike the widgets listed in the package ``__widgets__`` this one needs a cube,
     so it is not constructible without arguments.  The widget emits no custom
-    signals; query it with ``status_info()`` and the ``current_band`` attribute.
-    On ``closeEvent`` the cube, wavelengths, canvas and spectrum references are
-    dropped and the export dialog is closed.
+    signals; query it with ``status_info()``, ``spectrum_set`` and the ``current_band``
+    attribute.  On ``closeEvent`` the background jobs are stopped, the spectra cleared and
+    the cube, wavelengths, canvas and plot references dropped; the export dialog is closed.
 
     Args:
         cube: 3-D array ``(slit, scan, wavelength)``; kept by reference.
@@ -256,8 +368,19 @@ class CubeViewerWindow(QWidget):
         resolution: Decimals shown for wavelengths in labels.
         display_mapper: Optional ``DisplayMapper`` whose ``bit_depth`` initialises
             the display controls (default 16 bit).
-        config: Calibration dict forwarded to the export (``m``, ``c``, ``pixel_size``).
+        config: Calibration dict forwarded to the export (``m``, ``c``, ``pixel_size``);
+            a numeric ``full_scale`` is also the saturation level counted in the spectra
+            statistics, and the camera scalars go into the XLSX ``Metadata`` sheet.
         camera_bin: Hardware bin factor forwarded to the export (default 1).
+        source_path: Optional path of the cube file: its stem names the areas
+            (``'<stem>-mean-<k>'``) and the default export file, and it is recorded in the
+            XLSX metadata.  Without it the stem is ``'cube'``.
+
+    Attributes:
+        spectrum_set: The :class:`~modules.cube_viewer.spectra.SpectrumSet` (palette
+            ``TAB20_HEX``).
+        spectra_panel: The sidebar :class:`~modules.cube_viewer.spectra_panel.SpectraPanel`.
+        inline_bytes: Inline limit for area statistics (class default ``INLINE_BYTES``).
 
     Raises:
         ValueError: ``cube`` is not 3-D.
@@ -266,16 +389,22 @@ class CubeViewerWindow(QWidget):
 
     ┌─── HSplitter ────────────────────────────────────────────┐
     │           │  ┌─ Overlay Bar (band nav) ────────────────┐  │
-    │           │  ├─ VSplitter ────────────────────────────┐│  │
-    │  SIDEBAR  │  │  QStackedWidget                       ││  │
-    │           │  │    page 0: CubeImageCanvas     4/5    ││  │
-    │  DISPLAY  │  │    page 1: CenteredPixmapLabel         ││  │
-    │  RGB      │  ├─ SpectrumPlot                  1/5    ││  │
-    │  CUBE INFO│  └───────────────────────────────────────┘│  │
-    │  EXPORT   │  ┌─ Status Bar ──────────────────────────┐│  │
-    │  KEYBOARD │  └───────────────────────────────────────┘│  │
+    │  DISPLAY  │  ├─ VSplitter ────────────────────────────┐│  │
+    │   MODE    │  │  QStackedWidget                ~3/5   ││  │
+    │  DISPLAY  │  │    page 0: CubeImageCanvas             ││  │
+    │  SPECTRA  │  │    page 1: _RoiPixmapLabel (RGB)       ││  │
+    │  CUBE INFO│  ├─ SpectrumPlot                  ~2/5   ││  │
+    │  EXPORT   │  └───────────────────────────────────────┘│  │
+    │  KEYBOARD │  ┌─ Status Bar ──────────────────────────┐│  │
+    │           │  └───────────────────────────────────────┘│  │
     └───────────┴──────────────────────────────────────────┘
+
+    The image / plot splitter starts at 3:2 (``setSizes([600, 400])``, scaled to the
+    available height: about 415 / 277 px in a 1000x800 MDI window); its 4:1 stretch
+    factors only share out later resizes.  The plot keeps its 160 px minimum.
     """
+
+    inline_bytes = INLINE_BYTES
 
     def __init__(
         self,
@@ -285,6 +414,7 @@ class CubeViewerWindow(QWidget):
         display_mapper: DisplayMapper | None = None,
         config: dict | None = None,
         camera_bin: int | None = None,
+        source_path=None,
     ):
         super().__init__()
 
@@ -297,19 +427,43 @@ class CubeViewerWindow(QWidget):
         self.resolution = int(resolution)
         self.config = config or {}
         self.camera_bin = int(camera_bin or 1)
+        self.source_path = os.fspath(source_path) if source_path else None
 
         self.current_band = 0
         self._export_dlg = None
         self._playing = False
+        self._closed = False
 
-        # ★ shared spectrum history — single source of truth
-        self._spectrum_history: list[tuple[int, int, np.ndarray]] = []
+        # ★ spectra — single source of truth for points and areas
+        stem = Path(self.source_path).stem if self.source_path else "cube"
+        self.spectrum_set = SpectrumSet(TAB20_HEX, source_name=stem)
+        self._plot_entries: dict[int, _PlotEntry] = {}
+        self._selected_rid = None
+        self._saturation = self._config_number("full_scale")
+        self._in_ram = _cube_in_ram(cube)
+        self._x = (np.asarray(wavelengths, dtype=np.float64) if self._has_wavelengths()
+                   else np.arange(self.bands, dtype=np.float64))
+
+        self._jobs = JobRunner(self)
+        self._jobs.done.connect(self._on_job_done)
+        self._jobs.failed.connect(self._on_job_failed)
+
+        self._message = ""
+        self._message_timer = QTimer(self)
+        self._message_timer.setSingleShot(True)
+        self._message_timer.setInterval(_MESSAGE_MS)
+        self._message_timer.timeout.connect(self._clear_message)
 
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(80)
         self._anim_timer.timeout.connect(self._anim_step)
 
-        # ── single-band canvas (1-click spectrum) ──
+        self._marker_timer = QTimer(self)
+        self._marker_timer.setSingleShot(True)
+        self._marker_timer.setInterval(_MARKER_SWEEP_MS)
+        self._marker_timer.timeout.connect(self._update_band_marker)
+
+        # ── single-band canvas (1-click spectrum, ROI tools) ──
         self.canvas = CubeImageCanvas()
         self.canvas.pixel_clicked.connect(self._on_canvas_pixel_clicked)
 
@@ -322,6 +476,16 @@ class CubeViewerWindow(QWidget):
 
         # ── spectrum plot ──
         self.spectrum = SpectrumPlot()
+        pw = self.spectrum.pw
+        # The viewer draws its own curves; SpectrumPlot's empty curve used to be
+        # dropped by the first pw.clear(), so drop it here (nothing visible changes).
+        pw.removeItem(self.spectrum.curve)
+        # The band marker stays in the plot for good (moved by on_band_changed); it
+        # must not pull the auto range of an empty plot towards its wavelength.
+        pw.removeItem(self.spectrum.band_line)
+        pw.addItem(self.spectrum.band_line, ignoreBounds=True)
+        if not self._has_wavelengths():
+            pw.getAxis("bottom").setLabel("Band")
 
         # ── RGB controls (sidebar) ──
         self._rgb_controls = RGBCompositeControls()
@@ -329,11 +493,33 @@ class CubeViewerWindow(QWidget):
         self._rgb_controls.mode_changed.connect(self._on_display_mode_changed)
         self._rgb_controls.composite_updated.connect(self._on_composite_updated)
 
-        # ── RGB image label (1-click spectrum) ──
-        self._rgb_image = CenteredPixmapLabel()
+        # ── RGB image label (1-click spectrum; ROI drawing and overlays) ──
+        self._rgb_image = _RoiPixmapLabel()
         self._rgb_image.clicked.connect(self._rgb_on_clicked)
         self.canvas.zoom_changed.connect(self._on_zoom_changed)
         self._rgb_image.zoom_changed.connect(self._on_zoom_changed)
+        for view in (self.canvas, self._rgb_image):
+            view.roi_drawn.connect(self._on_roi_drawn)
+            view.roi_discarded.connect(self._show_message)
+
+        # ── SPECTRA panel (sidebar) ──
+        self.spectra_panel = SpectraPanel()
+        self.spectra_panel.set_image_size(self.h, self.w)
+        self.btn_clear_points = self.spectra_panel.btn_clear_points
+        self.btn_clear_points.clicked.connect(self._clear_all_points)
+        self.spectra_panel.tool_changed.connect(self.set_tool)
+        self.spectra_panel.visibility_changed.connect(self.set_spectrum_visible)
+        self.spectra_panel.rename_requested.connect(self.rename_spectrum)
+        self.spectra_panel.color_requested.connect(self.set_spectrum_color)
+        self.spectra_panel.show_std_changed.connect(self.set_spectrum_show_std)
+        self.spectra_panel.copy_requested.connect(self.copy_spectra)
+        self.spectra_panel.delete_requested.connect(self.delete_spectra)
+        self.spectra_panel.selection_changed.connect(self._on_spectrum_selected)
+        self.spectra_panel.export_requested.connect(self._export_spectra_dialog)
+        if not HAVE_OPENPYXL:
+            self.spectra_panel.btn_export.setToolTip(
+                "Save the checked spectra as CSV.  Excel (XLSX) export needs openpyxl: "
+                "pip install openpyxl")
 
         self._build_ui()
         self._setup_shortcuts()
@@ -373,6 +559,9 @@ class CubeViewerWindow(QWidget):
         self._vsplit.addWidget(self.spectrum)
         self._vsplit.setStretchFactor(0, 4)
         self._vsplit.setStretchFactor(1, 1)
+        # Initial 3:2 split.  Without it Qt weighs sizeHint x stretch and pins the
+        # image at the canvas's 200 px minimum ([200, 492] in a 1000x800 MDI window).
+        self._vsplit.setSizes([600, 400])
         right_lay.addWidget(self._vsplit, stretch=1)
 
         right_lay.addWidget(self._build_status_bar(), stretch=0)
@@ -409,11 +598,12 @@ class CubeViewerWindow(QWidget):
         g1.setLayout(l1)
         lay.addWidget(g1)
 
-        # ★ clear all points button
-        self.btn_clear_points = QPushButton("Clear All Points")
-        self.btn_clear_points.setMinimumHeight(32)
-        self.btn_clear_points.clicked.connect(self._clear_all_points)
-        lay.addWidget(self.btn_clear_points)
+        # ★ spectra: tools, tree, Export… and Clear All Points (the old button's slot)
+        g_spectra = QGroupBox("SPECTRA")
+        l_spectra = QVBoxLayout()
+        l_spectra.addWidget(self.spectra_panel)
+        g_spectra.setLayout(l_spectra)
+        lay.addWidget(g_spectra)
 
         # cube info
         g2 = QGroupBox("CUBE INFO")
@@ -428,7 +618,7 @@ class CubeViewerWindow(QWidget):
         lay.addWidget(g2)
 
         # export button
-        self.btn_export = QPushButton("  Export Datacube \u2192")
+        self.btn_export = QPushButton("  Export Datacube →")
         self.btn_export.setMinimumHeight(38)
         self.btn_export.clicked.connect(self._open_export)
         lay.addWidget(self.btn_export)
@@ -438,10 +628,13 @@ class CubeViewerWindow(QWidget):
         l3 = QVBoxLayout()
         l3.setSpacing(2)
         for key, desc in [
-            ("\u2190 \u2192",  "Prev / Next band"),
+            ("← →",  "Prev / Next band"),
             ("Space",         "Play / Pause sweep"),
             ("E",             "Export dialog"),
-            ("R",             "Reset view"),
+            ("R",             "Reset band + zoom"),
+            ("Esc",           "Cancel rect / lasso"),
+            ("Del",           "Delete spectrum (tree)"),
+            ("F2",            "Rename spectrum (tree)"),
         ]:
             row = QHBoxLayout()
             kl = QLabel(key)
@@ -467,15 +660,16 @@ class CubeViewerWindow(QWidget):
         lay.setSpacing(6)
 
         # ★ nav buttons
-        self.btn_prev = self._nav_btn("\u25C0", lambda: self._step(-1))
-        self.btn_play = self._nav_btn("\u25B6", self._toggle_play)
+        self.btn_prev = self._nav_btn("◀", lambda: self._step(-1))
+        self.btn_play = self._nav_btn("▶", self._toggle_play)
         self.btn_play.setCheckable(True)
-        self.btn_next = self._nav_btn("\u25B6", lambda: self._step(1))
+        self.btn_next = self._nav_btn("▶", lambda: self._step(1))
 
         # ★ band slider
         self.band_slider = QSlider(Qt.Horizontal)
         self.band_slider.setRange(0, max(0, self.bands - 1))
         self.band_slider.valueChanged.connect(self.on_band_changed)
+        self.band_slider.sliderReleased.connect(self._update_band_marker)
 
         # ★ labels
         self.band_label = QLabel()
@@ -485,7 +679,10 @@ class CubeViewerWindow(QWidget):
 
         self.roi_label = QLabel("")
         self.roi_label.setObjectName("valueLabel")
+        self.roi_label.setTextFormat(Qt.PlainText)     # spectrum names are text, never markup
         self.roi_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # a long spectrum name is clipped instead of widening the whole window
+        self.roi_label.setMinimumWidth(1)
 
         # ★ zoom controls
         self._zoom_label = QLabel("100%")
@@ -493,7 +690,7 @@ class CubeViewerWindow(QWidget):
         self._zoom_label.setAlignment(Qt.AlignCenter)
         self._zoom_label.setFixedWidth(48)
 
-        btn_zoom_out = self._nav_btn("\u2212", self._zoom_out)
+        btn_zoom_out = self._nav_btn("−", self._zoom_out)
         btn_zoom_in = self._nav_btn("+", self._zoom_in)
         btn_fit = self._nav_btn("Fit", self._zoom_fit)
         btn_fit.setFixedWidth(36)
@@ -522,6 +719,8 @@ class CubeViewerWindow(QWidget):
         lay = QHBoxLayout(bar)
         lay.setContentsMargins(12, 0, 12, 0)
         self.status_label = QLabel("Ready")
+        self.status_label.setTextFormat(Qt.PlainText)  # messages quote spectrum names: never markup
+        self.status_label.setMinimumWidth(1)      # long messages are clipped, never widen the window
         lay.addWidget(self.status_label)
         return bar
 
@@ -536,41 +735,30 @@ class CubeViewerWindow(QWidget):
         QShortcut(QKeySequence(Qt.Key_Minus),   self, self._zoom_out)
         QShortcut(QKeySequence(Qt.Key_0),       self, self._zoom_fit)
         QShortcut(QKeySequence(Qt.Key_1),       self, self._zoom_actual)
-        
+
     # ──────────────────────────────────────────────────────
-    #  DISPLAY MODE SWITCH — sync click points
+    #  DISPLAY MODE SWITCH
     # ──────────────────────────────────────────────────────
     def _rgb_on_clicked(self, ix: int, iy: int):
-        """Left-click on RGB image — extract spectrum."""
-        spectrum = self.cube[iy, ix, :].astype(np.float32)
-        self._add_spectrum_point(ix, iy, spectrum)
+        """Left-click on RGB image (point tool) — add that pixel's spectrum."""
+        self.add_point(ix, iy)
+
     # ★ _on_display_mode_changed — update zoom label when switching
     def _on_display_mode_changed(self, mode: str):
         is_rgb = (mode == "rgb")
         if is_rgb:
             self._display_stack.setCurrentIndex(1)
             self._overlay.setVisible(False)
+            self.canvas.cancel_drawing()
         else:
             self._display_stack.setCurrentIndex(0)
             self._overlay.setVisible(True)
+            self._rgb_image.cancel_drawing()
             self.update_band_image()
 
-        self._sync_click_points_to_active_view()
+        # both views draw the same record overlays, so nothing needs re-syncing
         # ★ update zoom label for active canvas
         self._on_zoom_changed(self._active_canvas().zoom_percent)
-
-    def _sync_click_points_to_active_view(self):
-        """Re-draw all click points from history onto the active canvas."""
-        is_rgb = (self._display_stack.currentIndex() == 1)
-
-        # clear dots on BOTH canvases
-        self.canvas.clear_click_points()
-        self._rgb_image.clear_click_points()
-
-        # redraw all dots on active canvas
-        active = self._rgb_image if is_rgb else self.canvas
-        for ix, iy, _ in self._spectrum_history:
-            active.add_click_point(ix, iy)
 
     def _on_composite_updated(self, rgb8: np.ndarray):
         h, w, ch = rgb8.shape
@@ -579,129 +767,607 @@ class CubeViewerWindow(QWidget):
         pixmap = QPixmap.fromImage(qimg)
         self._rgb_image.setPixmapScaled(pixmap)
 
-        # ★ re-sync dots after pixmap update (paintEvent needs pixmap)
-        self._sync_click_points_to_active_view()
-
     # ──────────────────────────────────────────────────────
     #  SINGLE-BAND MODE — 1-click spectrum
     # ──────────────────────────────────────────────────────
 
     def _on_canvas_pixel_clicked(self, ix: int, iy: int):
         """1 click on single-band canvas = 1 spectrum."""
-        spectrum = self.cube[iy, ix, :].astype(np.float32)
-        self._add_spectrum_point(ix, iy, spectrum)
-
+        self.add_point(ix, iy)
 
     # ──────────────────────────────────────────────────────
-    #  SHARED — add point to history + update everything
+    #  SPECTRA — tools, points and areas
     # ──────────────────────────────────────────────────────
 
-    def _add_spectrum_point(self, ix: int, iy: int, spectrum: np.ndarray):
-        """Add a click point — shared by both modes."""
-        self._spectrum_history.append((ix, iy, spectrum.copy()))
+    def set_tool(self, name: str) -> None:
+        """Select the image tool in both views and the panel.
 
-        # add dot on active canvas
-        is_rgb = (self._display_stack.currentIndex() == 1)
-        if is_rgb:
-            self._rgb_image.add_click_point(ix, iy)
+        Args:
+            name: ``'point'`` (click = pixel spectrum), ``'rect'`` or ``'lasso'``.
+
+        Raises:
+            ValueError: Unknown tool name.
+        """
+        if name not in TOOLS:
+            raise ValueError(f"tool must be one of {TOOLS}, got {name!r}")
+        changed = self.canvas.tool != name or self._rgb_image.tool != name
+        self.canvas.set_tool(name)
+        self._rgb_image.set_tool(name)
+        if self.spectra_panel.tool() != name:
+            self.spectra_panel.set_tool(name)
+        if changed:
+            self._show_message(_TOOL_HINTS[name])
+
+    def add_point(self, ix: int, iy: int):
+        """Add the spectrum of pixel ``(ix, iy)`` (column, row), as a left click does.
+
+        The record is named ``'(ix,iy)'`` and coloured ``TAB20_HEX[n % 20]`` by creation
+        count, exactly as the click dots and curves always were; its statistics are read
+        synchronously (``point_stats``).
+
+        Returns:
+            SpectrumRecord: The new record (``'ready'``, or ``'failed'`` when no band of
+            the pixel is finite).
+        """
+        if self._closed:
+            return None
+        record = self.spectrum_set.add("point", {"x": int(ix), "y": int(iy)})
+        stats = point_stats(self.cube, int(ix), int(iy), saturation=self._saturation)
+        self.spectrum_set.set_stats(record.rid, stats)
+        self._record_added(record)
+        if record.state == "failed":
+            self.spectra_panel.update_record(record, note="no finite value in any band")
+        n = len(self.spectrum_set)
+        self.roi_label.setText(f"Point {n}: x={ix}  y={iy}  ({n} spectra)")
+        self._refresh_status()
+        return record
+
+    def _on_roi_drawn(self, kind: str, geometry: dict):
+        """A view finished a rectangle or lasso."""
+        self.add_area(kind, geometry)
+
+    def add_area(self, kind: str, geometry: dict):
+        """Add a rectangle or lasso spectrum (mean and std of the pixels inside).
+
+        Small areas of an in-RAM cube (bounding box at most ``inline_bytes`` of cube data)
+        are computed at once; the others are queued on the worker thread and the record
+        stays ``'pending'`` (dashed outline, 'computing...') until the result arrives.
+
+        Args:
+            kind: ``'rect'`` or ``'lasso'``.
+            geometry: Rect ``{'c0', 'r0', 'c1', 'r1'}`` (ints, half-open) or lasso
+                ``{'vertices': [[x, y], ...]}`` (float image-corner coordinates), as
+                emitted by ``roi_drawn``.
+
+        Returns:
+            SpectrumRecord | None: The record, or None when the area holds no pixel
+            centre (discarded with a status message).
+
+        Raises:
+            ValueError: Unknown ``kind`` or invalid geometry values.
+            KeyError: A geometry key is missing.
+        """
+        if self._closed:
+            return None
+        h, w = self.h, self.w
+        mask = None
+        if kind == "rect":
+            bbox, _, n_px = roi_selection("rect", geometry, h, w)
+            if n_px == 0:
+                self._show_message("Rectangle discarded: it encloses no pixel centre")
+                return None
+            geometry = dict(geometry, c0=bbox[0], r0=bbox[1], c1=bbox[2], r1=bbox[3])
+        elif kind == "lasso":
+            vertices = np.asarray(geometry["vertices"], dtype=np.float64).reshape(-1, 2)
+            if vertices.shape[0] < 3:
+                self._show_message("Lasso discarded: it needs at least 3 points")
+                return None
+            bbox = snap_rect(float(vertices[:, 0].min()), float(vertices[:, 1].min()),
+                             float(vertices[:, 0].max()), float(vertices[:, 1].max()), h, w)
+            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                self._show_message("Lasso discarded: it encloses no pixel centre")
+                return None
+            if _lasso_crossings(vertices) <= INLINE_MASK_CROSSINGS:
+                c0, r0, mask = polygon_mask(vertices, h, w)
+                if not mask.any():
+                    self._show_message("Lasso discarded: it encloses no pixel centre")
+                    return None
+                bbox = (c0, r0, c0 + mask.shape[1], r0 + mask.shape[0])
         else:
-            self.canvas.add_click_point(ix, iy)
+            raise ValueError(f"kind must be 'rect' or 'lasso', got {kind!r}")
 
-        # redraw spectra with legend
-        self._redraw_spectra()
+        record = self.spectrum_set.add(kind, geometry)
+        self._record_added(record)
+        c0, r0, c1, r1 = bbox
+        cost = (c1 - c0) * (r1 - r0) * self.bands * np.dtype(self.cube.dtype).itemsize
+        inline = self._in_ram and cost <= self.inline_bytes and (kind == "rect" or mask is not None)
+        if inline:
+            try:
+                stats = roi_stats(self.cube, bbox, mask, saturation=self._saturation)
+            except Exception as exc:  # noqa: BLE001 - shown on the record, never raised in a slot
+                self._record_failed(record.rid, f"{type(exc).__name__}: {exc}")
+            else:
+                self._record_finished(record.rid, stats)
+        else:
+            self._jobs.submit(record.rid, self._area_job(record, bbox, mask))
+            n = len(self.spectrum_set)
+            self.roi_label.setText(f"{record.name}: computing…  ({n} spectra)")
+            self._refresh_status()
+        return record
 
-        # update info
-        idx = len(self._spectrum_history)
-        self.roi_label.setText(
-            f"Point {idx}: x={ix}  y={iy}  ({idx} spectra)"
-        )
+    def _area_job(self, record, bbox, mask):
+        """The worker callable for an area: (mask, if still needed, then) ``roi_stats``.
+
+        It holds its own references to the cube and the geometry, never to widgets.
+        """
+        cube, saturation = self.cube, self._saturation
+        kind, geometry, h, w = record.kind, record.geometry, self.h, self.w
+
+        def job(cancel):
+            box, local_mask = bbox, mask
+            if kind == "lasso" and local_mask is None:
+                # a huge lasso: its mask is rasterised here, cancellable per ~10 ms batch
+                box, local_mask, _ = roi_selection(kind, geometry, h, w, cancel=cancel)
+            return roi_stats(cube, box, local_mask, saturation=saturation, cancel=cancel)
+
+        return job
+
+    def _on_job_done(self, rid: int, stats):
+        """Worker result (GUI thread); late results of deleted records are ignored."""
+        if not self._closed:
+            self._record_finished(rid, stats)
+
+    def _on_job_failed(self, rid: int, message: str):
+        """Worker error (GUI thread)."""
+        if not self._closed:
+            self._record_failed(rid, message)
+
+    def _record_finished(self, rid: int, stats):
+        """Attach the statistics of an area and show it (or drop a 0-px lasso)."""
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return
+        if int(stats.n_px) == 0:
+            self._discard_record(rid)
+            return
+        self.spectrum_set.set_stats(rid, stats)
+        n = len(self.spectrum_set)
+        if record.is_ready:
+            self.spectra_panel.update_record(record)
+            self._add_plot_items(record)
+            self.roi_label.setText(f"{record.name}: {int(stats.n_px):,} px  ({n} spectra)")
+        else:
+            self.spectra_panel.update_record(record, note="no valid pixel in any band")
+            self.roi_label.setText(f"{record.name}: no valid pixel  ({n} spectra)")
+            self._show_message(f"{record.name}: no valid pixel in any band")
+        self._repaint_overlays()
         self._refresh_status()
 
+    def _record_failed(self, rid: int, message: str):
+        """Mark a record failed (job error or cancellation not asked for by the viewer)."""
+        record = self.spectrum_set.set_stats(rid, None)
+        if record is None:
+            return
+        self.spectra_panel.update_record(record, note=message)
+        self._repaint_overlays()
+        self.roi_label.setText(f"{record.name}: failed  ({len(self.spectrum_set)} spectra)")
+        self._show_message(f"{record.name}: statistics failed ({message})")
+
+    def _discard_record(self, rid: int):
+        """Drop an area that turned out to hold no pixel centre (a thin lasso rasterised in
+        the worker), as if it had never been added: when no record was added after it, the
+        next one gets its colour and name (``SpectrumSet.discard``)."""
+        self._jobs.cancel(rid)
+        self._remove_plot_items(rid)
+        self.spectra_panel.remove_record(rid)
+        self.spectrum_set.discard(rid)
+        if self._selected_rid not in self.spectrum_set:
+            self._selected_rid = None
+        self._sync_overlays()
+        n = len(self.spectrum_set)
+        self.spectra_panel.btn_export.setEnabled(n > 0)
+        self.roi_label.setText(f"Lasso discarded  ({n} spectra)" if n else "Lasso discarded")
+        self._show_message("Lasso discarded: it encloses no pixel centre")
+
+    def _record_added(self, record):
+        """Show a new record in the panel, the views and (when ready) the plot."""
+        self.spectra_panel.add_record(record)
+        if record.is_ready:
+            self._add_plot_items(record)
+        self._sync_overlays()
+        self.spectra_panel.btn_export.setEnabled(True)
+
     # ──────────────────────────────────────────────────────
-    #  SHARED — redraw spectra with tab20 legend
+    #  SPECTRA — edit, hide, delete
     # ──────────────────────────────────────────────────────
 
-    def _redraw_spectra(self):
-        """Redraw all spectra (both modes) with tab20 legend."""
-        import pyqtgraph as pg
+    def rename_spectrum(self, rid: int, name: str) -> bool:
+        """Rename a spectrum; legend, curve name, tree, image tag and export follow.
 
+        A refused name (empty, used by another spectrum, control characters) leaves the
+        old one everywhere and shows the reason in the status bar.
+
+        Returns:
+            bool: True when the name was accepted.
+        """
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return False
+        try:
+            self.spectrum_set.rename(rid, name)
+        except (TypeError, ValueError) as exc:
+            self.spectra_panel.update_record(record)
+            self._show_message(f"Name not changed: {exc}")
+            return False
+        entry = self._plot_entries.get(rid)
+        if entry is not None:
+            entry.curve.opts["name"] = record.name
+            legend = self.spectrum.pw.getPlotItem().legend
+            label = legend.getLabel(entry.curve) if legend is not None else None
+            if label is not None:
+                label.setText(html.escape(record.name, quote=False))
+                legend.updateSize()
+        self.spectra_panel.update_record(record)
+        self._repaint_overlays()
+        return True
+
+    def set_spectrum_visible(self, rid: int, visible: bool) -> None:
+        """Show or hide a spectrum: curve, std band, image outline and export together."""
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return
+        record.visible = bool(visible)
+        self._apply_visibility(record)
+        self.spectra_panel.update_record(record)
+        self._repaint_overlays()
+        self._update_y_range()
+
+    def set_spectrum_show_std(self, rid: int, show: bool) -> None:
+        """Show or hide the shaded +-std band of an area spectrum (exports keep the std)."""
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return
+        record.show_std = bool(show)
+        self._apply_visibility(record)
+        self.spectra_panel.update_record(record)
+        self._update_y_range()
+
+    def set_spectrum_color(self, rid: int, color: str) -> None:
+        """Give one spectrum a new ``'#rrggbb'`` colour (curve, band, legend, outline, tree)."""
+        try:
+            record = self.spectrum_set.set_color(rid, color)
+        except KeyError:
+            return
+        except ValueError as exc:
+            self._show_message(str(exc))
+            return
+        entry = self._plot_entries.get(rid)
+        if entry is not None:
+            entry.curve.setPen(pg.mkPen(color=record.color, width=_CURVE_WIDTH))
+            if entry.fill is not None:
+                entry.fill.setBrush(_fill_brush(record.color))
+            self._update_legend_sample(entry.curve)
+        self.spectra_panel.update_record(record)
+        self._repaint_overlays()
+
+    def delete_spectra(self, rids) -> int:
+        """Delete spectra by rid; their pending jobs are cancelled.  Other colours stay.
+
+        Returns:
+            int: How many records were deleted.
+        """
+        removed = 0
+        for rid in list(rids):
+            self._jobs.cancel(rid)
+            self._remove_plot_items(rid)
+            self.spectra_panel.remove_record(rid)
+            if self.spectrum_set.remove(rid) is not None:
+                removed += 1
+        if self._selected_rid not in self.spectrum_set:
+            self._selected_rid = None
+        self._sync_overlays()
+        self._update_y_range()
+        n = len(self.spectrum_set)
+        self.spectra_panel.btn_export.setEnabled(n > 0)
+        if removed:
+            self.roi_label.setText(f"{removed} deleted  ({n} spectra)" if n else "")
+        self._refresh_status()
+        return removed
+
+    def copy_spectra(self, rids) -> str:
+        """Copy the table of the given spectra (hidden ones too) to the clipboard as TSV.
+
+        Returns:
+            str: The text copied ('' when none of them is computed).
+        """
+        records = [r for r in (self.spectrum_set.get(rid) for rid in rids) if r is not None]
+        try:
+            text = spectra_text(records, self.wavelengths, visible_only=False)
+        except ValueError as exc:
+            self._show_message(f"Nothing copied: {exc}")
+            return ""
+        QApplication.clipboard().setText(text)
+        self._show_message(f"Copied {len(exportable(records, visible_only=False))} spectra "
+                           "as tab-separated text")
+        return text
+
+    def _on_spectrum_selected(self, rid):
+        """Tree selection: draw that record with the thick outline in both views."""
+        if self._closed:
+            return
+        self._selected_rid = rid
+        self.canvas.set_selected_roi(rid)
+        self._rgb_image.set_selected_roi(rid)
+
+    # ──────────────────────────────────────────────────────
+    #  SPECTRA — plot items (one curve per record, never pw.clear())
+    # ──────────────────────────────────────────────────────
+
+    def _add_plot_items(self, record):
+        """Create the curve (and for areas the +-std fill) of a ready record."""
+        if record.rid in self._plot_entries:
+            return
         pw = self.spectrum.pw
+        if pw.getPlotItem().legend is None:
+            pw.addLegend()
+        stats = record.stats
+        mean = np.asarray(stats.mean, dtype=np.float64)
+        curve = pw.plot(self._x, mean, pen=pg.mkPen(color=record.color, width=_CURVE_WIDTH),
+                        name=record.name, connect="finite")
+        escaped = html.escape(record.name, quote=False)
+        if escaped != record.name:
+            pw.getPlotItem().legend.getLabel(curve).setText(escaped)
+        entry = _PlotEntry(curve, y_mean=_finite_range(mean))
+        if record.is_area:
+            std = np.asarray(stats.std, dtype=np.float64)
+            lo, hi = mean - std, mean + std
+            entry.lo = pg.PlotCurveItem(self._x, lo, connect="finite")    # off-scene
+            entry.hi = pg.PlotCurveItem(self._x, hi, connect="finite")
+            entry.fill = pg.FillBetweenItem(entry.lo, entry.hi, brush=_fill_brush(record.color))
+            pw.addItem(entry.fill)
+            entry.y_std = _finite_range(mean, lo, hi)
+        self._plot_entries[record.rid] = entry
+        self._apply_visibility(record)
+        # a click on the legend sample toggles the curve: keep the record in step
+        curve.visibleChanged.connect(partial(self._on_curve_visible_changed, record.rid))
+        self._update_y_range()
 
-        pw.clear()
-        pw.addLegend()
+    def _remove_plot_items(self, rid: int):
+        """Remove a record's curve, legend entry and fill (the band marker stays)."""
+        entry = self._plot_entries.pop(rid, None)
+        if entry is None:
+            return
+        try:
+            entry.curve.visibleChanged.disconnect()
+        except TypeError:
+            pass
+        pw = self.spectrum.pw
+        pw.removeItem(entry.curve)
+        if entry.fill is not None:
+            pw.removeItem(entry.fill)
 
-        for i, (px, py, spectrum) in enumerate(self._spectrum_history):
-            color = TAB20_HEX[i % len(TAB20_HEX)]
-            pen = pg.mkPen(color=color, width=1.5)
+    def _apply_visibility(self, record):
+        """Show / hide the plot items of ``record`` from its ``visible`` / ``show_std``.
 
-            if (
-                self.wavelengths is not None
-                and len(self.wavelengths) == len(spectrum)
-            ):
-                x_data = self.wavelengths
-            else:
-                x_data = np.arange(len(spectrum), dtype=np.float32)
+        The curve's legend sample is repainted too: it draws the hidden state, and
+        pyqtgraph repaints it only after a click on the sample itself.
+        """
+        entry = self._plot_entries.get(record.rid)
+        if entry is None:
+            return
+        entry.curve.setVisible(bool(record.visible))
+        self._update_legend_sample(entry.curve)
+        if entry.fill is not None:
+            entry.fill.setVisible(bool(record.visible and record.show_std))
 
-            pw.plot(
-                x_data, spectrum, pen=pen,
-                name=f"({px},{py})", connect="finite",
-            )
+    def _update_legend_sample(self, curve):
+        """Repaint the legend sample of ``curve`` (after a pen or visibility change)."""
+        legend = self.spectrum.pw.getPlotItem().legend
+        for sample, _label in (legend.items if legend is not None else ()):
+            if sample.item is curve:
+                sample.update()
+                return
 
-        if self._spectrum_history:
-            all_spectra = np.stack([s for _, _, s in self._spectrum_history])
-            ymin = float(all_spectra.min())
-            ymax = float(all_spectra.max())
-            if ymax <= ymin:
-                ymax = ymin + 1.0
-            margin = (ymax - ymin) * 0.08 + 1e-6
-            pw.setYRange(ymin - margin, ymax + margin, padding=0)
+    def _on_curve_visible_changed(self, rid: int):
+        """The curve was shown / hidden from outside (legend click): follow it."""
+        if self._closed:
+            return
+        entry = self._plot_entries.get(rid)
+        record = self.spectrum_set.get(rid)
+        if entry is None or record is None:
+            return
+        visible = entry.curve.isVisibleTo(entry.curve.parentItem())
+        if visible != bool(record.visible):
+            self.set_spectrum_visible(rid, visible)
+
+    def _update_y_range(self):
+        """Fit the y range to the visible curves (and shown std bands), 8 % margin."""
+        lo, hi = math.inf, -math.inf
+        for record in self.spectrum_set:
+            entry = self._plot_entries.get(record.rid)
+            if entry is None or not record.visible:
+                continue
+            a, b = entry.y_std if (entry.fill is not None and record.show_std) else entry.y_mean
+            lo, hi = min(lo, a), max(hi, b)
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            return
+        if hi <= lo:
+            hi = lo + 1.0
+        margin = (hi - lo) * 0.08 + 1e-6
+        self.spectrum.pw.setYRange(lo - margin, hi + margin, padding=0)
+
+    # ──────────────────────────────────────────────────────
+    #  SPECTRA — overlays on both views
+    # ──────────────────────────────────────────────────────
+
+    def _sync_overlays(self):
+        """Hand the current record list to both views (after add / delete / clear)."""
+        records = self.spectrum_set.records()
+        for view in (self.canvas, self._rgb_image):
+            view.set_roi_overlays(records, self._selected_rid)
+
+    def _repaint_overlays(self):
+        """Repaint both views after an in-place record change (name, colour, state...)."""
+        self.canvas.update()
+        self._rgb_image.update()
 
     # ──────────────────────────────────────────────────────
     #  CLEAR ALL POINTS
     # ──────────────────────────────────────────────────────
 
     def _clear_all_points(self):
-        """Clear all spectrum points, dots, and plot."""
-        self._spectrum_history.clear()
-        self.canvas.clear_click_points()
-        self._rgb_image.clear_click_points()
+        """Clear all spectra (points and areas): records, jobs, overlays and plot."""
+        self._jobs.cancel_all()
+        for rid in list(self._plot_entries):
+            self._remove_plot_items(rid)
+        self.spectrum_set.clear()
+        self.spectra_panel.clear()
+        self._selected_rid = None
+        self._sync_overlays()
+        self.spectra_panel.btn_export.setEnabled(False)
         self.roi_label.setText("")
+        self._refresh_status()
 
-        # ★ clear plot + legend ให้หมด (ไม่ใช่แค่ curve)
-        import pyqtgraph as pg
-        pw = self.spectrum.pw
-        pw.clear()
-        pw.addLegend()
-        # re-add band marker (ถ้าต้องการ)
-        if hasattr(self.spectrum, 'band_line'):
-            self.spectrum.band_line.setVisible(False)
-            pw.addItem(self.spectrum.band_line)
+    # ──────────────────────────────────────────────────────
+    #  SPECTRA — export
+    # ──────────────────────────────────────────────────────
+
+    def export_spectra(self, path, ids=None) -> str:
+        """Write spectra to ``path``: XLSX when it ends in ``.xlsx``, else plain CSV.
+
+        Args:
+            path: Target file.  ``.xlsx`` -> workbook with sheets Spectra, ROIs and
+                Metadata (needs openpyxl); anything else -> the plain PVC-style CSV
+                (``.csv`` appended when the name has no extension).
+            ids: rids to export (computed ones, hidden included); None exports every
+                visible computed spectrum.
+
+        Returns:
+            str: The path written.
+
+        Raises:
+            ValueError: Nothing to export (none ready / visible).
+            ImportError: XLSX requested without openpyxl.
+            OSError: The file cannot be written (e.g. open in Excel); it is unchanged.
+        """
+        if ids is None:
+            records, visible_only = self.spectrum_set.records(), True
+        else:
+            records = [r for r in (self.spectrum_set.get(rid) for rid in ids) if r is not None]
+            visible_only = False
+        path = os.fspath(path)
+        if path.lower().endswith(".xlsx"):
+            return export_xlsx(path, records, self.wavelengths, self.export_metadata(),
+                               visible_only=visible_only)
+        return export_csv(path, records, self.wavelengths, visible_only=visible_only)
+
+    def export_metadata(self) -> dict:
+        """Metadata for the XLSX ``Metadata`` sheet: source, units, dtype, shape, axis order,
+        saturation level and the camera scalars of ``config`` (format_version, std ddof,
+        pixel rule and exported_at are added by the writer)."""
+        dtype = np.dtype(self.cube.dtype) if self.cube is not None else None
+        meta = {
+            "source": self.source_path or "",
+            "units": ("counts" if dtype is not None and dtype.kind in "iu"
+                      else "unknown (float cube)"),
+            "dtype": str(dtype),
+            "shape": [self.h, self.w, self.bands],
+            "axis_order": _AXIS_ORDER,
+            "saturation_level": (self._saturation if self._saturation is not None
+                                 else "none (not counted)"),
+            "camera_bin": self.camera_bin,
+        }
+        for key in _CONFIG_SCALARS:
+            value = self.config.get(key)
+            if isinstance(value, (bool, int, float, str, np.integer, np.floating)):
+                meta[key] = value.item() if isinstance(value, np.generic) else value
+        return meta
+
+    def default_export_path(self) -> str:
+        """``<stem>_spectra.csv`` next to the source file (or in the working folder)."""
+        name = f"{self.spectrum_set.source_name}_spectra.csv"
+        if self.source_path:
+            return os.path.join(os.path.dirname(os.path.abspath(self.source_path)), name)
+        return name
+
+    def _export_spectra_dialog(self):
+        """'Export...' button: ask for a CSV / XLSX file and write the checked spectra."""
+        records = self.spectrum_set.records()
+        count = len(exportable(records))
+        if not count:
+            QMessageBox.information(
+                self, "Export spectra",
+                "There is no checked spectrum with computed statistics to export.")
+            return
+        filters = "CSV (*.csv);;Excel workbook (*.xlsx)" if HAVE_OPENPYXL else "CSV (*.csv)"
+        path, selected = QFileDialog.getSaveFileName(
+            self, "Export spectra", self.default_export_path(), filters)
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:            # no extension typed: the chosen filter decides
+            path += ".xlsx" if selected.startswith("Excel") else ".csv"
+        try:
+            written = self.export_spectra(path)
+        except Exception as exc:  # noqa: BLE001 - every export error goes to the user
+            QMessageBox.warning(self, "Export spectra", str(exc))
+            return
+        self._show_message(f"Exported {count} spectra: {written}")
 
     # ──────────────────────────────────────────────────────
     #  BAND NAVIGATION
     # ──────────────────────────────────────────────────────
 
     def on_band_changed(self, band: int):
-        """Select a band: update the label, the image and the status line.
+        """Select a band: update the label, the image, the plot's band marker and the status line.
+
+        The marker moves at once, except while the Space sweep plays or the slider is
+        dragged: then it follows at most every 250 ms (each move repaints the curves under
+        it) and jumps to the band when the sweep stops or the slider is released.
 
         Args:
             band: Band index in ``[0, bands)`` (0-based, not a wavelength).
         """
         self.current_band = int(band)
+        if self._playing or self.band_slider.isSliderDown():
+            if not self._marker_timer.isActive():
+                self._marker_timer.start()
+        else:
+            self._update_band_marker()
 
-        if self.wavelengths is not None and len(self.wavelengths) == self.bands:
+        if self._has_wavelengths():
             wl = self.wavelengths[self.current_band]
             self.band_label.setText(
-                f"\u03bb {wl:.{self.resolution}f} nm  "
+                f"λ {wl:.{self.resolution}f} nm  "
                 f"({self.current_band}/{self.bands - 1})"
             )
+            self.spectra_panel.set_band(
+                self.current_band,
+                f"{wl:.{self.resolution}f} nm (band {self.current_band})")
         else:
             self.band_label.setText(
                 f"Band {self.current_band} / {self.bands - 1}"
             )
+            self.spectra_panel.set_band(self.current_band)
 
         self.update_band_image()
         self._refresh_status()
+
+    def _update_band_marker(self):
+        """Put the dashed band marker at the current band, on the x axis the curves use.
+
+        That is ``wavelengths[band]`` in nm when there is one wavelength per band,
+        otherwise the band index.  A deferred move (sweep / slider drag) is done now.
+        """
+        self._marker_timer.stop()
+        if self._closed:
+            return
+        if self._has_wavelengths():
+            x = float(self.wavelengths[self.current_band])
+        else:
+            x = float(self.current_band)
+        line = self.spectrum.band_line
+        line.setPos(x)
+        line.setVisible(True)
 
     def _step(self, delta: int):
         v = max(0, min(self.current_band + delta, self.bands - 1))
@@ -710,15 +1376,19 @@ class CubeViewerWindow(QWidget):
     def _toggle_play(self):
         self._playing = not self._playing
         self.btn_play.setChecked(self._playing)
-        self.btn_play.setText("\u23F8" if self._playing else "\u25B6")
+        self.btn_play.setText("⏸" if self._playing else "▶")
         (self._anim_timer.start if self._playing else self._anim_timer.stop)()
+        if not self._playing:
+            self._update_band_marker()          # the marker lagged by up to 250 ms
 
     def _anim_step(self):
         self.band_slider.setValue((self.current_band + 1) % self.bands)
 
     def _reset(self):
+        """R key: back to band 0 and fit-to-window zoom in both views; spectra are kept."""
         self.band_slider.setValue(0)
-        self._clear_all_points()
+        self._rgb_image.zoom_fit()
+        self.canvas.zoom_fit()
 
     # ──────────────────────────────────────────────────────
     #  DISPLAY
@@ -754,24 +1424,40 @@ class CubeViewerWindow(QWidget):
     # ──────────────────────────────────────────────────────
 
     def _refresh_status(self):
-        parts = [f"Cube {self.h}\u00d7{self.w}\u00d7{self.bands}"]
-        if self.wavelengths is not None and len(self.wavelengths) == self.bands:
+        parts = [f"Cube {self.h}×{self.w}×{self.bands}"]
+        if self._has_wavelengths():
             parts.append(
-                f"\u03bb={self.wavelengths[self.current_band]:.{self.resolution}f} nm"
+                f"λ={self.wavelengths[self.current_band]:.{self.resolution}f} nm"
             )
-        if self._spectrum_history:
-            parts.append(f"{len(self._spectrum_history)} spectra")
-        self.status_label.setText("  \u00b7  ".join(parts))
+        if len(self.spectrum_set):
+            pending = len(self._jobs.pending())
+            parts.append(f"{len(self.spectrum_set)} spectra"
+                         + (f" ({pending} computing…)" if pending else ""))
+        if self._message:
+            parts.append(self._message)
+        self.status_label.setText("  ·  ".join(parts))
+
+    def _show_message(self, text: str):
+        """Show ``text`` in the status bar for a few seconds."""
+        self._message = str(text)
+        self._message_timer.start()
+        self._refresh_status()
+
+    def _clear_message(self):
+        """Drop the status-bar message (timer)."""
+        self._message = ""
+        if not self._closed:
+            self._refresh_status()
 
     def status_info(self) -> str:
         """Return a one-line summary for a host status bar.
 
         Returns:
             str: Current band (with wavelength in nm when known), number of
-            spectra picked and the cube shape ``H×W×bands``.
+            spectra and the cube shape ``H×W×bands``.
         """
         parts = []
-        if self.wavelengths is not None and len(self.wavelengths) == self.bands:
+        if self._has_wavelengths():
             wl = self.wavelengths[self.current_band]
             parts.append(
                 f"Band {self.current_band}/{self.bands - 1} "
@@ -779,14 +1465,26 @@ class CubeViewerWindow(QWidget):
             )
         else:
             parts.append(f"Band {self.current_band}/{self.bands - 1}")
-        if self._spectrum_history:
-            parts.append(f"{len(self._spectrum_history)} spectra")
-        parts.append(f"Cube {self.h}\u00d7{self.w}\u00d7{self.bands}")
-        return "  \u00b7  ".join(parts)
+        if len(self.spectrum_set):
+            parts.append(f"{len(self.spectrum_set)} spectra")
+        parts.append(f"Cube {self.h}×{self.w}×{self.bands}")
+        return "  ·  ".join(parts)
 
     # ──────────────────────────────────────────────────────
     #  HELPERS
     # ──────────────────────────────────────────────────────
+    def _has_wavelengths(self) -> bool:
+        """True when there is one wavelength per band."""
+        return self.wavelengths is not None and len(self.wavelengths) == self.bands
+
+    def _config_number(self, key: str):
+        """``config[key]`` as a float when it is a finite number, else None."""
+        value = self.config.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) else None
+
     # ★ zoom helpers
     def _active_canvas(self):
         """Return the active canvas (single-band or RGB)."""
@@ -830,13 +1528,31 @@ class CubeViewerWindow(QWidget):
         return f
 
     def closeEvent(self, event):
-        """Stop the sweep timer, close the export dialog and release data references (Qt override)."""
-        self._anim_timer.stop()
-        if self._export_dlg:
-            self._export_dlg.close()
-            self._export_dlg = None
-        self.cube = None
-        self.wavelengths = None
-        self.canvas = None
-        self.spectrum = None
+        """Stop the jobs and timers, clear the spectra, close the export dialog, then release
+        the cube and the other data references (Qt override).
+
+        The worker thread is joined first (a running ``roi_stats`` stops within one ~1 MB
+        chunk, a lasso mask rasterised in the worker within one ~10 ms batch of
+        ``polygon_mask``), so no job still reads the cube when it is dropped.  Safe to call
+        twice.
+        """
+        if not self._closed:
+            self._closed = True
+            self._anim_timer.stop()
+            self._message_timer.stop()
+            self._marker_timer.stop()
+            self._jobs.shutdown()
+            self.spectrum_set.clear()
+            self._plot_entries.clear()
+            self.spectra_panel.clear()
+            for view in (self.canvas, self._rgb_image):
+                view.cancel_drawing()
+                view.set_roi_overlays(())
+            if self._export_dlg:
+                self._export_dlg.close()
+                self._export_dlg = None
+            self.cube = None
+            self.wavelengths = None
+            self.canvas = None
+            self.spectrum = None
         super().closeEvent(event)

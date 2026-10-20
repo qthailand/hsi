@@ -54,7 +54,10 @@ store.save_wavelength_default(profile, camera_config)
     processing.json       resolution, raw_inverted, rgb_target_wavelengths, preprocessing_backend,
                           profile_timing (optional, default true: log [profile] stage timings),
                           resolution_source (optional, "config" | "fwhm", default "config"),
-                          fwhm_step_factor (optional, default 1.0)
+                          fwhm_step_factor (optional, default 1.0),
+                          wavelength_range_nm (optional, {camera_backend: [start_nm, end_nm] | null};
+                          backend names are lower-cased, values rounded to 0.1 nm, start < end;
+                          missing/null = the full calibrated range; written by the Scan Window)
     dark.json             dark_frame_folder, dark_frame_n_frames
     smile.json            smile_map_folder
     camera_<uuid>.json    legacy only: older versions wrote it on Save as Default; used until camera.json is edited after it
@@ -82,7 +85,10 @@ store.save_wavelength_default(profile, camera_config)
 
 * `SECTIONS`: section name to the keys it stores.
 * `ConfigStore(directory)`: `.directory`, `.root`, `.manifest`;
-  `initialize(data)`, `read()`, `save_wavelength_default(profile, config)`, `wavelength_folder(camera_backend)`.
+  `initialize(data)`, `read()`, `save_wavelength_default(profile, config)`, `wavelength_folder(camera_backend)`,
+  `update_section(section, values)` (write only those keys), `update_section_entry(section, key, entry, value)`
+  (set or, with `None`, remove one entry of an object-valued key such as `wavelength_range_nm`; entry names
+  match without regard to case and the other entries are read from the file).
 
 ## Threading
 

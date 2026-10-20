@@ -26,8 +26,44 @@ Example:
 """
 import libximc.highlevel as ximc
 from ctypes import *
+import glob
+import os
 import time
 import math
+
+#: Stable links to USB serial devices on Linux; an XIMC controller's link names it.
+_SERIAL_BY_ID = "/dev/serial/by-id"
+
+
+def _device_uri(device: str) -> str:
+    """libximc URI for ``device``: a path (``/dev/...``) gets ``xi-com:``; a URI is kept."""
+    device = str(device).strip()
+    return device if device.startswith("xi-") else "xi-com:" + device
+
+
+def _find_device_uri(device: str = "") -> str:
+    """URI of the stage to open.
+
+    ``device`` (``stage_device`` in ``config/scan.json``) if set; else the first device
+    libximc enumerates (Windows); else, on Linux where enumeration needs the vendor's
+    ``/dev/ximc`` udev links, the first ``/dev/serial/by-id`` link whose name contains XIMC.
+
+    Raises:
+        RuntimeError: nothing found; the message lists the serial devices present.
+    """
+    if str(device or "").strip():
+        return _device_uri(device)
+    devices = ximc.enumerate_devices(ximc.EnumerateFlags.ENUMERATE_PROBE)
+    if len(devices) > 0:
+        return devices[0]['uri']
+    links = sorted(glob.glob(os.path.join(_SERIAL_BY_ID, "*")))
+    ximc_links = [link for link in links if "ximc" in os.path.basename(link).lower()]
+    if ximc_links:
+        return _device_uri(ximc_links[0])
+    ports = links or sorted(glob.glob("/dev/ttyACM*"))
+    found = f" Serial devices found: {', '.join(ports)}." if ports else ""
+    raise RuntimeError("No XIMC stage detected; check stage power and USB connection, or set "
+                       f"stage_device in config/scan.json (e.g. a {_SERIAL_BY_ID}/... path).{found}")
 
 # FULL STEP 0.02°
 # MIN 1/8 STEP 0.0025°
@@ -44,16 +80,19 @@ class Stage8SMC1:
     STEPPERSTAGE = 18000
     DEGREEPERSTEP = 0.02
 
-    def __init__(self, open_on_init=False):
+    def __init__(self, open_on_init=False, device=""):
         """Create the driver (does not touch the hardware unless asked).
 
         Args:
             open_on_init: Call ``open()`` immediately.
+            device: Device path (e.g. ``/dev/serial/by-id/...``) or libximc URI; empty =
+                find it (see :func:`_find_device_uri`).
 
         Raises:
             RuntimeError: ``open_on_init`` is true and no stage is found.
         """
         self._axis = None
+        self.device = device
         self.device_id = None
         self._opened = False
         self._enum = None
@@ -74,7 +113,7 @@ class Stage8SMC1:
         return False
 
     def open(self):
-        """Connect to the first XIMC device found and read its settings (no-op if open).
+        """Connect to ``device`` (or the XIMC device found) and read its settings (no-op if open).
 
         On the rotation stage this also sets the engine to half-microstep mode
         (``MICROSTEP_MODE_FRAC_2``) and reads move settings and position. Prints progress.
@@ -87,28 +126,25 @@ class Stage8SMC1:
             return
 
         print("Library loaded successfully")
-        devices = ximc.enumerate_devices(ximc.EnumerateFlags.ENUMERATE_PROBE)
-        if len(devices) == 0:
-            raise RuntimeError("No XIMC stage detected; check stage power and USB connection")
-        else:
-            device_uri = devices[0]['uri']
-            self._axis = ximc.Axis(device_uri)
-            self._axis.open_device()
-            self._opened = True
-            try:
-                version = ximc.ximc_version()
-                print("Opened:", version)
-            except Exception:
-                self.close()
-                raise
-            try:
-                self.sync_engine()
-                self.set_engine()
-                self.sync_speed()
-                self.sync_position()
-            except Exception:
-                self.close()
-                raise
+        device_uri = _find_device_uri(self.device)
+        print("Stage device:", device_uri)
+        self._axis = ximc.Axis(device_uri)
+        self._axis.open_device()
+        self._opened = True
+        try:
+            version = ximc.ximc_version()
+            print("Opened:", version)
+        except Exception:
+            self.close()
+            raise
+        try:
+            self.sync_engine()
+            self.set_engine()
+            self.sync_speed()
+            self.sync_position()
+        except Exception:
+            self.close()
+            raise
 
     def close(self):
         """Close the device (no-op if not open). The driver can be re-opened afterwards."""
@@ -337,16 +373,19 @@ class Stage8SMC1Linear:
 
     STEPS_PER_MM = 50.0
     MM_PER_STEP = 1.0 / STEPS_PER_MM  # 0.02 mm/step
-    def __init__(self, open_on_init=False):
+    def __init__(self, open_on_init=False, device=""):
         """Create the driver (does not touch the hardware unless asked).
 
         Args:
             open_on_init: Call ``open()`` immediately.
+            device: Device path (e.g. ``/dev/serial/by-id/...``) or libximc URI; empty =
+                find it (see :func:`_find_device_uri`).
 
         Raises:
             RuntimeError: ``open_on_init`` is true and no stage is found.
         """
         self._axis = None
+        self.device = device
         self.device_id = None
         self._opened = False
         self._enum = None
@@ -369,7 +408,7 @@ class Stage8SMC1Linear:
         return False
 
     def open(self):
-        """Connect to the first XIMC device found and read its settings (no-op if open).
+        """Connect to ``device`` (or the XIMC device found) and read its settings (no-op if open).
 
         Reads move settings and position; the engine settings are left as configured on
         the controller. Prints progress. If any step fails the device is closed again
@@ -382,26 +421,23 @@ class Stage8SMC1Linear:
             return
 
         print("Library loaded successfully")
-        devices = ximc.enumerate_devices(ximc.EnumerateFlags.ENUMERATE_PROBE)
-        if len(devices) == 0:
-            raise RuntimeError("No XIMC stage detected; check stage power and USB connection")
-        else:
-            device_uri = devices[0]['uri']
-            self._axis = ximc.Axis(device_uri)
-            self._axis.open_device()
-            self._opened = True
-            try:
-                version = ximc.ximc_version()
-                print("Opened:", version)
-            except Exception:
-                self.close()
-                raise
-            try:
-                self.sync_speed()
-                self.sync_position()
-            except Exception:
-                self.close()
-                raise
+        device_uri = _find_device_uri(self.device)
+        print("Stage device:", device_uri)
+        self._axis = ximc.Axis(device_uri)
+        self._axis.open_device()
+        self._opened = True
+        try:
+            version = ximc.ximc_version()
+            print("Opened:", version)
+        except Exception:
+            self.close()
+            raise
+        try:
+            self.sync_speed()
+            self.sync_position()
+        except Exception:
+            self.close()
+            raise
 
     def close(self):
         """Close the device (no-op if not open). The driver can be re-opened afterwards."""

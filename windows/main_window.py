@@ -298,6 +298,7 @@ class MainWindow(QMainWindow):
             self.create_cube_viewer(
                 cube=cube, wavelengths=wavelengths,
                 title=f"ENVI Cube {Path(path).name}",
+                source_path=path,
             )
         except Exception as e:
             logger.exception("Failed to open ENVI cube: %s", e)
@@ -316,8 +317,12 @@ class MainWindow(QMainWindow):
             camera_bits = {**(camera_bits or {}), **self.scan_controller.last_scan_temperatures}
         self.create_cube_viewer(cube, wavelengths, camera_bits=camera_bits)
 
-    def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None):
-        """Open a Cube Viewer; ``camera_bits`` (``camera_bit_info``) goes into the ENVI export header."""
+    def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None):
+        """Open a Cube Viewer; ``camera_bits`` (``camera_bit_info``) goes into the ENVI export header.
+
+        ``source_path`` (the opened ENVI header) names the viewer's area spectra and its
+        default spectra export file; None for a cube that has no file yet.
+        """
         from modules.cube_viewer.window import CubeViewerWindow
 
         mapper = None
@@ -349,6 +354,7 @@ class MainWindow(QMainWindow):
                 display_mapper=mapper,
                 config=cfg,
                 camera_bin=self.scan_controller.camera_bin if self.scan_controller is not None else 1,
+                source_path=source_path,
             )
         except Exception as e:
             QMessageBox.critical(self, "Viewer Error", str(e))

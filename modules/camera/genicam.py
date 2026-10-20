@@ -58,14 +58,22 @@ TARGET_TEMPERATURE_NODES = (
     "TemperatureSetpoint", "TECTemperatureSetpoint", "TECSetpoint",
 )
 #: Nodes that switch the cooler on (bool, or an enumeration with an "On"-like entry).
+#: SVS fxo992MXGE-T: ``SensorTemperatureControl`` = OFF / Cooling / CoolingandHeating.
 COOLER_ENABLE_NODES = (
+    "SensorTemperatureControl",
     "TECEnable", "DeviceTECEnable", "TECControl", "TECMode", "TECControlMode",
     "CoolingEnable", "CoolerEnable", "Cooling", "Cooler",
 )
+#: Read-only TEC regulation state (SVS: SensorTemp_low / _high / _stable / _alert).
+COOLING_STATE_NODES = ("SensorTemperatureControlState", "TECStatus", "TECState", "CoolingState")
+#: ``DeviceTemperatureSelector`` entry measured by ``get_temperature`` (the sensor, not the board),
+#: when the camera offers it; otherwise the selector is left as the camera has it.
+TEMPERATURE_SELECTOR_ENTRY = "Sensor"
 _TARGET_PATTERN = re.compile(r"(?i)(tec|cool).*(target|set)|target.*temp|temp.*set")
 _ENABLE_PATTERN = re.compile(r"(?i)^(device)?(tec|cool(ing|er)?)(enable|mode|control|controlmode|state)?$")
 _COOLING_LOG_PATTERN = re.compile(r"(?i)temp|tec|cool|peltier|fan")
-_ON_VALUES = (True, "On", "Active", "Enable", "Enabled", "Auto", "Continuous")
+_ON_VALUES = ("Cooling", True, "On", "Active", "Enable", "Enabled", "Auto", "Continuous")
+_STATE_PREFIX = re.compile(r"(?i)^(sensor_?temp(erature)?_?|tec_?|cooling_?)")
 
 
 def pixel_format_bits(name):
@@ -144,6 +152,7 @@ class GenICamBackend(AbstractCameraBackend):
         self._source_bits = 12              # transmitted bits per pixel (see pixel_format_bits)
         self._target_temp_node: str | None = None    # writable TEC set-point found at open
         self._cooler_enable_node: str | None = None
+        self._cooling_state_node: str | None = None
 
         # GigE config
         self.BUFFER_COUNT = 64
@@ -270,8 +279,24 @@ class GenICamBackend(AbstractCameraBackend):
             (n for n in target_names if self._is_writable(n) and self._is_numeric(n)), None)
         self._cooler_enable_node = next(
             (n for n in enable_names if n != self._target_temp_node and self._is_writable(n)), None)
-        logger.info("GenICam cooling: target node %s, cooler switch %s",
-                    self._target_temp_node, self._cooler_enable_node)
+        self._cooling_state_node = next(
+            (n for n in COOLING_STATE_NODES if self._read_node(n) is not None), None)
+        logger.info("GenICam cooling: target node %s, cooler switch %s, state node %s",
+                    self._target_temp_node, self._cooler_enable_node, self._cooling_state_node)
+        self._select_sensor_temperature()
+
+    def _select_sensor_temperature(self) -> None:
+        """Point ``DeviceTemperatureSelector`` at the sensor so ``get_temperature`` reads the sensor."""
+        if not self._has_node("DeviceTemperatureSelector"):
+            return
+        before = self._read_node("DeviceTemperatureSelector")
+        if self._set_node_value("DeviceTemperatureSelector", TEMPERATURE_SELECTOR_ENTRY):
+            logger.info("GenICam DeviceTemperatureSelector %s -> %s: DeviceTemperature = %s",
+                        before, self._read_node("DeviceTemperatureSelector"),
+                        self._read_node("DeviceTemperature"))
+        else:
+            logger.warning("GenICam DeviceTemperatureSelector has no writable %r entry; temperature "
+                           "is measured at %s", TEMPERATURE_SELECTOR_ENTRY, before)
 
     def _exec_node(self, name: str) -> bool:
         node = self._node(name)
@@ -784,7 +809,11 @@ class GenICamBackend(AbstractCameraBackend):
 
     def get_temperature(self) -> float:
         """Return the first of DeviceTemperature/Temperature/TemperatureAbs in degrees Celsius,
-        or ``-999.0`` if none is available."""
+        or ``-999.0`` if none is available.
+
+        ``DeviceTemperature`` is measured where ``DeviceTemperatureSelector`` points; ``open``
+        selects the sensor (:data:`TEMPERATURE_SELECTOR_ENTRY`) when the camera offers it.
+        """
         if self._nm is None:
             return -999.0
         for node_name in ("DeviceTemperature", "Temperature", "TemperatureAbs"):
@@ -792,6 +821,16 @@ class GenICamBackend(AbstractCameraBackend):
             if val is not None:
                 return float(val)
         return -999.0
+
+    def cooling_state(self):
+        """TEC regulation state from the state node (``"stable"``, ``"low"``, ``"high"``,
+        ``"alert"`` on SVS cameras), or ``None`` if the camera has none."""
+        if self._nm is None or self._cooling_state_node is None:
+            return None
+        value = self._read_node(self._cooling_state_node)
+        if value is None:
+            return None
+        return _STATE_PREFIX.sub("", str(value)) or str(value)
 
     def cooling_supported(self) -> bool:
         """True when ``open`` found a writable TEC set-point node (see ``TARGET_TEMPERATURE_NODES``)."""

@@ -7,7 +7,7 @@ if not __package__:
     __package__ = "modules.radiometric"
 import argparse
 import numpy as np
-from .core import create_datacube_logic, create_datacube_resampled_logic, rowwise_calculation_heavy_logic, fluo_calculation_heavy_logic
+from .core import create_datacube_logic, create_datacube_resampled_logic, rowwise_calculation_heavy_logic, fluo_calculation_heavy_logic, save_factor_profile, load_factor_profile
 from modules.cube_io.envi import parse_envi_header
 
 def main():
@@ -15,7 +15,8 @@ def main():
 
     Without ``--input`` the Qt calibration window is shown. With ``--input`` one of three
     jobs runs: ``--compute rowwise|fluorescence`` (needs ``--roi-mask`` NPY, rowwise also
-    ``--reference-spectrum`` XLSX; saves factors to ``--output`` as ``.npy``), or a cube
+    ``--reference-spectrum`` XLSX; saves factors to ``--output`` as ``.npy`` plus
+    ``<name>.wavelength.npy``), or a cube
     export (optionally ``--crop``, ``--factors``/``--rowwise`` NPY, ``--spatial-bin``,
     ``--target-grid START STOP STEP`` for resampling) written as ENVI BIP to ``--output``.
     Argument errors exit via ``argparse``.
@@ -46,13 +47,14 @@ def main():
             if not a.reference_spectrum or a.avg_window<1 or meta['wavelength'] is None:p.error('Rowwise calibration requires reference spectrum, wavelengths and positive window')
             result=rowwise_calculation_heavy_logic(a.input,meta,a.reference_spectrum,a.avg_window,mask)
         else:result=fluo_calculation_heavy_logic(a.input,meta,mask)
-        np.save(a.output,result['factors']);print(a.output);return
+        save_factor_profile(a.output,result['factors'],meta['wavelength']);print(a.output);return
     crop=a.crop or (0,meta['samples'],0,meta['lines'])
     x0,x1,y0,y1=crop
     if not (0<=x0<x1<=meta['samples'] and 0<=y0<y1<=meta['lines']):p.error('Crop outside input dimensions')
     if min(x1-x0,y1-y0)<a.spatial_bin:p.error('Crop smaller than spatial bin')
     if a.factors and a.rowwise:p.error('Choose --factors or --rowwise')
-    params=dict(raw_filepath=a.input,raw_meta=meta,save_path=a.output,crop_coords=crop,is_wavelength=meta['wavelength'] is not None,band_count=meta['bands'],factors=None if not a.factors else np.load(a.factors,allow_pickle=False),rowwise_factors=None if not a.rowwise else np.load(a.rowwise,allow_pickle=False),binning_factor=a.spatial_bin)
+    factors,factor_wl=load_factor_profile(a.factors or a.rowwise) if (a.factors or a.rowwise) else (None,None)
+    params=dict(raw_filepath=a.input,raw_meta=meta,save_path=a.output,crop_coords=crop,is_wavelength=meta['wavelength'] is not None,band_count=meta['bands'],factors=factors if a.factors else None,rowwise_factors=factors if a.rowwise else None,factor_wavelengths=factor_wl,binning_factor=a.spatial_bin)
     if a.target_grid:
         start,stop,step=a.target_grid
         if step<=0 or stop<=start or meta['wavelength'] is None:p.error('Positive target grid and input wavelength metadata required')

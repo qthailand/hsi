@@ -32,7 +32,7 @@ Example:
     >>> win.load_from_memory(cube, wavelengths)                 # doctest: +SKIP
 """
 from .workers import Worker
-from .core import _apply_spatial_binning, rowwise_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, fluo_calculation_heavy_logic, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles
+from .core import _apply_spatial_binning, rowwise_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, fluo_calculation_heavy_logic, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles, check_factor_bands, save_factor_profile, load_factor_profile
 from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, release_band_maps
 # -*- coding: utf-8 -*-
 import numpy as np
@@ -109,6 +109,8 @@ class CalibrationWindow(QWidget):
     isWavelength: bool = False
 
     rowwise_factors: np.ndarray = None
+    _factor_wavelengths: np.ndarray = None      # nm of the active factors' bands, or None (unknown)
+    _reference_wavelengths: np.ndarray = None   # nm of the reference a calibration is running on
     spectralon_rows_span: tuple = None
     thread: QThread = None
     worker: Worker = None
@@ -531,6 +533,7 @@ class CalibrationWindow(QWidget):
                 self.preview_idx_edit.setText("113")
                 self.preview_slider.setEnabled(False)
 
+            self._drop_factors_not_fitting_cube()
             self.update_preview_image()
             self.mark_button_done(self.btn)
             self._clear_memmap_temp_states()
@@ -671,6 +674,7 @@ class CalibrationWindow(QWidget):
         self.wavelengths = None
         self.rowwise_factors = None
         self.factors = None
+        self._factor_wavelengths = None
         self._source_mode = None
 
         self.label.setText('...')
@@ -740,6 +744,39 @@ class CalibrationWindow(QWidget):
         self._cal_temp_building = False
         self._post_build_actions.clear()
 
+    def _reference_refused(self, ref_meta) -> bool:
+        """Warn and return True if factors from ``ref_meta``'s bands would not fit the loaded cube."""
+        if not self.raw_meta:
+            return False                        # checked when a cube is loaded
+        try:
+            check_factor_bands(ref_meta['bands'], ref_meta.get('wavelength'), self.raw_meta)
+        except ValueError as e:
+            QMessageBox.warning(self, 'Reference not used', str(e))
+            return True
+        return False
+
+    def _drop_factors_not_fitting_cube(self):
+        """Clear the active factors, with a warning, if they do not fit the cube just loaded."""
+        factors = self.rowwise_factors if self.rowwise_factors is not None else getattr(self, 'factors', None)
+        if factors is None:
+            return
+        try:
+            check_factor_bands(np.shape(factors)[-1], self._factor_wavelengths, self.raw_meta)
+            return
+        except ValueError as e:
+            message = str(e)
+        self.rowwise_factors = None
+        self.factors = None
+        self._factor_wavelengths = None
+        self.label_profile.setText("No reflectance profile loaded.")
+        self.label_fluo_profile.setText("No fluorescence profile loaded.")
+        for btn in (self.btn_rowwise, self.btn_save_profile, self.btn_fluo_cal, self.btn_save_fluo_profile):
+            btn.setEnabled(True)
+        for btn in (self.btn_rowwise, self.btn_load_profile, self.btn_save_profile,
+                    self.btn_fluo_cal, self.btn_load_fluo_profile, self.btn_save_fluo_profile):
+            btn.setStyleSheet("")
+        QMessageBox.warning(self, 'Calibration cleared', f"{message}\n\nThe calibration factors were cleared.")
+
     # =====================================================================
     #  Calibration UI
     # =====================================================================
@@ -754,7 +791,7 @@ class CalibrationWindow(QWidget):
             self, "Save Calibration Profile", "", "NumPy Array (*.npy)")
         if save_path:
             try:
-                np.save(save_path, self.rowwise_factors)
+                save_factor_profile(save_path, self.rowwise_factors, self._factor_wavelengths)
                 QMessageBox.information(self, 'Success', f'Profile saved:\n{save_path}')
                 self.mark_button_done(self.btn_save_profile)
             except Exception as e:
@@ -767,8 +804,12 @@ class CalibrationWindow(QWidget):
             self, "Load Calibration Profile", "", "NumPy Array (*.npy)")
         if load_path:
             try:
-                self.rowwise_factors = np.load(load_path)
+                factors, wavelengths = load_factor_profile(load_path)
+                if self.raw_meta:
+                    check_factor_bands(np.shape(factors)[-1], wavelengths, self.raw_meta)
+                self.rowwise_factors = factors
                 self.factors = None
+                self._factor_wavelengths = wavelengths
                 self.label_profile.setText(f"Loaded: {os.path.basename(load_path)}")
                 QMessageBox.information(self, 'Success', f'Profile loaded:\n{load_path}')
                 self.mark_button_done(self.btn_load_profile)
@@ -834,10 +875,13 @@ class CalibrationWindow(QWidget):
             QMessageBox.warning(self, 'Error', 'Invalid averaging window size.')
             return
 
+        if self._reference_refused(ref_meta):
+            return
         mask = self.select_roi_on_main(ref_filepath, ref_meta, ref_excel)
         if mask is None:
             return
 
+        self._reference_wavelengths = ref_meta.get('wavelength')
         self.progess.setMaximum(ref_meta['bands'])
         self.progess.setValue(0)
         worker, thread = self._run_in_thread(
@@ -855,6 +899,7 @@ class CalibrationWindow(QWidget):
             self.rowwise_factors = result['factors']
             self.spectralon_rows_span = result['span']
             self.factors = None
+            self._factor_wavelengths = self._reference_wavelengths
             self.label_profile.setText("Row-wise factors computed.")
             QMessageBox.information(self, 'Row-wise Calibration',
                                     'Row-wise factors computed successfully.')
@@ -912,6 +957,7 @@ class CalibrationWindow(QWidget):
             "band_count": self.raw_meta['bands'],
             "factors": getattr(self, 'factors', None),
             "rowwise_factors": self.rowwise_factors,
+            "factor_wavelengths": self._factor_wavelengths,
             "binning_factor": n_bin,
         }
         worker, thread = self._run_in_thread(self.create_datacube_logic, params)
@@ -998,6 +1044,7 @@ class CalibrationWindow(QWidget):
             "is_wavelength": self.nanometer.isChecked(),
             "factors": getattr(self, 'factors', None),
             "rowwise_factors": getattr(self, 'rowwise_factors', None),
+            "factor_wavelengths": self._factor_wavelengths,
             "lam_target": lam_target.tolist(),
             "binning_factor": n_bin
         }
@@ -1425,7 +1472,8 @@ class CalibrationWindow(QWidget):
             params={'raw_filepath': self.raw_filepath, 'raw_meta': self.raw_meta,
                     'save_path': tmp_cal, 'crop': (x0, x1, y0, y1),
                     'factors': getattr(self, 'factors', None),
-                    'rowwise_factors': getattr(self, 'rowwise_factors', None)})
+                    'rowwise_factors': getattr(self, 'rowwise_factors', None),
+                    'factor_wavelengths': self._factor_wavelengths})
 
         def _cal_ready(meta):
             try:
@@ -1474,10 +1522,13 @@ class CalibrationWindow(QWidget):
             QMessageBox.warning(self, 'Error', str(e))
             return
 
+        if self._reference_refused(ref_meta):
+            return
         mask = self.select_roi_fluo_main(ref_filepath, ref_meta)
         if mask is None:
             return
 
+        self._reference_wavelengths = ref_meta.get('wavelength')
         self.progess.setMaximum(ref_meta['bands'])
         self.progess.setValue(0)
         worker, thread = self._run_in_thread(
@@ -1503,6 +1554,7 @@ class CalibrationWindow(QWidget):
         if result:
             self.factors = result['factors']
             self.rowwise_factors = None
+            self._factor_wavelengths = self._reference_wavelengths
             self.label_fluo_profile.setText("Fluorescence factors (Smoothed) computed.")
             self.label_profile.setText("No reflectance profile loaded.")
             QMessageBox.information(self, 'Fluorescence Calibration',
@@ -1528,7 +1580,7 @@ class CalibrationWindow(QWidget):
             self, "Save Fluorescence Profile", "", "NumPy Array (*.npy)")
         if save_path:
             try:
-                np.save(save_path, self.factors)
+                save_factor_profile(save_path, self.factors, self._factor_wavelengths)
                 QMessageBox.information(self, 'Success', f'Profile saved:\n{save_path}')
                 self.mark_button_done(self.btn_save_fluo_profile)
             except Exception as e:
@@ -1541,8 +1593,12 @@ class CalibrationWindow(QWidget):
             self, "Load Fluorescence Profile", "", "NumPy Array (*.npy)")
         if load_path:
             try:
-                self.factors = np.load(load_path)
+                factors, wavelengths = load_factor_profile(load_path)
+                if self.raw_meta:
+                    check_factor_bands(np.shape(factors)[-1], wavelengths, self.raw_meta)
+                self.factors = factors
                 self.rowwise_factors = None
+                self._factor_wavelengths = wavelengths
                 self.label_fluo_profile.setText(f"Loaded: {os.path.basename(load_path)}")
                 self.label_profile.setText("No reflectance profile loaded.")
                 QMessageBox.information(self, 'Success', f'Profile loaded:\n{load_path}')

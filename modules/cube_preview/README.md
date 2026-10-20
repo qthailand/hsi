@@ -46,6 +46,10 @@ preview.reset()                                # start of a scan
 # for every camera frame (GUI thread):
 #     preview.push_frame(frame, wavelengths, bands=200)   # frame (slit, wavelength)
 # preview.push_frames(list_of_frames, wavelengths, 200)   # batch variant
+# or show a list that grows elsewhere (read by reference, never copied):
+#     preview.set_frame_source(recording_list, wavelengths)
+#     preview.set_frame_source(final_list, wavelengths, shift=n)  # same frames, n cut off the start;
+#                                                              # points/spectra/bands/zoom stay
 # preview.set_saturation_mask(mask)                       # optional (n_frames, slit) bool
 ```
 
@@ -77,15 +81,16 @@ outer contours not touching the border, best-scoring one among the large ones.
 ## API summary
 
 * `RealtimeCubePreviewWidget(rgb_target_wavelengths=(645, 555, 465))`: `push_frame(frame, wavelengths, bands)`,
-  `push_frames(frames, wavelengths, bands)`, `reset()` (the next image is shown fitted to the canvas),
+  `push_frames(frames, wavelengths, bands)`, `set_frame_source(frames, wavelengths=None, shift=0)`,
+  `reset()` (the next image is shown fitted to the canvas),
   `set_saturation_mask(mask)`, `cleanup()`; attributes `image_label` (white background), `frame_label`,
   `pixel_label`, `shape_label`, `spec_plot`.
 * `CenteredPixmapLabel(parent=None, background="#0d0d0d")`: signals `clicked(int, int)`, `zoom_changed(float)`; `setPixmapScaled`, `getPixmap`,
-  `add_click_point`, `clear_click_points`, `set_shape_overlay(outline, text)`, `clear_shape_overlay`.
+  `add_click_point`, `clear_click_points`, `click_points`, `set_shape_overlay(outline, text)`, `clear_shape_overlay`.
 * `shape_check.detect_shape(rgb8, "circle" | "square") -> ShapeResult | None` (pure, any thread):
   `score`, `circularity`, `squareness`, `aspect`, `width`, `height`, `center`, `area`, `outline`.
 * `CubeRenderWorker`: signals `rgb_ready(object, int, int)`, `frames_count_ready(int)`,
-  `spectrum_ready(object, object, int, int)`; `start`, `stop`, `push_frame(s)`, `set_wavelengths`,
+  `spectrum_ready(object, object, int, int)`; `start`, `stop`, `push_frame(s)`, `set_frames`, `set_wavelengths`,
   `set_rgb_bands`, `request_spectrum`, `reset`.
 
 `__widgets__ = ("RealtimeCubePreviewWidget", "CenteredPixmapLabel")`.

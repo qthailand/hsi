@@ -38,9 +38,16 @@ camera.read_frame_raw()                       modules.camera
   -> spectral binning                         modules.spectral_processing
   -> ScanRecorder.offer()  (EVERY frame)      modules.acquisition  (worker thread)
   -> frame_ready  (<= 30 fps, display only)   CameraPreviewThread -> ScanController -> widgets
-  -> cube_frames_ready (batches, every frame) -> real-time cube preview
+  -> real-time cube preview reads the recorder's own list (live_recorded_frames), every frame
 scan end: ScanSession.finish() -> cube = create_pushbroom_cube_from_corrected(images)
 ```
+
+A **wavelength range** (Scan Window, per camera backend in `processing.json` `wavelength_range_nm`)
+acts only in the binner: the engine fits the full bin grid as always and keeps the bins whose
+every pixel lies inside the range (`LambdaBinner.subset`). The frame stays full width up to the
+binning, so dark, hot pixel, Smile, the calibration Grab and Keep Spectrogram are unaffected, and
+the kept bins are bit-identical to the same bins without a range. Changes apply at a frame
+boundary in preview, are refused during a scan, and are resolved again after bin/calibration changes.
 
 The 30 fps limit applies to what the GUI draws. Display frames are pulled: the worker keeps
 only the newest one, and the GUI takes it when ready and then rests at least as long as it was

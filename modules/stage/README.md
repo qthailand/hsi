@@ -66,6 +66,10 @@ unopened driver with `open/close/set_position/set_speed...`).
 ## Data formats / conventions
 
 * Rotation: degrees and degrees/second (full step 0.02 deg; speed limit 20 deg/s).
+* Device: `stage_device` (config/scan.json) path or URI; empty = libximc enumeration,
+  else (Linux, no `/dev/ximc` udev links) the first `/dev/serial/by-id` link naming XIMC.
+* Homing before a scan runs at `HOMING_SPEED_STEPS_S` = 500 full steps/s on both stages
+  (linear 10 mm/s, rotation 10 deg/s); the return home after a scan uses the scan speed (v1).
 * Linear: millimetres and mm/s; **`speed_um_s` on the sequence is micrometres/second**.
   50 steps per mm.
 * `StageSequence.phase`: `idle, opening, homing, scanning, returning, closing`.

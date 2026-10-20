@@ -26,26 +26,23 @@ def test_recorder_records_only_when_armed_and_keeps_raw_aligned():
     assert not r.enabled and r.count() == 0                                # take disarms and empties
 
 
-def test_recorder_batches_by_interval_and_arming_clears():
+def test_recorder_live_list_and_arming_clears():
     r = ScanRecorder(); r.set_recording(True)
+    live = r.live_frames()
     r.offer(np.zeros(1), np.zeros(1), False)
-    assert r.pop_batch(now=100.0) is not None                              # first batch is due immediately
-    r.offer(np.zeros(1), np.zeros(1), False)
-    assert r.pop_batch(now=100.001) is None                                # too soon
-    assert len(r.pop_batch(now=101.0)) == 1
+    assert len(live) == 1                                                  # a preview sees it at once
     r.take_frames(); r.set_recording(True)
-    assert r.count() == 0
+    assert r.count() == 0 and r.live_frames() is not live                  # arming starts a new list
 
 
 # ───────────────────────────── session ─────────────────────────────
 
-def test_session_cube_outcome_and_preview_tail():
+def test_session_cube_outcome():
     s = ScanSession(); s.begin()
     assert s.state == s.SCANNING and not s.recording
     frames = [np.zeros((4, 3), np.uint16)] * 5
-    s.note_preview_frames(3)
     outcome = s.finish(frames, raw=[])
-    assert outcome.kind == 'cube' and len(outcome.tail) == 2 and s.state == s.PREVIEW
+    assert outcome.kind == 'cube' and outcome.images is frames and s.state == s.PREVIEW
     s.begin(); assert s.finish([], []).kind == 'empty'
 
 
@@ -73,11 +70,10 @@ from hsi_fakes import FakeCamera, W, H  # noqa: E402
 
 class Collector(AcquisitionSink):
     def __init__(self):
-        self.frames, self.errors, self.bins, self.failed_bins, self.batches = [], [], [], [], []
+        self.frames, self.errors, self.bins, self.failed_bins = [], [], [], []
         self.wavelength, self.rates = [], []
 
     def frame(self, frame, fps, timestamp): self.frames.append(frame)
-    def cube_frames(self, frames): self.batches.append(list(frames))
     def error(self, message): self.errors.append(message)
     def bin_applied(self, bin_value): self.bins.append(bin_value)
     def bin_failed(self, requested, message): self.failed_bins.append((requested, message))
@@ -110,6 +106,7 @@ def test_every_frame_is_recorded_independent_of_the_display_throttle(engine):
     eng, camera, sink = engine
     assert wait_for(lambda: sink.frames)                         # first frame includes the numba warm-up
     eng.set_keep_spectrogram(True); eng.set_recording(True)
+    live = eng.live_recorded_frames()
     start = camera.index
     assert wait_for(lambda: camera.index - start > 120)
     frames, raw = eng.take_recorded_frames(), eng.take_recorded_raw()
@@ -117,7 +114,7 @@ def test_every_frame_is_recorded_independent_of_the_display_throttle(engine):
     values = [int(r[0, 0]) for r in raw]
     assert all(b - a == 1 for a, b in zip(values, values[1:]))   # none dropped, in order
     assert frames[0].shape[0] == H and frames[0].dtype == np.uint16
-    assert sum(len(b) for b in sink.batches) > 0                 # live preview feed carries the same frames
+    assert frames is live                                        # the live preview read this very list
 
 
 def test_bin_change_success_and_refusal_keep_the_loop_alive(engine):
@@ -227,6 +224,28 @@ def test_hdf5_file_carries_the_metadata_and_data_unchanged(tmp_path):
     save_hdf5(str(tmp_path / 'plain.h5'), data)                    # still works without metadata
     with h5py.File(tmp_path / 'plain.h5', 'r') as f:
         assert tuple(f.attrs['shape']) == data.shape
+
+
+def test_bin_is_pending_until_its_outcome_is_sent(engine):
+    """Start Scan waits while this is true, else the bin would be applied mid-scan."""
+    eng, camera, sink = engine
+    assert wait_for(lambda: sink.frames) and not eng.bin_pending
+    entered, release = threading.Event(), threading.Event()
+    set_bin = camera.set_bin
+    def slow_set_bin(value):
+        entered.set(); release.wait(5); set_bin(value)
+    camera.set_bin = slow_set_bin
+    pending_when_sent = []
+    sink.bin_applied = lambda value: (pending_when_sent.append(eng.bin_pending), sink.bins.append(value))
+    eng.request_bin(2)
+    assert eng.bin_pending                                        # queued (or already taken)
+    assert entered.wait(5) and eng.bin_pending                    # being applied
+    release.set()
+    assert wait_for(lambda: sink.bins == [2]) and wait_for(lambda: not eng.bin_pending)
+    assert pending_when_sent == [True]                            # cleared only after the outcome
+    camera.set_bin = set_bin; camera.refuse = {3}
+    eng.request_bin(3)
+    assert wait_for(lambda: sink.failed_bins) and wait_for(lambda: not eng.bin_pending)
 
 
 def test_bin_that_cannot_stream_falls_back_to_the_previous_bin(engine):

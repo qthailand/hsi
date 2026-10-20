@@ -93,7 +93,12 @@ sets the application-wide Fusion style and a dark palette (`QApplication.setPale
   float32 for type-4 input). The header `<save_path>.hdr` records description, spatial binning,
   `wavelength units = Nanometers` and, if requested, the wavelengths.
 * **Profiles**: plain NumPy `.npy` files (no version header): row-wise `(lines, bands)`
-  float32, fluorescence `(bands,)`. Apply by multiplication to counts.
+  float32, fluorescence `(bands,)`. Apply by multiplication to counts. Saving also writes
+  the band centres (nm, float64 `(bands,)`) of the reference cube to `<name>.wavelength.npy`
+  beside `<name>.npy` (when the reference header has wavelengths). Factors are applied by band
+  index, so they are refused (`ValueError`, message box in the window) for a cube with another
+  band count, or with band centres further apart than a quarter of the cube's median band step
+  (ENVI headers keep 2 decimals). A profile without a sidecar is checked by band count only.
 * **Reflectance table**: Excel sheet without header; column 0 wavelength (nm), column 1
   reflectance. The tables of the reference targets live in `reflectance_profiles/`
   (`REFLECTANCE_PROFILE_DIR`; Spectralon 5/20/40 %, PVC). The window lists them in
@@ -120,6 +125,12 @@ sets the application-wide Fusion style and a dark palette (`QApplication.setPale
 * `build_raw_cube_tmp(params, ...)` (`folder, raw_meta, save_path, crop`) and
   `build_cal_cube_tmp(params, ...)` (`raw_filepath, raw_meta, save_path, crop, factors,
   rowwise_factors`) -> `{'path', 'lines', 'samples', 'bands', 'dtype'}`.
+  These three export functions also take an optional `factor_wavelengths` (nm of the factors'
+  bands) and call `check_factor_bands` before writing anything.
+* `check_factor_bands(n_bands, factor_wavelengths, cube_meta)`: raises `ValueError` unless
+  factors of `n_bands` bands (band centres `factor_wavelengths`, or `None` = unknown) fit the cube.
+* `save_factor_profile(path, factors, wavelengths=None)` -> profile path (with the sidecar);
+  `load_factor_profile(path)` -> `(factors, wavelengths or None)`.
 * `CalibrationWindow`: `load_from_memory`, `load_from_scan`, signal
   `calibration_done(str, dict)`. `RoiDialog(parent, ref_filepath, ref_meta, wl, show_spectrum)`:
   `get_mask()`. `Worker(fn, *args, **kwargs)`: signals `finished(object)`, `error(str)`,

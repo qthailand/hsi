@@ -23,6 +23,14 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+#: Speed of the homing move before a scan, in controller full steps per second, for both
+#: stages. The stage may start far away (e.g. the app was closed before it returned home).
+#: Linear: 500 steps/s = 10 mm/s (0.02 mm per step; the driver caps raw speed at 1000).
+#: Rotation: 500 steps/s = 10 deg/s (0.02 deg per step; the driver allows up to 20 deg/s).
+HOMING_SPEED_STEPS_S = 500
+#: Degrees per full step of the rotation stage (``Stage8SMC1.DEGREEPERSTEP``; smc1 needs the SDK).
+_ROTATION_DEG_PER_STEP = 0.02
+
 
 class StageSequence:
     """One scan: open the stage, home it, move through the scan, return home, close.
@@ -37,8 +45,8 @@ class StageSequence:
         failed_phase: Phase in which the first failure happened, else ``None``.
         cancelled: A stop was requested.
         scan_finished: ``on_after`` was called (the scan move ended).
-        motion_start_ns: ``time.perf_counter_ns()`` just before the scan move command,
-            ``None`` until then.
+        motion_start_ns: ``time.perf_counter_ns()`` just before ``on_before`` and the scan
+            move command, ``None`` until then or if a stop cancelled the move.
         motion_end_ns: ``time.perf_counter_ns()`` when the scan move ended (the driver
             polls the stop status every 10 ms), ``None`` until then or if it failed.
         ramp_s: ``(accel_s, decel_s)`` the controller takes to reach the scan speed and
@@ -46,6 +54,8 @@ class StageSequence:
             cannot tell).
         trim_extra_ms: Extra time cut off both ends of the constant-speed window
             (:meth:`steady_window`), for command latency.
+        device: Stage device path or libximc URI for the default drivers; empty = find it
+            (``stage_device`` in ``config/scan.json``).
         completed: The whole sequence, including return-home, succeeded.
 
     Args:
@@ -86,6 +96,7 @@ class StageSequence:
         self.motion_end_ns = None
         self.ramp_s = (0.0, 0.0)
         self.trim_extra_ms = 0.0
+        self.device = ""
         self.completed = False              # whole sequence incl. return-home succeeded
 
     # ── notifications (overridden by the Qt wrapper to emit signals) ──────
@@ -210,7 +221,9 @@ class StageSequence:
             factory = self._factory
             if factory is None:
                 from .smc1 import Stage8SMC1, Stage8SMC1Linear
-                factory = Stage8SMC1Linear if self.stage_type == 'linear' else Stage8SMC1
+                driver = Stage8SMC1Linear if self.stage_type == 'linear' else Stage8SMC1
+                # No device configured: the driver finds it, created exactly as before.
+                factory = (lambda: driver(device=self.device)) if self.device else driver
             self.phase = self.OPENING
             stage = factory()
             with self._lifecycle_lock:
@@ -221,9 +234,9 @@ class StageSequence:
             if not self._stop.is_set():
                 self.phase = self.HOMING
                 if self.stage_type == 'linear':
-                    stage.set_speed(10)
+                    stage.set_speed(HOMING_SPEED_STEPS_S)
                 else:
-                    stage.set_speed_dps(10)
+                    stage.set_speed_dps(HOMING_SPEED_STEPS_S * _ROTATION_DEG_PER_STEP)
                 moved = True
                 stage.set_position(0, 0)
 
@@ -233,11 +246,14 @@ class StageSequence:
                 self.phase = self.SCANNING
                 self._set_scan_speed(stage)
                 self._read_ramp_times(stage)
+                # Noted before on_before, so its handler can already use steady_window().
+                self.motion_start_ns = time.perf_counter_ns()
                 self._notify_before()
                 if not self._stop.is_set():   # stop may arrive between checks
-                    self.motion_start_ns = time.perf_counter_ns()
                     self._scan_move(stage)
                     self.motion_end_ns = time.perf_counter_ns()
+                else:
+                    self.motion_start_ns = None   # the move never started
                 self.scan_finished = True
                 self._notify_after()
         except Exception as exc:

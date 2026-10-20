@@ -60,7 +60,7 @@ def _capture_dialogs(monkeypatch):
 def test_controller_recovers_preview_and_releases_stage(monkeypatch):
     dialogs=_capture_dialogs(monkeypatch)
     c=controller_methods()();c.PREVIEW='PREVIEW';c.SCANNING='SCANNING';c.state=c.SCANNING;c.recording=True;flags=[];statuses=[]
-    c.preview_thread=SimpleNamespace(set_scanning=lambda v:flags.append(v),set_keep_spectrogram=lambda v:flags.append(v),set_recording=lambda v:None,take_recorded_frames=lambda *window:[],take_recorded_raw=lambda:[]);c.win=SimpleNamespace(set_status=statuses.append);c._set_state=lambda v:setattr(c,'state',v)
+    c.preview_thread=SimpleNamespace(set_scanning=lambda v:flags.append(v),set_keep_spectrogram=lambda v:flags.append(v),set_recording=lambda *a, **kw:None,take_recorded_frames=lambda *window, **kw:[],take_recorded_raw=lambda:[],live_recorded_frames=lambda:[]);c.win=SimpleNamespace(set_status=statuses.append);c._set_state=lambda v:setattr(c,'state',v)
     deleted=[];c.stage=SimpleNamespace(completed=False,failed=True,cancelled=False,deleteLater=lambda:deleted.append(True))
     c.on_stage_error('open failed');assert c.state==c.PREVIEW and not c.recording and flags==[False,False]
     c.on_stage_thread_finished();assert c.stage is None and deleted
@@ -117,6 +117,28 @@ def test_cube_signal_before_return_home():
                            'returned_home', 'close']
     assert w.completed and w.scan_finished and not w.failed and not errors
 
+def test_homing_before_a_scan_runs_at_500_steps_per_second_on_both_stages():
+    # The stage may start far from home (the app was closed before it returned home).
+    from modules.stage.sequence import HOMING_SPEED_STEPS_S, StageSequence
+    class LinearStage:
+        def __init__(self): self.calls = []
+        def open(self): pass
+        def close(self): pass
+        def set_speed(self, v): self.calls.append(('steps/s', v))
+        def set_speed_mm_s(self, v): self.calls.append(('mm/s', v))
+        def set_position(self, *args): self.calls.append(('position', args))
+        def move_le_motor_mm(self, v): self.calls.append(('move', v))
+    linear = LinearStage()
+    seq = StageSequence('linear', stage_factory=lambda: linear)
+    seq.distance_mm, seq.speed_um_s = 5.0, 2000.0
+    seq.run()
+    assert HOMING_SPEED_STEPS_S == 500 and seq.completed
+    assert linear.calls[:3] == [('steps/s', 500), ('position', (0, 0)), ('mm/s', 2.0)]   # 10 mm/s (was 0.2)
+    app = QApplication.instance() or QApplication([])
+    rotation = RecordingStage(); w, errors = make_worker(rotation); w.run()
+    assert rotation.calls[1] == ('speed', 10) and not errors     # 500 steps/s = 10 deg/s, as before
+
+
 def test_return_home_failure_keeps_scan():
     app = QApplication.instance() or QApplication([])
     stage = RecordingStage('return'); w, errors = make_worker(stage); w.run()
@@ -158,7 +180,7 @@ def _controller(state='SCANNING', running=True):
     c = controller_methods()(); c.PREVIEW = 'PREVIEW'; c.SCANNING = 'SCANNING'; c.state = state
     c.recording = True; c.statuses = []; c.built = []; c.stops = []
     c.preview_thread = SimpleNamespace(set_scanning=lambda v: None, set_keep_spectrogram=lambda v: None,
-                                  set_recording=lambda v: None, take_recorded_frames=lambda *window: [], take_recorded_raw=lambda: [])
+                                  set_recording=lambda *a, **kw: None, take_recorded_frames=lambda *window, **kw: [], take_recorded_raw=lambda: [], live_recorded_frames=lambda: [])
     c.win = SimpleNamespace(set_status=c.statuses.append)
     c._set_state = lambda v: setattr(c, 'state', v)
     def finish():

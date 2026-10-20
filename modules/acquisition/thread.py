@@ -45,9 +45,6 @@ class _SignalSink(AcquisitionSink):
     def saturation_ceiling(self, ceiling):
         self._t.saturation_ceiling_ready.emit(ceiling)
 
-    def cube_frames(self, frames):
-        self._t.cube_frames_ready.emit(frames)
-
     def correction_status(self, status):
         self._t.correction_status.emit(status)
 
@@ -90,6 +87,12 @@ class _SignalSink(AcquisitionSink):
     def wavelength_failed(self, profile, message):
         self._t.wavelength_failed.emit(profile, message)
 
+    def wavelength_range_applied(self, info):
+        self._t.wavelength_range_applied.emit(info)
+
+    def wavelength_range_failed(self, requested, message):
+        self._t.wavelength_range_failed.emit(requested, message)
+
 
 class CameraPreviewThread(AcquisitionEngine, QThread):
     """Acquisition worker thread with Qt signals.
@@ -101,7 +104,6 @@ class CameraPreviewThread(AcquisitionEngine, QThread):
             (never repeated). ``timestamp`` is when the worker produced the frame.
         saturation_ceiling_ready(object): Per-pixel level of a clipped pixel in the display
             frames (``None`` if unknown); emitted before the frames it applies to, on change.
-        cube_frames_ready(list): Every recorded binned frame since the last batch.
         correction_status(dict): ``{'dark': (state, detail), 'smile': (...)}`` on change.
         sharpness_ready(float): Focus score (about 5 Hz).
         snapshot_ready(FrameSnapshot): Answer to :meth:`request_snapshot`.
@@ -114,6 +116,10 @@ class CameraPreviewThread(AcquisitionEngine, QThread):
         target_temperature_applied(float) / target_temperature_failed(str): Outcome of
             :meth:`request_target_temperature`.
         wavelength_applied(profile) / wavelength_failed(profile, str): Calibration result.
+        wavelength_range_applied(dict): The wavelength bins in use, after every binner fit
+            and range change (see ``AcquisitionSink.wavelength_range_applied``).
+        wavelength_range_failed(object, str): A range ``(lo, hi)`` (or ``None``) was refused,
+            or cleared because it no longer fits.
         saturation_ready(object): Reserved for per-line saturation maps (not emitted yet).
 
     Args:
@@ -125,11 +131,12 @@ class CameraPreviewThread(AcquisitionEngine, QThread):
     correction_status = pyqtSignal(object)
     wavelength_failed = pyqtSignal(object, str)
     wavelength_applied = pyqtSignal(object)
+    wavelength_range_applied = pyqtSignal(object)
+    wavelength_range_failed = pyqtSignal(object, str)
     snapshot_ready = pyqtSignal(object)
     processed_frame_ready = pyqtSignal(object)
     frame_ready = pyqtSignal(object, float, float)
     saturation_ceiling_ready = pyqtSignal(object)
-    cube_frames_ready = pyqtSignal(object)
     saturation_ready = pyqtSignal(object)
     sharpness_ready = pyqtSignal(float)
     error = pyqtSignal(str)

@@ -10,7 +10,7 @@ session are Qt-free.
 | Class | Qt? | Role |
 |-------|-----|------|
 | `AcquisitionEngine` | no | the pipeline; run `run_until_stopped` on your own thread |
-| `AcquisitionSink` | no | base class with no-op callbacks (`frame`, `cube_frames`, `correction_status`, `sharpness`, `snapshot`, `processed_frame`, `error`, `bin_applied`, `bin_failed`, `params_applied`, `params_failed`, `wavelength_applied`, `wavelength_failed`) |
+| `AcquisitionSink` | no | base class with no-op callbacks (`frame`, `correction_status`, `sharpness`, `snapshot`, `processed_frame`, `error`, `bin_applied`, `bin_failed`, `params_applied`, `params_failed`, `wavelength_applied`, `wavelength_failed`, `wavelength_range_applied`, `wavelength_range_failed`) |
 | `CameraPreviewThread` | yes | the engine on a `QThread`; sink callbacks become signals |
 | `ScanRecorder` | no | thread-safe "record every frame" buffers (owned by the engine) |
 | `ScanSession` / `ScanOutcome` | no | GUI-independent scan state machine |
@@ -76,7 +76,6 @@ from modules.acquisition import CameraPreviewThread, CorrectionStatusDisplay
 status_display = CorrectionStatusDisplay(parent_widget)   # .dark / .smile cards
 thread = CameraPreviewThread(create_backend(config), config)
 thread.frame_ready.connect(viewer.set_frame)            # (frame, fps, timestamp), newest only, <= 30/s
-thread.cube_frames_ready.connect(collect)               # list of every recorded frame
 thread.sharpness_ready.connect(sharpness_panel.set_value)
 thread.correction_status.connect(status_display.update_status)
 thread.error.connect(show_error)
@@ -88,6 +87,8 @@ thread.stop()                                           # True when finished wit
 Other signals: `snapshot_ready(object)`, `processed_frame_ready(object)` (answer to
 `request_processed_frame()`: the preprocessed frame before spectral binning), `bin_applied(int)`, `bin_failed(int, str)`,
 `params_applied()`, `params_failed(str)`, `wavelength_applied(object)`, `wavelength_failed(object, str)`,
+`wavelength_range_applied(object)` (the bins in use, after every binner fit and range change),
+`wavelength_range_failed(object, str)`,
 `saturation_ready(object)` (reserved, not emitted yet). The host owns the thread and must
 call `stop()` before closing.
 
@@ -114,6 +115,12 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
 * With Keep Spectrogram (`set_keep_spectrogram(True)`) the raw frames are recorded too,
   index-aligned with the binned ones; `take_recorded_*` return lists the caller owns.
 * Dark capture mode (`set_dark_capture_mode`) skips corrections and delivers raw frames.
+* Wavelength range (`set_wavelength_range` before start, `request_wavelength_range` in preview):
+  only the bins whose every spectral pixel lies inside `(lo, hi)` nm are binned, displayed and
+  recorded, as a subset of the full bin grid (bit-identical to the same bins without a range).
+  The sensor frame stays full width (dark, Smile, Grab and raw spectrogram are unaffected); the
+  range is kept in nm and resolved again after every bin/calibration/bin-width change; changes are
+  refused while scanning; `wavelength_range_metadata()` gives the kept slice for the scan metadata.
 
 ## API summary
 
@@ -125,11 +132,12 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   × FWHM, at least 2 spectral pixels; `config.resolution` when there is none), `binning_info()`
   (bin width in use and its source, stored in the scan metadata), `request_snapshot(id)`, `request_processed_frame()`, `request_smile_model(path)`,
   `set_recording`, `set_scanning`, `set_keep_spectrogram`, `set_raw_inverted`,
-  `set_dark_capture_mode`, `recorded_count`, `take_recorded_frames`, `take_recorded_raw`,
-  `binner_n_bins`, `binner_lambda_out`.
-* `ScanRecorder`: `set_recording`, `offer`, `count`, `take_frames`, `take_raw`, `pop_batch`.
+  `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `take_recorded_raw`,
+  `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
+  `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
+* `ScanRecorder`: `set_recording`, `set_min_stamp`, `offer`, `count`, `live_frames`, `take_frames`, `take_raw`.
 * `ScanSession`: `begin`, `finish`, `fail`, `set_error`, `start_reference_preview`,
-  `cancel_reference_preview`, `note_preview_frames`, `add_reference_column`.
+  `cancel_reference_preview`, `add_reference_column`.
 * `CorrectionStatusDisplay(parent=None)`: `.dark`, `.smile`, `update_status(status)`;
   a `QObject`, so it is documented here rather than listed in `__widgets__`.
 

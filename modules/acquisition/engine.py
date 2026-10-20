@@ -7,6 +7,7 @@ Pipeline per frame (worker thread)::
       -> orientation (raw_inverted)               |  modules.preprocessing
       -> Smile correction (if a model is loaded) /
       -> spectral binning (LambdaBinner)          (modules.spectral_processing)
+         (with a wavelength range: only the bins inside it, a subset of the full grid)
       -> record every frame while armed           (ScanRecorder)
       -> sharpness every 0.2 s, display frame at <= 30 fps  -> sink
 
@@ -61,6 +62,10 @@ SHARPNESS_INTERVAL = 0.2
 #: Narrowest bin derived from a stored FWHM, in spectral pixels (closer to one pixel the
 #: bins become uneven and some end up empty).
 MIN_FWHM_STEP_PX = 2.0
+#: Fewest bins a wavelength range may keep; a narrower range is refused.
+MIN_RANGE_BANDS = 3
+#: "No range request" (``None`` already means "clear the range").
+_NO_CHANGE = object()
 
 
 class AcquisitionSink:
@@ -80,9 +85,6 @@ class AcquisitionSink:
         dark`` where dark is applied). Sent before the first frame it applies to, and again
         only when it changes.
         """
-
-    def cube_frames(self, frames: list) -> None:
-        """A batch of every frame recorded since the previous batch (by reference)."""
 
     def correction_status(self, status: dict) -> None:
         """``{'dark': (state, detail), 'smile': (state, detail)}``; sent only when it changes."""
@@ -130,6 +132,20 @@ class AcquisitionSink:
     def wavelength_failed(self, profile, message: str) -> None:
         """A wavelength calibration was rejected."""
 
+    def wavelength_range_applied(self, info: dict) -> None:
+        """The wavelength bins in use, sent after every binner fit and every range change.
+
+        ``info`` keys: ``range_nm`` (the applied ``(lo, hi)`` nm, or ``None`` for the full
+        grid), ``bands`` (``(k0, k1)`` of the full grid, or ``None``), ``full_bands``,
+        ``centres_nm`` (first and last bin centre in use), ``calibrated_nm`` (wavelengths
+        of the first and last sensor pixel) and ``step_nm``.
+        """
+
+    def wavelength_range_failed(self, requested, message: str) -> None:
+        """A wavelength range (``(lo, hi)`` nm, or ``None``) was refused, or the applied one
+        no longer fits after a bin/calibration change and was cleared. The next
+        ``wavelength_range_applied`` (if any) shows the range in use."""
+
 
 class AcquisitionEngine:
     """Run one camera through the processing pipeline and report to a sink.
@@ -145,6 +161,13 @@ class AcquisitionEngine:
         sink: Where results go; defaults to a no-op sink.
         profile: Log running per-stage timings (see :class:`StageProfiler`).
     """
+
+    # Wavelength range (class defaults, so engines built with __new__ in tests work too).
+    _range_nm = None                # applied (lo, hi) nm, or None: the full bin grid
+    _pending_range = _NO_CHANGE     # request queued by request_wavelength_range
+    _range_candidate = _NO_CHANGE   # request taken by the worker, until it is resolved
+    _binner_full = None             # the full-grid binner the current one was cut from
+    _bin_in_flight = False          # bin request taken by the worker, until its outcome is sent
 
     def __init__(self, backend, config=None, sink: AcquisitionSink | None = None, profile: bool = True):
         self.backend = backend
@@ -204,6 +227,8 @@ class AcquisitionEngine:
 
         self._camera_hz: float | None = None      # last AcquisitionFrameRate read from the camera
         self._clock_offset_ns: int | None = None  # camera ns - host perf_counter_ns, latched on arming
+        self._armed_ns: int | None = None         # host perf_counter_ns when recording was armed
+        self._record_start_ns: int | None = None  # host time before which frames are not recorded
         self._clock_sync_pending = False
         self._last_frame_id: int | None = None
         self._frame_shape: tuple | None = None    # (H, W) of the last frame, for the profile header
@@ -238,23 +263,46 @@ class AcquisitionEngine:
         """Also record the raw sensor frame of every recorded frame."""
         self._keep_spectrogram = bool(enabled)
 
-    def set_recording(self, active: bool):
+    def set_recording(self, active: bool, start_ns=None):
         """Arm/disarm per-frame recording. Arming starts a fresh buffer.
 
         Arming also asks the worker to latch the camera clock, so the scan can later be
         trimmed to the stage motion window (:meth:`take_recorded_frames`).
+
+        Args:
+            active: Arm (True) or disarm.
+            start_ns: Host ``time.perf_counter_ns()`` before which frames are not recorded
+                at all (the start of the constant-speed window), once the clock is latched;
+                ``None`` records every frame until :meth:`take_recorded_frames` trims.
         """
         if active:
             with self._lock:
-                self._clock_sync_pending = True
+                if not self.recorder.enabled:
+                    self._armed_ns = time.perf_counter_ns()
+                self._record_start_ns = start_ns
         self.recorder.set_recording(active)
+        if active:
+            # After arming, which clears the recorder's bound, so the latch can set it.
+            with self._lock:
+                self._clock_sync_pending = True
 
     def recorded_count(self) -> int:
         """Frames recorded so far."""
         return self.recorder.count()
 
-    def take_recorded_frames(self, motion_start_ns=None, motion_end_ns=None) -> list[np.ndarray]:
+    def live_recorded_frames(self) -> list:
+        """The list the current recording appends to, for a live cube preview (by reference).
+
+        Ask after :meth:`set_recording` (arming starts a new list); do not modify it.
+        """
+        return self.recorder.live_frames()
+
+    def take_recorded_frames(self, motion_start_ns=None, motion_end_ns=None,
+                             reference_ns=None) -> list[np.ndarray]:
         """Disarm recording and hand over (and empty) the recorded binned frames.
+
+        Logs one ``Scan trim:`` line every time: why nothing was trimmed, or the frame
+        times, the kept window and the counts dropped.
 
         Args:
             motion_start_ns, motion_end_ns: Host ``time.perf_counter_ns()`` when the stage
@@ -262,6 +310,8 @@ class AcquisitionEngine:
                 its frames (GenICam) and a clock latched when recording was armed, frames
                 taken before the start or after the end are dropped, with their raw
                 frames.  Otherwise every recorded frame is returned, as before.
+            reference_ns: Host time the logged times are relative to (the start of the
+                stage move); defaults to ``motion_start_ns``.
 
         Returns:
             list: The binned frames, in order.
@@ -272,18 +322,45 @@ class AcquisitionEngine:
             window = (None if motion_start_ns is None else motion_start_ns + offset,
                       None if motion_end_ns is None else motion_end_ns + offset)
         frames = self.recorder.take_frames(window)
-        before, after = self.recorder.last_trim
-        if before or after:
-            logger.info("Scan trimmed to stage motion: %d frames before start and %d after stop dropped, %d kept",
-                        before, after, len(frames))
+        self._log_trim(frames, offset, motion_start_ns, motion_end_ns,
+                       motion_start_ns if reference_ns is None else reference_ns)
         return frames
+
+    def _log_trim(self, frames, offset, start_ns, end_ns, reference_ns):
+        """The ``Scan trim:`` summary of :meth:`take_recorded_frames` (times in ms from ``reference_ns``)."""
+        first, last, missing, total = self.recorder.last_stamps
+        before, after = self.recorder.last_trim
+
+        def ms(host_ns):
+            """Host time as signed ms from ``reference_ns`` ('?' if unknown)."""
+            if host_ns is None or reference_ns is None:
+                return '?'
+            return f'{(host_ns - reference_ns) / 1e6:+.0f}'
+
+        def camera_ms(stamp):
+            """Camera time, converted to host time, as :func:`ms`."""
+            return '?' if stamp is None or offset is None else ms(stamp - offset)
+
+        if offset is None:
+            reason = 'not trimmed: camera clock not latched'
+        elif start_ns is None and end_ns is None:
+            reason = 'not trimmed: no stage motion times'
+        elif missing:
+            reason = f'not trimmed: {missing} frames without camera time'
+        else:
+            reason = (f'dropped {before + self.recorder.last_live_dropped} before '
+                      f'({self.recorder.last_live_dropped} while recording), {after} after')
+        logger.info('Scan trim: %s; %d recorded, %d kept; armed %s ms, frames %s..%s ms, '
+                    'keep %s..%s ms (from stage move start)',
+                    reason, total, len(frames), ms(self._armed_ns), camera_ms(first), camera_ms(last),
+                    ms(start_ns), ms(end_ns))
 
     def take_recorded_raw(self) -> list[np.ndarray]:
         """Hand over (and empty) the raw sensor frames kept by Keep Spectrogram."""
         return self.recorder.take_raw()
 
     def set_scanning(self, active: bool):
-        """Tell the engine a scan is running (blocks wavelength changes)."""
+        """Tell the engine a scan is running (blocks wavelength calibration and range changes)."""
         self._scanning = bool(active)
 
     def set_raw_inverted(self, inverted: bool):
@@ -313,6 +390,12 @@ class AcquisitionEngine:
         with self._lock:
             self._pending_bin = int(bin_value)
 
+    @property
+    def bin_pending(self) -> bool:
+        """True while a requested bin is queued or being applied (until ``bin_applied``/``bin_failed`` is sent)."""
+        with self._lock:
+            return self._pending_bin is not None or self._bin_in_flight
+
     def request_wavelength(self, profile):
         """Queue a wavelength calibration profile.
 
@@ -325,6 +408,76 @@ class AcquisitionEngine:
             if self._pending_wavelength is not None:
                 raise RuntimeError("A wavelength calibration change is already pending")
             self._pending_wavelength = profile
+
+    @staticmethod
+    def _checked_range(wavelength_range):
+        """``None``, or ``(lo, hi)`` as floats; raises ``ValueError`` unless finite with lo < hi."""
+        if wavelength_range is None:
+            return None
+        lo, hi = (float(v) for v in wavelength_range)
+        if not (np.isfinite(lo) and np.isfinite(hi) and lo < hi):
+            raise ValueError(f"Wavelength range must be two finite nm values with start < end, not {wavelength_range!r}")
+        return lo, hi
+
+    def set_wavelength_range(self, wavelength_range):
+        """Set the start-up wavelength range; call before the loop starts.
+
+        Args:
+            wavelength_range: ``(lo, hi)`` nm, or ``None`` for the full calibrated range.
+                The first binner keeps only the bins inside it (see :meth:`request_wavelength_range`).
+
+        Raises:
+            ValueError: if the range is not two finite values with lo < hi.
+        """
+        self._range_nm = self._checked_range(wavelength_range)
+
+    def request_wavelength_range(self, wavelength_range):
+        """Queue a wavelength range; applied at a frame boundary, refused while scanning.
+
+        Only the bins whose every spectral pixel lies inside the range are binned,
+        recorded and shown, as a subset of the full bin grid (so the kept bins equal the
+        same bins without a range, bit for bit). The range is kept in nm and resolved again
+        after every bin, calibration or bin-width change. A later request replaces one not
+        yet applied. The outcome arrives as ``wavelength_range_applied`` /
+        ``wavelength_range_failed`` (also when fewer than :data:`MIN_RANGE_BANDS` bins fit).
+
+        Args:
+            wavelength_range: ``(lo, hi)`` nm, or ``None`` for the full calibrated range.
+
+        Raises:
+            ValueError: if the range is not two finite values with lo < hi.
+        """
+        wavelength_range = self._checked_range(wavelength_range)
+        with self._lock:
+            self._pending_range = wavelength_range
+
+    @property
+    def wavelength_range(self):
+        """The applied wavelength range ``(lo, hi)`` nm, or ``None`` (full grid)."""
+        with self._binner_lock:
+            return self._range_nm
+
+    @property
+    def wavelength_range_pending(self) -> bool:
+        """True while a requested wavelength range has not been applied or refused yet."""
+        with self._lock:
+            return self._pending_range is not _NO_CHANGE or self._range_candidate is not _NO_CHANGE
+
+    def wavelength_range_metadata(self) -> dict:
+        """Scan provenance of the range: empty unless the binner keeps a subset of the grid.
+
+        Returns:
+            dict: ``wavelength_range_requested_nm`` (``[lo, hi]``) and
+            ``wavelength_range_bands`` (``[k0, k1, n_full]``: the kept bins of the full grid
+            ``LambdaBinner(m * bin, c, step).fit(frame_width)``).
+        """
+        with self._binner_lock:
+            binner, range_nm = self._binner, self._range_nm
+        source = getattr(binner, 'source_bins', None)
+        if range_nm is None or source is None:
+            return {}
+        return {"wavelength_range_requested_nm": [float(range_nm[0]), float(range_nm[1])],
+                "wavelength_range_bands": [int(v) for v in source]}
 
     def set_wavelength_lookup(self, lookup):
         """Find the stored wavelength calibration of each camera setting with ``lookup()``.
@@ -408,6 +561,122 @@ class AcquisitionEngine:
             self._binner = None
             self._binner_fitted = False
         self.sink.wavelength_applied(profile)
+
+    def _apply_pending_wavelength_range(self):
+        """Take a queued range request: refuse it while scanning, else apply it (worker thread).
+
+        With a fitted binner the range is cut from its full grid now (keeping the binner
+        object when the kept bins do not change); otherwise the next fit resolves it.
+        """
+        if self._pending_range is _NO_CHANGE:
+            return                                  # the per-frame path takes no lock
+        with self._lock:
+            requested = self._range_candidate = self._pending_range
+            self._pending_range = _NO_CHANGE
+        if requested is _NO_CHANGE:
+            return
+        if self._scanning:
+            self._range_candidate = _NO_CHANGE
+            self.sink.wavelength_range_failed(requested, "Stop the scan before changing the wavelength range")
+            return
+        with self._binner_lock:
+            full = self._binner_full if self._binner_fitted else None
+            current = self._binner
+        if full is not None:
+            self._publish_range(full, current)
+
+    def _range_binner(self, full, wavelength_range, current=None):
+        """The binner for ``wavelength_range`` on ``full``'s grid, or ``None`` if too few bins fit.
+
+        Returns ``full`` itself when the range keeps every bin, and ``current`` when it keeps
+        the same bins as ``current`` (so GPU tables and caches stay valid).
+        """
+        k0, k1 = full.range_bins(*wavelength_range)
+        if k1 - k0 < MIN_RANGE_BANDS:
+            return None
+        if k1 - k0 == full.n_bins:
+            return full
+        if current is not None and getattr(current, 'source_bins', None) == (k0, k1, full.n_bins):
+            return current
+        return full.subset(k0, k1)
+
+    def _publish_range(self, full, current=None):
+        """Resolve the range for the freshly fitted (or current) ``full`` grid and publish it.
+
+        The pending candidate (if any) wins over the applied range; a candidate that keeps
+        fewer than :data:`MIN_RANGE_BANDS` bins is refused and the applied range kept; an
+        applied range that no longer fits is cleared. Never raises: an unexpected failure
+        falls back to the full grid. Sends ``wavelength_range_failed`` (if any) and then
+        ``wavelength_range_applied``.
+
+        Returns:
+            LambdaBinner: the published binner.
+        """
+        with self._lock:
+            candidate, self._range_candidate = self._range_candidate, _NO_CHANGE
+        failures = []
+        range_nm = self._range_nm
+        binner = full
+        try:
+            if candidate is not _NO_CHANGE:
+                if candidate is None:
+                    range_nm = None
+                else:
+                    chosen = self._range_binner(full, candidate, current)
+                    if chosen is None:
+                        failures.append((candidate, self._range_refusal(full, candidate)))
+                    else:
+                        range_nm, binner = candidate, chosen
+            if binner is full and range_nm is not None and (candidate is _NO_CHANGE or failures):
+                chosen = self._range_binner(full, range_nm, current)
+                if chosen is None:
+                    failures.append((range_nm, self._range_refusal(full, range_nm) + "; full range in use"))
+                    range_nm = None
+                else:
+                    binner = chosen
+        except Exception as exc:                    # never stop the camera over a range
+            logger.exception("Wavelength range failed")
+            failures.append((range_nm if candidate is _NO_CHANGE else candidate, f"Wavelength range failed: {exc}"))
+            range_nm, binner = None, full
+        with self._binner_lock:
+            self._binner = binner
+            self._binner_full = full
+            self._binner_fitted = True
+            self._range_nm = range_nm
+        for requested, message in failures:
+            logger.warning("Wavelength range %s refused: %s", requested, message)
+            self.sink.wavelength_range_failed(requested, message)
+        info = self._range_info(full, binner, range_nm)
+        if binner is not full and binner is not current:
+            first, last = binner.iL[0], binner.iR[-1] - 1
+            logger.info("Wavelength range: requested %.1f-%.1f nm -> bands %d:%d of %d, "
+                        "centres %.2f-%.2f nm, pixels %.2f-%.2f nm",
+                        range_nm[0], range_nm[1], *info["bands"], info["full_bands"], *info["centres_nm"],
+                        full.m * float(first) + full.c, full.m * float(last) + full.c)
+        self.sink.wavelength_range_applied(info)
+        return binner
+
+    @staticmethod
+    def _range_refusal(full, wavelength_range) -> str:
+        """Why ``wavelength_range`` cannot be used on ``full``'s grid."""
+        k0, k1 = full.range_bins(*wavelength_range)
+        lam = full.lambda_out
+        return (f"{wavelength_range[0]:g}-{wavelength_range[1]:g} nm keeps {k1 - k0} bands "
+                f"(at least {MIN_RANGE_BANDS} needed; calibrated bands {lam[0]:.1f}-{lam[-1]:.1f} nm)")
+
+    @staticmethod
+    def _range_info(full, binner, range_nm) -> dict:
+        """The ``info`` dict of ``wavelength_range_applied``."""
+        source = binner.source_bins if binner is not full else None
+        lam = binner.lambda_out
+        return {
+            "range_nm": range_nm,
+            "bands": None if source is None else (int(source[0]), int(source[1])),
+            "full_bands": int(full.n_bins),
+            "centres_nm": (float(lam[0]), float(lam[-1])),
+            "calibrated_nm": (float(full.c), float(full.m * (full.v_ - 1) + full.c)),
+            "step_nm": float(full.step),
+        }
 
     def _snapshot_requested(self) -> bool:
         with self._lock:
@@ -611,8 +880,17 @@ class AcquisitionEngine:
         with self._lock:
             bin_value = self._pending_bin
             self._pending_bin = None
+            self._bin_in_flight = bin_value is not None
         if bin_value is None:
             return
+        try:
+            self._apply_bin(bin_value)
+        finally:
+            with self._lock:
+                self._bin_in_flight = False     # cleared after the outcome is sent (see bin_pending)
+
+    def _apply_bin(self, bin_value: int):
+        """Switch the camera to ``bin_value`` (back to the previous bin on failure) and report it."""
         logger.info("Apply bin: %s", bin_value)
         previous = int(self.backend.current_bin)
         self.backend.stop_stream()
@@ -663,6 +941,8 @@ class AcquisitionEngine:
             self._clock_offset_ns = None
         if self._clock_offset_ns is None:
             logger.info("Camera clock not latched: the scan is not trimmed to the stage motion")
+        elif self._record_start_ns is not None:
+            self.recorder.set_min_stamp(self._record_start_ns + self._clock_offset_ns)
 
     def _note_frame_info(self, profiler):
         """Count frames the camera sent but the loop never received; return the frame's camera time."""
@@ -735,10 +1015,6 @@ class AcquisitionEngine:
             binner = LambdaBinner(m=mm, c=cc, step=step)
             binner.fit(int(width))
 
-            with self._binner_lock:
-                self._binner = binner
-                self._binner_fitted = True
-
             logger.info(
                 "LambdaBinner fitted: %d pixels -> %d bins "
                 "(m=%.4f, bin=%d, step=%.2f [%s], lam %.1f-%.1f nm)",
@@ -746,6 +1022,8 @@ class AcquisitionEngine:
                 mm, camera_bin, step, info["resolution_source"],
                 binner.lambda_out[0], binner.lambda_out[-1],
             )
+            # Publishes the full binner, or the bins of the wavelength range cut from it.
+            binner = self._publish_range(binner)
         return binner
 
     def _bin_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -815,11 +1093,6 @@ class AcquisitionEngine:
 
     # ── main loop ─────────────────────────────────────────
 
-    def _flush_preview_batch(self):
-        batch = self.recorder.pop_batch()
-        if batch:
-            self.sink.cube_frames(batch)
-
     def run(self):
         """The acquisition loop; blocks until :meth:`request_stop` and always closes the camera.
 
@@ -858,8 +1131,8 @@ class AcquisitionEngine:
                 self._apply_pending_smile()
                 self._apply_pending_wavelength()
                 self._apply_pending_resolution()
+                self._apply_pending_wavelength_range()
                 self._apply_pending_clock_sync()
-                self._flush_preview_batch()
 
                 with self._binner_lock:
                     dark_capture = self._dark_capture_mode

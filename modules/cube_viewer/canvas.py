@@ -1,10 +1,12 @@
 # widgets/cube_canvas.py
-"""Single-band image canvas with click-to-spectrum and zoom/pan support.
+"""Single-band image canvas with click-to-spectrum, ROI drawing and zoom/pan support.
 
 Data conventions:
     The canvas shows one 2-D band image ``(rows, cols)`` = ``(slit, scan)`` of any
     numeric dtype.  It is auto-stretched to 8 bit between the 1st and 99th
     percentile.  Pixel coordinates are ``(ix, iy)`` = ``(column, row)`` of that array.
+    Rectangle / lasso tools and record overlays come from
+    ``modules.cube_viewer.roi_draw.RoiDrawMixin`` (float image-corner coordinates).
 
 Threading:
     GUI thread only.
@@ -23,30 +25,42 @@ from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
 from PyQt5.QtWidgets import QWidget, QSizePolicy
 
+from modules.cube_preview.widget import TAB20_QCOLORS
+from modules.cube_viewer.roi_draw import RoiDrawMixin
 from modules.ui_kit.zoom_pan import ZoomPanMixin
 
 
-class CubeImageCanvas(QWidget, ZoomPanMixin):
-    """Display a 2D band image with click-to-spectrum and zoom/pan.
+class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
+    """Display a 2D band image with click-to-spectrum, ROI drawing and zoom/pan.
 
     Zoom and pan come from ``modules.ui_kit.zoom_pan.ZoomPanMixin`` (mouse wheel
     zooms, middle button pans, double click is handled by the mixin).  Clicked
     points can be marked with coloured dots (tab20 palette, labelled ``(ix,iy)``);
     the host decides which points are shown via ``add_click_point`` /
-    ``clear_click_points``.  Construct with no arguments; GUI thread only.
+    ``clear_click_points``.  ``set_tool('rect' | 'lasso')`` switches the left button
+    to drawing an area (``roi_drawn``), ``set_roi_overlays`` draws spectrum records
+    and ``set_class_overlay`` a class map (see ``modules.cube_viewer.roi_draw``).
+    Construct with no arguments; GUI thread only.
 
     Signals:
         pixel_clicked(int, int): ``(ix, iy)`` image pixel (column, row) under the
-            cursor, emitted on a left click inside the image.
+            cursor, emitted on a left click inside the image (point tool only).
         zoom_changed(float): zoom in percent, emitted whenever the zoom changes.
+        roi_drawn(str, object): ``(kind, geometry)`` of a finished rectangle / lasso.
+        roi_discarded(str): a drawing was dropped; the reason, for a status bar.
     """
 
     pixel_clicked = pyqtSignal(int, int)
     zoom_changed = pyqtSignal(float)
 
+    # point tags keep this canvas's legacy placement: right of the dot, never flipped or
+    # clamped (the RGB view keeps its own flip / clamp rule)
+    _roi_point_tag_inside = False
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_zoom_pan()
+        self._init_roi_draw()
 
         self._array: np.ndarray | None = None
         self._display_mapper = None
@@ -131,27 +145,10 @@ class CubeImageCanvas(QWidget, ZoomPanMixin):
         qimg = QImage(arr.data, w, h, w, QImage.Format_Grayscale8).copy()
         self._pixmap = QPixmap.fromImage(qimg)
 
-    # ── tab20 dot colors ──────────────────────────────────
-
-    _DOT_COLORS = None
-
-    @classmethod
-    def _get_dot_colors(cls):
-        if cls._DOT_COLORS is None:
-            from matplotlib import colormaps
-            cmap = colormaps["tab20"]
-            cls._DOT_COLORS = []
-            for i in range(20):
-                r, g, b, a = cmap(i / 20)
-                cls._DOT_COLORS.append(
-                    QColor(int(r * 255), int(g * 255), int(b * 255))
-                )
-        return cls._DOT_COLORS
-
     # ── painting ──────────────────────────────────────────
 
     def paintEvent(self, event):
-        """Paint the zoomed image and the click dots (Qt override)."""
+        """Paint the zoomed image, class overlay, click dots, records and drawing (Qt override)."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -177,8 +174,10 @@ class CubeImageCanvas(QWidget, ZoomPanMixin):
             )
             painter.drawPixmap(int(ox), int(oy), scaled)
 
+        self._roi_paint_class_overlay(painter)
+
         # draw click dots + labels
-        colors = self._get_dot_colors()
+        colors = TAB20_QCOLORS
         for i, (ix, iy) in enumerate(self._click_points):
             color = colors[i % len(colors)]
             cx, cy = self._zp_map_image_to_widget(ix, iy)
@@ -213,6 +212,8 @@ class CubeImageCanvas(QWidget, ZoomPanMixin):
             painter.setPen(QPen(QColor(255, 255, 255, 230)))
             painter.drawText(QRectF(lx, ly, tw, th), Qt.AlignCenter, label)
 
+        self._roi_paint_records(painter)
+        self._roi_paint_drawing(painter)
         painter.end()
 
     # ── mouse events ──────────────────────────────────────
@@ -227,9 +228,14 @@ class CubeImageCanvas(QWidget, ZoomPanMixin):
             return
 
     def mousePressEvent(self, event):
-        """Start a pan (middle button) or emit ``pixel_clicked`` (left button); Qt override."""
+        """Start a pan (middle button), a drawing (left, rect / lasso tool) or emit
+        ``pixel_clicked`` (left, point tool); Qt override."""
         # ★ middle button → pan
         if self._zp_mouse_press(event):
+            return
+
+        # ★ left button, rect / lasso tool → start drawing
+        if self._roi_mouse_press(event):
             return
 
         # ★ left button → pixel click
@@ -239,11 +245,20 @@ class CubeImageCanvas(QWidget, ZoomPanMixin):
                 self.pixel_clicked.emit(ix, iy)
 
     def mouseMoveEvent(self, event):
-        """Continue a pan drag (Qt override, delegates to the zoom mixin)."""
+        """Continue a pan drag, else a drawing (Qt override)."""
         if self._zp_mouse_move(event):
             return
+        self._roi_mouse_move(event)
 
     def mouseReleaseEvent(self, event):
-        """End a pan drag (Qt override, delegates to the zoom mixin)."""
+        """End a pan drag or finish a drawing (Qt override)."""
         if self._zp_mouse_release(event):
+            self._roi_restore_cursor()
             return
+        self._roi_mouse_release(event)
+
+    def keyPressEvent(self, event):
+        """Esc cancels a drawing in progress (Qt override)."""
+        if self._roi_key_press(event):
+            return
+        super().keyPressEvent(event)

@@ -30,6 +30,8 @@ FIELD_HOVER = "#3c4047"
 BORDER = "#3d4148"
 ACCENT = "#22c06b"
 ACCENT_DARK = "#1a9a55"
+#: Splitter handle bars: the base grey (#3f4042) hardly shows on the page; hover stays the accent.
+HANDLE = "#5c6370"
 
 #: Plot colours for pyqtgraph.
 PLOT_BACKGROUND = CARD
@@ -55,9 +57,13 @@ def _to_accent_hue(match: re.Match) -> str:
 
 
 def dashboard_stylesheet(base: str) -> str:
-    """Return ``base`` (the qdarktheme dark QSS) recoloured to the green accent plus the page colour."""
+    """Return ``base`` (the qdarktheme dark QSS) recoloured to the green accent, plus the page
+    and splitter handle colours."""
     return _RGBA.sub(_to_accent_hue, base) + f"""
     QMainWindow, QMdiArea {{
         background: {PAGE};
+    }}
+    QSplitter::handle {{
+        background-color: {HANDLE};
     }}
     """

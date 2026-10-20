@@ -6,6 +6,9 @@ Data conventions:
     ``(frames, spatial, n_bins)`` uint16, each bin being the integer-rounded (and
     clamped to 65535) mean of the spectral pixels inside the bin edges.  Bin
     edges are ``step`` nm apart starting at ``c`` nm; empty bins are dropped.
+    A wavelength range keeps a contiguous run of those bins (``range_bins`` and
+    ``subset``): the kept bins are bit-identical to the same bins of the full
+    binner, because the grid is never refitted for the range.
 
 Threading:
     Pure computation, no Qt.  ``transform`` calls Numba's process-wide
@@ -26,6 +29,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 from numba import njit, prange, set_num_threads
+
+#: Tolerance (nm) of :meth:`LambdaBinner.range_bins`: a bound this close to a pixel's
+#: wavelength still includes that pixel.
+RANGE_EPS_NM = 1e-6
 
 
 @njit(parallel=True, fastmath=True, cache=True)
@@ -64,9 +71,13 @@ class LambdaBinner:
         iL, iR: Per-bin first (inclusive) and last (exclusive) spectral pixel
             index, int32 (``None`` before fit).
         w: Per-bin pixel count, int32.
+        source_bins: ``(k0, k1, n_full)`` for a binner made by :meth:`subset`
+            (bins ``k0:k1`` of a fitted binner with ``n_full`` bins), else ``None``.
 
     Thread-safety:
         Not thread-safe while being re-fitted; read-only use after ``fit`` is fine.
+        Never change a fitted binner in place: GPU backends cache its tables by
+        object identity. :meth:`subset` returns a new object.
     """
 
     def __init__(self, m: float, c: float, step: float = 2.0,
@@ -89,6 +100,7 @@ class LambdaBinner:
         self.iR: Optional[np.ndarray] = None
         self.w: Optional[np.ndarray] = None
         self._lambda_out: Optional[np.ndarray] = None
+        self.source_bins: Optional[Tuple[int, int, int]] = None
 
     # ---------- precompute ----------
     def _precompute_bins(self, v: int):
@@ -160,6 +172,74 @@ class LambdaBinner:
         """
         assert self.iL is not None
         return int(self.iL.size)
+
+    def range_bins(self, lo_nm: float, hi_nm: float) -> Tuple[int, int]:
+        """The bins whose every spectral pixel lies inside ``[lo_nm, hi_nm]``.
+
+        A pixel's wavelength is its calibrated centre ``m * j + c``; a bound within
+        :data:`RANGE_EPS_NM` of a pixel's wavelength counts as including it. The test is
+        float64 arithmetic on the integer pixel indices with Python-float operands, so it
+        decides the same on NumPy 1.x and 2.x.
+
+        Args:
+            lo_nm: Shortest wavelength to keep (nm).
+            hi_nm: Longest wavelength to keep (nm).
+
+        Returns:
+            tuple: ``(k0, k1)``: bins ``k0:k1`` of this binner, a contiguous run;
+            ``(0, 0)`` when no bin fits (or ``m`` is not positive).
+
+        Raises:
+            AssertionError: if :meth:`fit` has not been called.
+        """
+        assert self.iL is not None
+        if not self.m > 0 or self.iL.size == 0:
+            return 0, 0
+        lo = float(lo_nm) - RANGE_EPS_NM
+        hi = float(hi_nm) + RANGE_EPS_NM
+        first = self.m * self.iL.astype(np.float64) + self.c
+        last = self.m * (self.iR.astype(np.float64) - 1.0) + self.c
+        kept = np.flatnonzero((first >= lo) & (last <= hi))
+        if kept.size == 0:
+            return 0, 0
+        k0, k1 = int(kept[0]), int(kept[-1]) + 1
+        assert k1 - k0 == kept.size, "bins inside a wavelength range must be contiguous"
+        return k0, k1
+
+    def subset(self, k0: int, k1: int) -> "LambdaBinner":
+        """A new binner that computes only bins ``k0:k1`` of this one.
+
+        It keeps this binner's ``m``, ``c``, ``step``, ``threads`` and fitted width
+        ``v_`` (it bins the same full-width frames), so its output equals
+        ``self.transform(x)[..., k0:k1]`` bit for bit and its :attr:`lambda_out` is
+        the same float32 values. The tables are int32 C-contiguous copies (the same
+        Numba signature: no recompilation).
+
+        Args:
+            k0: First bin to keep.
+            k1: One past the last bin to keep.
+
+        Returns:
+            LambdaBinner: New fitted binner with ``source_bins`` set.
+
+        Raises:
+            AssertionError: if :meth:`fit` has not been called.
+            ValueError: if ``k0:k1`` is empty or outside ``0:n_bins``.
+        """
+        assert self.iL is not None
+        n = self.n_bins
+        k0, k1 = int(k0), int(k1)
+        if not 0 <= k0 < k1 <= n:
+            raise ValueError(f"bin slice {k0}:{k1} is empty or outside 0:{n}")
+        part = LambdaBinner(self.m, self.c, self.step, self.threads)
+        part.v_ = self.v_
+        part.iL = np.array(self.iL[k0:k1], dtype=np.int32)
+        part.iR = np.array(self.iR[k0:k1], dtype=np.int32)
+        part.w = np.array(self.w[k0:k1], dtype=np.int32)
+        part._lambda_out = np.array(self._lambda_out[k0:k1], dtype=np.float32)
+        offset, total = (0, n) if self.source_bins is None else (self.source_bins[0], self.source_bins[2])
+        part.source_bins = (offset + k0, offset + k1, total)
+        return part
 
     def warmup(self) -> None:
         """Trigger Numba compilation/cache load with a tiny dummy input.

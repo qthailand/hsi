@@ -1,8 +1,13 @@
 # windows/scan_window.py
 from __future__ import annotations
 
+import math
+import time
+
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
+    QApplication,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -14,6 +19,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QGroupBox,
     QSplitter,
+    QShortcut,
     QScrollArea,
     QSizePolicy,
     QFileDialog,
@@ -37,12 +43,44 @@ from modules.live_view.histogram import HistogramPlot
 from windows.image_viewer import ImageViewer
 from modules.spectrogram_viewer.window import SpectrogramViewer
 
+#: Provisional limits of the wavelength range spin boxes until the camera reports its axis.
+WAVELENGTH_LIMITS_NM = (0.0, 9999.9)
+#: Title of the cube preview box; a scan appends its settings (see ScanWindow.set_scanning).
+CUBE_PREVIEW_TITLE = "Realtime Cube Preview"
+
+
+def _format_duration(seconds: float) -> str:
+    """``12.3 s`` below a minute, else ``m:ss``."""
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    return f"{int(seconds // 60)}:{int(seconds % 60):02d}"
+
+
+class _NoWheelUnlessFocusedSpinBox(QDoubleSpinBox):
+    """A spin box that ignores the mouse wheel unless it has focus.
+
+    Scrolling the settings panel over it then scrolls the panel instead of changing a
+    value that decides what is recorded.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)          # the wheel does not give focus
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 
 class ScanWindow(QWidget):
     snapshot_ready = pyqtSignal(object)
     snapshot_failed = pyqtSignal(int, str)
     cube_ready = pyqtSignal(object, object)
     calibration_requested = pyqtSignal(object, object)
+    #: The user finished a wavelength range edit: Enter, or focus leaving the Start/End pair.
+    wavelength_range_committed = pyqtSignal()
 
     def request_snapshot(self, request_id):
         controller = getattr(self, 'controller', None)
@@ -135,6 +173,38 @@ class ScanWindow(QWidget):
         self.linear_group = QGroupBox("Linear Stage")
         self.linear_group.setLayout(linear_layout)
 
+        # ── Wavelength range (bins kept for preview and recording) ──
+        self.wavelength_start_spin = _NoWheelUnlessFocusedSpinBox()
+        self.wavelength_end_spin = _NoWheelUnlessFocusedSpinBox()
+        for spin in (self.wavelength_start_spin, self.wavelength_end_spin):
+            spin.setDecimals(1)
+            spin.setSingleStep(1.0)
+            spin.setRange(*WAVELENGTH_LIMITS_NM)
+            spin.setSuffix(" nm")
+        self.wavelength_end_spin.setValue(WAVELENGTH_LIMITS_NM[1])
+
+        wavelength_layout = QFormLayout()
+        wavelength_layout.addRow("Start", self.wavelength_start_spin)
+        wavelength_layout.addRow("End", self.wavelength_end_spin)
+
+        self.wavelength_range_group = QGroupBox("Wavelength Range")
+        self.wavelength_range_group.setCheckable(True)
+        self.wavelength_range_group.setChecked(False)
+        self.wavelength_range_group.setLayout(wavelength_layout)
+        self.wavelength_range_group.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.wavelength_range_group.setToolTip(
+            "Record only the wavelengths between Start and End (unchecked: the full calibrated range).\n"
+            "Applied from the next frame; locked during a scan.")
+        # Usable once the camera has reported its calibrated axis (set_wavelength_range_axis).
+        self._wavelength_axis_known = False
+        self._recorded_bands = None         # e.g. "17 bands 500.9–599.8 nm", from the engine's axis info
+        self._wavelength_range_allowed = True
+        self.wavelength_range_group.setEnabled(False)
+        self.wavelength_start_spin.editingFinished.connect(
+            lambda: self._on_wavelength_spin_finished(self.wavelength_end_spin))
+        self.wavelength_end_spin.editingFinished.connect(
+            lambda: self._on_wavelength_spin_finished(self.wavelength_start_spin))
+
         # ── Display controls ─────────────────────────────────────
         self.display_controls = DisplayControls(bit_depth=16)
 
@@ -223,6 +293,7 @@ class ScanWindow(QWidget):
         stage_row = QHBoxLayout()
         stage_row.addWidget(self.rotation_group)
         stage_row.addWidget(self.linear_group)
+        stage_row.addWidget(self.wavelength_range_group)
         settings_column.addLayout(stage_row)
 
         status_column = QVBoxLayout()
@@ -239,7 +310,9 @@ class ScanWindow(QWidget):
         scroll_area.setWidgetResizable(True)
         scroll_area.setWidget(controls_widget)
         scroll_area.setMinimumWidth(420)
-        scroll_area.setMaximumHeight(300)
+        # Fixed like the left panel's width, so the splitter handle snaps it shut (dragged past
+        # half its height) and open again instead of shrinking it step by step.
+        scroll_area.setFixedHeight(300)
         scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self._pending_cube = None
@@ -284,7 +357,8 @@ class ScanWindow(QWidget):
             QPushButton:disabled { background-color: #1a2a40; color: #555; }
         """)
 
-        cube_preview_group = QGroupBox("Realtime Cube Preview")
+        cube_preview_group = QGroupBox(CUBE_PREVIEW_TITLE)
+        self.cube_preview_group = cube_preview_group
         cpg_layout = QVBoxLayout()
         cpg_layout.setContentsMargins(4, 4, 4, 4)
         cpg_layout.setSpacing(4)
@@ -293,20 +367,23 @@ class ScanWindow(QWidget):
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.open_cube_viewer_btn)
         btn_row.addWidget(self.open_calibration_btn)
+        btn_row.addWidget(self.open_spectrogram_btn)
         cpg_layout.addLayout(btn_row)
-
-        spectro_row = QHBoxLayout()                              
-        spectro_row.addWidget(self.open_spectrogram_btn)         
-        cpg_layout.addLayout(spectro_row)      
 
         cube_preview_group.setLayout(cpg_layout)
 
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(4)
-        right_layout.addWidget(scroll_area)
-        right_layout.addWidget(cube_preview_group, stretch=1)
+        # Settings above, cube preview below: the handle moves, and a scan folds the
+        # settings away (see set_scanning).
+        right_panel = QSplitter(Qt.Vertical)
+        right_panel.addWidget(scroll_area)
+        right_panel.addWidget(cube_preview_group)
+        right_panel.setCollapsible(0, True)
+        right_panel.setCollapsible(1, False)
+        right_panel.setStretchFactor(0, 0)
+        right_panel.setStretchFactor(1, 1)
+        self.settings_splitter = right_panel
+        self._settings_sizes_before_scan = None
+        self._scan_clock = None             # (monotonic start, expected s) while the stage moves
 
         # ── SPLITTER ─────────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
@@ -321,6 +398,18 @@ class ScanWindow(QWidget):
         self.setLayout(main_layout)
 
         self._update_stage_controls(self.stage_type())
+
+        # F5 / Esc press Start / Stop Scan (nothing while that button is disabled), only with
+        # the focus inside this window, so another module window never starts the stage.
+        self.start_scan_shortcut = QShortcut(QKeySequence(Qt.Key_F5), self)
+        self.stop_scan_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        for shortcut, button in ((self.start_scan_shortcut, self.viewer.start_btn),
+                                 (self.stop_scan_shortcut, self.viewer.stop_btn)):
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(button.click)
+        self.viewer.start_btn.setToolTip("Start Scan (F5)")
+        self.viewer.stop_btn.setToolTip("Stop Scan (Esc)")
+
         self.open_cube_viewer_btn.clicked.connect(self._on_open_cube_viewer)
         self.open_calibration_btn.clicked.connect(self._on_open_calibration)
         self.open_spectrogram_btn.clicked.connect(self._on_open_spectrogram)
@@ -332,11 +421,17 @@ class ScanWindow(QWidget):
     def status_info(self) -> str:
         s = self._status
         cam_fps = "" if s["camera_fps"] is None else f" (cam {s['camera_fps']:.1f})"
+        scan_time = ""
+        if self._scan_clock is not None:
+            started, expected = self._scan_clock
+            scan_time = (f"Scan {_format_duration(time.monotonic() - started)}"
+                         f" / ~{_format_duration(expected)}  ·  ")
         temp_str = ""
         if s["temp"] > -900:
             temp_str = f"  ·  \U0001f321 {s['temp']:.1f}\u00b0C"
         return (
             f"{s['state']}  ·  "
+            f"{scan_time}"
             f"FPS {s['fps']:.1f}"
             f"{cam_fps}  ·  "
             f"Frame {s['frame']:,}  ·  "
@@ -432,6 +527,135 @@ class ScanWindow(QWidget):
 
     def set_bin_enabled(self, enabled):
         self.camera_controls.set_bin_enabled(enabled)
+
+    # ── scanning ─────────────────────────────────────────────────
+
+    def set_scanning(self, active: bool):
+        """Lock the camera and stage settings during a scan and fold them away.
+
+        Starting folds the settings pane so the cube preview gets its height; it can still
+        be dragged open to read the (locked) values, and the preview title shows them in one
+        line (:meth:`scan_settings_summary`). Ending restores the pane height from before the
+        scan and the plain title. The bin, wavelength range and dark panel are locked separately.
+
+        Args:
+            active: True when a scan starts, False when it ends (or fails).
+        """
+        self.camera_controls.set_settings_enabled(not active)
+        self.rotation_group.setEnabled(not active)
+        self.linear_group.setEnabled(not active)
+        splitter = self.settings_splitter
+        if active and self._settings_sizes_before_scan is None:
+            sizes = splitter.sizes()
+            self._settings_sizes_before_scan = sizes
+            splitter.setSizes([0, sum(sizes)])
+        elif not active and self._settings_sizes_before_scan is not None:
+            splitter.setSizes(self._settings_sizes_before_scan)
+            self._settings_sizes_before_scan = None
+        if not active:
+            self._scan_clock = None
+        self.cube_preview_group.setTitle(
+            f"{CUBE_PREVIEW_TITLE}  —  {self.scan_settings_summary()}" if active else CUBE_PREVIEW_TITLE)
+
+    def scan_settings_summary(self) -> str:
+        """The settings a scan uses in one line: bin, exposure, gain, recorded bands, stage move."""
+        controls = self.camera_controls
+        parts = [f"Bin {controls.selected_bin()}", f"{controls.exposure_ms():.3f} ms", f"Gain {controls.gain()}"]
+        if self._recorded_bands is not None:
+            parts.append(self._recorded_bands)
+        if self.stage_type() == "linear":
+            parts.append(f"{self.linear_distance_mm():.3f} mm @ {self.linear_speed_um_s():g} µm/s")
+        else:
+            parts.append(f"{self.rotation_degree():.3f}° @ {self.rotation_speed_dps():.3f}°/s")
+        return "  ·  ".join(parts)
+
+    def expected_scan_seconds(self) -> float:
+        """Duration of the scan move from the stage settings, in s (stage acceleration ignored)."""
+        if self.stage_type() == "linear":
+            return self.linear_distance_mm() / (self.linear_speed_um_s() / 1000.0)
+        return self.rotation_degree() / self.rotation_speed_dps()
+
+    def start_scan_clock(self):
+        """Show ``Scan elapsed / ~expected`` in the status line from now (the stage move start)
+        until the scan ends (:meth:`set_scanning` ``False``)."""
+        self._scan_clock = (time.monotonic(), self.expected_scan_seconds())
+
+    # ── wavelength range ─────────────────────────────────────────
+
+    def requested_wavelength_range(self):
+        """``(start, end)`` nm as entered, or ``None`` when the range is off (full range)."""
+        if not self.wavelength_range_group.isChecked():
+            return None
+        return (round(self.wavelength_start_spin.value(), 1), round(self.wavelength_end_spin.value(), 1))
+
+    def wavelength_range_edits(self):
+        """The signals emitted when the user commits a range edit (connect them all)."""
+        return (self.wavelength_range_group.toggled, self.wavelength_range_committed)
+
+    def _on_wavelength_spin_finished(self, partner):
+        """Commit, unless focus just moved to the other spin box (Start then End is one edit)."""
+        if QApplication.focusWidget() is not partner:
+            self.wavelength_range_committed.emit()
+
+    def set_wavelength_range(self, wavelength_range):
+        """Show ``(start, end)`` nm (checked) or ``None`` (unchecked) without emitting edits."""
+        widgets = (self.wavelength_range_group, self.wavelength_start_spin, self.wavelength_end_spin)
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.wavelength_range_group.setChecked(wavelength_range is not None)
+            if wavelength_range is not None:
+                lo, hi = (float(v) for v in wavelength_range)
+                for spin, value in ((self.wavelength_start_spin, lo), (self.wavelength_end_spin, hi)):
+                    spin.setRange(min(spin.minimum(), value), max(spin.maximum(), value))
+                    spin.setValue(value)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+    def set_wavelength_range_axis(self, info: dict):
+        """Limits and tooltip from the engine's ``wavelength_range_applied`` info.
+
+        The limits are the calibrated span rounded outward to 0.1 nm (widened to keep the
+        values shown); with the range off the spin boxes show that span, so checking the
+        box starts from the full range. A spin box being edited is left alone. The first
+        call enables the control.
+        """
+        lo = math.floor(float(info["calibrated_nm"][0]) * 10.0) / 10.0
+        hi = math.ceil(float(info["calibrated_nm"][1]) * 10.0) / 10.0
+        widgets = (self.wavelength_start_spin, self.wavelength_end_spin)
+        for spin in widgets:
+            spin.blockSignals(True)
+        try:
+            off = not self.wavelength_range_group.isChecked()
+            for spin, edge in zip(widgets, (lo, hi)):
+                if off:
+                    spin.setRange(lo, hi)
+                    spin.setValue(edge)
+                elif not spin.hasFocus():
+                    spin.setRange(min(lo, spin.value()), max(hi, spin.value()))
+        finally:
+            for spin in widgets:
+                spin.blockSignals(False)
+        self._wavelength_axis_known = True
+        self.wavelength_range_group.setEnabled(self._wavelength_range_allowed)
+        first, last = info["centres_nm"]
+        if info.get("bands") is None:
+            kept = f"all {info['full_bands']} bands, {first:.1f}–{last:.1f} nm"
+        else:
+            kept = f"{info['bands'][1] - info['bands'][0]} of {info['full_bands']} bands, {first:.1f}–{last:.1f} nm"
+        n_bands = info['full_bands'] if info.get("bands") is None else info['bands'][1] - info['bands'][0]
+        self._recorded_bands = f"{n_bands} bands {first:.1f}–{last:.1f} nm"
+        self.wavelength_range_group.setToolTip(
+            f"Recording {kept} (band centres; step {info['step_nm']:.2f} nm)\n"
+            f"Calibrated range {info['calibrated_nm'][0]:.1f}–{info['calibrated_nm'][1]:.1f} nm.\n"
+            "Unchecked: the full calibrated range. Applied from the next frame; locked during a scan.")
+
+    def set_wavelength_range_enabled(self, enabled: bool):
+        """Allow or block range edits (blocked during a scan, like the bin, and until the
+        camera has reported its calibrated axis)."""
+        self._wavelength_range_allowed = bool(enabled)
+        self.wavelength_range_group.setEnabled(self._wavelength_range_allowed and self._wavelength_axis_known)
 
     # ── focus ROI ────────────────────────────────────────────────
 

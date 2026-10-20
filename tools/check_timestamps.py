@@ -13,15 +13,26 @@ Reports:
 * the delivered frame rate from camera timestamps, and frame-ID gaps (lost frames);
 * which timestamp-latch / tick-frequency nodes the camera has.
 
+``--list-nodes`` instead lists every node whose name matches ``--match`` (default
+time/stamp/latch) in all node maps (camera, GenTL device, interface, system), to find
+a latch under a vendor-specific name.  It is read-only: the camera is not opened the
+app's way (no tuning, no stream), no command is executed and no node is written;
+only readable values are read.  Close the app first, it holds the camera.
+
 Usage:
     python tools/check_timestamps.py
     python tools/check_timestamps.py --frames 200 --latch
+    python tools/check_timestamps.py --list-nodes
+    python tools/check_timestamps.py --list-nodes --match .      # every node
 """
 import argparse
 import os
+import re
 import statistics
 import sys
 import time
+
+from harvesters.core import Harvester
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -34,6 +45,13 @@ FRAME_ID_ATTRIBUTES = ('frame_id', 'frame_count', 'image_id')
 LATCH_NODES = ('TimestampLatch', 'GevTimestampControlLatch', 'TimestampControlLatch')
 LATCH_VALUE_NODES = ('TimestampLatchValue', 'GevTimestampValue', 'TimestampValue')
 TICK_NODES = ('GevTimestampTickFrequency', 'TimestampTickFrequency')
+#: Node maps listed by --list-nodes: label -> ImageAcquirer attribute.
+NODE_MAP_OWNERS = (('camera', 'remote_device'), ('GenTL device', 'device'),
+                   ('GenTL interface', 'interface'), ('GenTL system', 'system'))
+#: GenApi EAccessMode values.
+ACCESS_MODES = {0: 'NI', 1: 'NA', 2: 'WO', 3: 'RO', 4: 'RW'}
+#: Node types whose value is read (commands are never executed, categories have none).
+VALUE_TYPES = ('IInteger', 'IFloat', 'IString', 'IEnumeration', 'IBoolean')
 
 
 def buffer_value(buffer, names):
@@ -135,10 +153,72 @@ def check_nodes(node_map, latch):
     print('  no latch command node found')
 
 
+def node_rows(node_map, pattern):
+    """``(name, type, access, value, tooltip)`` of the nodes whose name matches ``pattern``.
+
+    Only readable values of value nodes are read; commands are not executed.
+    """
+    rows = []
+    for wrapper in node_map.nodes:
+        node = wrapper.node
+        if not re.search(pattern, node.name, re.IGNORECASE):
+            continue
+        kind = type(wrapper).__name__
+        try:
+            access = ACCESS_MODES.get(int(node.get_access_mode()), '?')
+        except Exception:
+            access = '?'
+        value = ''
+        if kind in VALUE_TYPES and access in ('RO', 'RW'):
+            try:
+                value = str(wrapper.value)
+            except Exception as exc:
+                value = f'<unreadable: {exc}>'
+        rows.append((node.name, kind[1:], access, value, ' '.join(str(node.tooltip or '').split())))
+    return rows
+
+
+def list_nodes(acquirer, pattern):
+    """Print the matching nodes of every node map the acquirer has."""
+    for label, owner_name in NODE_MAP_OWNERS:
+        try:
+            node_map = getattr(acquirer, owner_name).node_map
+            rows = node_rows(node_map, pattern)
+        except Exception as exc:
+            print(f'\n{label} node map: not available ({exc})')
+            continue
+        print(f'\n{label} node map: {len(rows)} nodes matching {pattern!r}')
+        for name, kind, access, value, tooltip in rows:
+            print(f'  {name:36s} {kind:12s} {access:3s} {value:>20s}  {tooltip[:70]}')
+
+
+def run_list_nodes(camera, pattern):
+    """Open the device only far enough to read its node maps (no tuning, no stream)."""
+    harvester = Harvester()
+    try:
+        harvester.add_file(camera.CTI_PATH)
+        harvester.update()
+        if not harvester.device_info_list:
+            print('No GenICam device found (is the app still running?)')
+            return 1
+        acquirer = harvester.create(camera.camera_index)
+        try:
+            list_nodes(acquirer, pattern)
+        finally:
+            acquirer.destroy()
+    finally:
+        harvester.reset()
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--frames', type=int, default=100, help='frames to collect')
     parser.add_argument('--latch', action='store_true', help='execute the timestamp-latch command once')
+    parser.add_argument('--list-nodes', action='store_true',
+                        help='only list matching nodes of all node maps (read-only)')
+    parser.add_argument('--match', default='time|stamp|latch',
+                        help='regular expression on node names for --list-nodes (case-insensitive)')
     args = parser.parse_args(argv)
 
     config = load_app_config()
@@ -146,6 +226,8 @@ def main(argv=None):
         print(f'GenICam only (config camera_backend={config.camera_backend})')
         return 1
     camera = create_backend(config)
+    if args.list_nodes:
+        return run_list_nodes(camera, args.match)
     print(f'Camera: genicam, bin {config.default_bin}, exposure {config.default_exposure_ms} ms, '
           f'gain {config.default_gain}; collecting {args.frames} frames')
     try:

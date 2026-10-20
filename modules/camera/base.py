@@ -258,6 +258,14 @@ class AbstractCameraBackend(DarkProcessor, ABC):
         """Return the camera's target temperature in °C, or ``None`` if it has none."""
         return None
 
+    def cooling_state(self):
+        """Return the cooler's regulation state as short text (e.g. ``"stable"``), or ``None``.
+
+        The default is ``None`` (no state reported); GenICam reads ``SensorTemperatureControlState``.
+        Polled from the GUI thread like ``get_temperature``.
+        """
+        return None
+
     def set_target_temperature(self, temp_c: float) -> None:
         """Turn the cooler on and regulate the sensor to ``temp_c`` °C.
 

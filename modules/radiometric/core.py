@@ -42,6 +42,7 @@ Example:
     >>> compute_fluorescence_factors('reference.bsq', meta, mask)['factors'].shape  # doctest: +SKIP
     (bands,)
 """
+import os
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,115 @@ def list_reflectance_profiles(folder=None):
     return sorted((p for p in folder.iterdir()
                    if p.is_file() and p.suffix.lower() in ('.xlsx', '.xls') and not p.name.startswith('~$')),
                   key=lambda p: p.name.lower())
+
+
+def check_factor_bands(n_bands, factor_wavelengths, cube_meta):
+    """Refuse calibration factors whose bands are not the cube's bands.
+
+    Factors are applied by band index, so factors made from a cube with another band
+    count or wavelength axis (for example another wavelength range) would be applied to
+    the wrong bands or run out of range.
+
+    Args:
+        n_bands: Number of bands of the factors (last axis of row-wise or fluorescence factors).
+        factor_wavelengths: Band centres (nm) of the cube the factors were made from, or
+            ``None`` if unknown (then only the band count is checked).
+        cube_meta: Header dict of the cube the factors are applied to (``bands``, ``wavelength``).
+
+    Raises:
+        ValueError: The band counts differ, or a band centre is further from the cube's than
+            a quarter of the cube's median band step (at least 0.01 nm, since ENVI headers
+            store 2 decimals).
+    """
+    n_bands, n_cube = int(n_bands), int(cube_meta['bands'])
+    if n_bands != n_cube:
+        raise ValueError(f"Calibration factors for {n_bands} bands do not fit this cube of {n_cube} bands: "
+                         "use a reference or profile with the same bands.")
+    cube_wl = cube_meta.get('wavelength')
+    if factor_wavelengths is None or cube_wl is None:
+        return
+    fw = np.asarray(factor_wavelengths, dtype=np.float64).ravel()
+    cw = np.asarray(cube_wl, dtype=np.float64).ravel()
+    if fw.size != cw.size:
+        raise ValueError(f"Calibration factors list {fw.size} wavelengths, this cube {cw.size}.")
+    step = float(np.median(np.abs(np.diff(cw)))) if cw.size > 1 else 0.0
+    tol = max(step / 4.0, 0.01)
+    gap = np.abs(fw - cw)
+    if not np.all(gap <= tol):
+        raise ValueError(f"Calibration factors for {fw[0]:.2f}-{fw[-1]:.2f} nm do not fit this cube's "
+                         f"{cw[0]:.2f}-{cw[-1]:.2f} nm (bands up to {np.max(gap):.3g} nm apart, tolerance "
+                         f"{tol:.3g} nm): use a reference or profile with the same bands.")
+
+
+def _check_params_factors(params, cube_meta):
+    """:func:`check_factor_bands` for the factors a processing call applies (row-wise first, as applied)."""
+    factors = params.get('rowwise_factors')
+    if factors is None:
+        factors = params.get('factors')
+    if factors is not None:
+        check_factor_bands(np.shape(factors)[-1], params.get('factor_wavelengths'), cube_meta)
+
+
+def _wavelength_sidecar(profile_path):
+    """``<name>.wavelength.npy`` next to the profile ``<name>.npy``."""
+    return os.path.splitext(str(profile_path))[0] + '.wavelength.npy'
+
+
+def save_factor_profile(path, factors, wavelengths=None):
+    """Save factors as ``.npy`` and their band centres as ``<name>.wavelength.npy`` beside it.
+
+    The profile file is what ``np.save(path, factors)`` writes. Without ``wavelengths`` a
+    sidecar left by an earlier save to the same name is removed, so it never describes
+    other factors.
+
+    Args:
+        path: Profile path; ``.npy`` is appended if missing, as ``np.save`` does.
+        factors: Row-wise ``(lines, bands)`` or fluorescence ``(bands,)`` factors.
+        wavelengths: Band centres (nm) of the cube the factors were made from, or ``None``.
+
+    Returns:
+        str: The profile path written.
+
+    Raises:
+        ValueError: ``wavelengths`` does not give one value per band.
+    """
+    path = str(path)
+    if not path.endswith('.npy'):
+        path += '.npy'
+    sidecar = _wavelength_sidecar(path)
+    if wavelengths is not None:
+        wavelengths = np.asarray(wavelengths, dtype=np.float64).ravel()
+        if wavelengths.size != np.shape(factors)[-1]:
+            raise ValueError(f"{wavelengths.size} wavelengths for {np.shape(factors)[-1]} bands")
+    np.save(path, factors)
+    if wavelengths is not None:
+        np.save(sidecar, wavelengths)
+    elif os.path.exists(sidecar):
+        os.remove(sidecar)
+    return path
+
+
+def load_factor_profile(path):
+    """Load a ``.npy`` factor profile and, if present, its ``<name>.wavelength.npy`` sidecar.
+
+    Returns:
+        tuple: ``(factors, wavelengths)``; ``wavelengths`` is a float64 array (nm) or
+        ``None`` for a profile saved without one (only its band count can be checked).
+
+    Raises:
+        ValueError: The sidecar does not give one wavelength per band.
+    """
+    factors = np.load(path)
+    sidecar = _wavelength_sidecar(path)
+    if not os.path.isfile(sidecar):
+        return factors, None
+    wavelengths = np.asarray(np.load(sidecar), dtype=np.float64)
+    n_bands = np.shape(factors)[-1] if np.ndim(factors) else 0
+    if wavelengths.ndim != 1 or wavelengths.size != n_bands:
+        raise ValueError(f"{os.path.basename(sidecar)} lists {wavelengths.size} wavelengths "
+                         f"for a profile of {n_bands} bands")
+    return factors, wavelengths
+
 
 def _apply_spatial_binning(img, n, to_uint16=False):
     """Average spatial blocks, dropping incomplete edge blocks as before."""
@@ -148,6 +258,7 @@ def create_datacube_logic(params, progress_callback=None):
     factors = params['factors']
     rowwise_factors = params['rowwise_factors']
     n_bin = params.get('binning_factor', 1)
+    _check_params_factors(params, raw_meta)
 
     cubheight, cubwidth = (y1 - y0) // n_bin, (x1 - x0) // n_bin
     is_cal = (rowwise_factors is not None) or (factors is not None)
@@ -206,6 +317,7 @@ def create_datacube_resampled_logic(params, progress_callback=None):
     rowwise_factors = params['rowwise_factors']
     lam_target = np.array(params['lam_target'], dtype=np.float32)
     n_bin = params.get('binning_factor', 1)
+    _check_params_factors(params, raw_meta)
 
     wl_all = raw_meta['wavelength']
     idx_right = np.searchsorted(wl_all, lam_target, side='left')
@@ -303,6 +415,7 @@ def build_cal_cube_tmp(params, progress_callback=None):
     x0, x1, y0, y1 = params['crop']
     factors = params.get('factors', None)
     rowwise = params.get('rowwise_factors', None)
+    _check_params_factors(params, raw_meta)
 
     lines, samples = (y1 - y0), (x1 - x0)
     bands = raw_meta['bands']

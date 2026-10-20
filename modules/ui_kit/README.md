@@ -11,7 +11,7 @@ zoom/pan mixin, an edge-resizable MDI sub-window and a macOS-style title bar.
 | `ZoomPanMixin` | `zoom_pan.py` | wheel zoom + middle-button pan for any `QWidget` |
 | `ResizableMdiSubWindow` | `resizable_subwindow.py` | `QMdiSubWindow` resizable from every edge/corner |
 | `IOSTitleBar`, `TrafficLightButton` | `title_bar.py` | dark custom title bar with traffic-light buttons |
-| `dashboard_stylesheet` | `theme.py` | recolours the qdarktheme QSS to a green accent (colours only) |
+| `dashboard_stylesheet` | `theme.py` | recolours the qdarktheme QSS to a green accent (colours only; splitter handles a lighter grey so the drag bars show) |
 
 ## Requirements
 

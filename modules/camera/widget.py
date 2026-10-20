@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox,
     QGroupBox,
     QFormLayout,
+    QHBoxLayout,
     QLabel,
     QSpinBox,
     QDoubleSpinBox,
@@ -39,6 +40,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import pyqtSignal
 
 _TEMPERATURE_RANGE_C = (-80.0, 100.0)    # widest range shown when the camera reports none
+#: Colour of the cooling-state label per state (others grey).
+_STATE_COLORS = {"stable": "#66bb6a", "low": "#ffa726", "high": "#ffa726", "alert": "#ef5350",
+                 "off": "#9e9e9e"}
 
 
 class CameraControls(QGroupBox):
@@ -61,7 +65,8 @@ class CameraControls(QGroupBox):
 
     Temperature row: with :meth:`set_cooling_supported` ``True`` it is an editable
     "Target Temp"; otherwise (the default, fan-cooled cameras) a read-only "Sensor Temp"
-    that :meth:`show_sensor_temperature` updates.
+    that :meth:`show_sensor_temperature` updates. Next to it, :meth:`set_cooling_state` shows
+    the cooler's regulation state (e.g. "stable"); the label is hidden while it is ``None``.
 
     The host must provide: the actual camera calls (connect the signals) and the
     hardware limits and bin list. Use from the GUI thread only.
@@ -99,6 +104,13 @@ class CameraControls(QGroupBox):
         self.temp_spin.setSingleStep(1.0)
         self.temp_spin.setSuffix(" °C")
         self.temp_spin.setKeyboardTracking(False)
+        self.cooling_state_label = QLabel()
+        self.cooling_state_label.setToolTip("Cooler regulation state reported by the camera")
+        self.cooling_state_label.hide()
+        temp_row = QHBoxLayout()
+        temp_row.setContentsMargins(0, 0, 0, 0)
+        temp_row.addWidget(self.temp_spin, stretch=1)
+        temp_row.addWidget(self.cooling_state_label)
         self._cooling_supported = False
         self._last_target = None
 
@@ -115,7 +127,7 @@ class CameraControls(QGroupBox):
         layout.addRow("Gain", self.gain_spin)
         layout.addRow("Exposure", self.exp_spin)
         layout.addRow("Bin", self.bin_combo)
-        layout.addRow(self.temp_label, self.temp_spin)
+        layout.addRow(self.temp_label, temp_row)
         layout.addRow("", self.keep_spectrogram_check)
         self.setLayout(layout)
         self.set_cooling_supported(False)
@@ -198,6 +210,22 @@ class CameraControls(QGroupBox):
         self.temp_spin.blockSignals(True)
         self.temp_spin.setValue(float(temp_c) if temp_c > -900 else self.temp_spin.minimum())
         self.temp_spin.blockSignals(False)
+
+    def set_cooling_state(self, state) -> None:
+        """Show the cooler's regulation state next to the temperature, or hide it.
+
+        Args:
+            state: Short text from the camera (``"stable"``, ``"low"``, ``"high"``, ``"alert"``),
+                or ``None`` when the camera reports none.
+        """
+        if not state:
+            self.cooling_state_label.hide()
+            return
+        text = str(state)
+        color = _STATE_COLORS.get(text.lower(), "#9e9e9e")
+        self.cooling_state_label.setText(text)
+        self.cooling_state_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.cooling_state_label.show()
 
     def _on_target_edited(self) -> None:
         if not self._cooling_supported:
@@ -288,3 +316,16 @@ class CameraControls(QGroupBox):
             enabled: True to let the user change the bin.
         """
         self.bin_combo.setEnabled(enabled)
+
+    def set_settings_enabled(self, enabled: bool) -> None:
+        """Enable / disable gain, exposure, cooling target and Keep Spectrogram (disabled during scan).
+
+        The bin has its own :meth:`set_bin_enabled`. A read-only sensor temperature stays
+        enabled, so it remains readable.
+
+        Args:
+            enabled: True to let the user change the settings.
+        """
+        for widget in (self.gain_spin, self.exp_spin, self.keep_spectrogram_check):
+            widget.setEnabled(enabled)
+        self.temp_spin.setEnabled(enabled or not self._cooling_supported)

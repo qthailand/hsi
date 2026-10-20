@@ -32,7 +32,10 @@ def build_window(path: str | None = None):
         path: ENVI ``.hdr`` path, or ``None`` for a synthetic cube.
 
     Returns:
-        CubeViewerWindow: Not yet shown.  Requires a ``QApplication``.
+        CubeViewerWindow: Not yet shown.  Requires a ``QApplication``.  For a file the
+        window gets it as ``source_path``: areas are named ``'<file stem>-mean-<k>'``,
+        the spectra export defaults to ``<stem>_spectra.csv`` next to it and the XLSX
+        metadata records it (as in the main application).
     """
     from modules.cube_viewer import CubeViewerWindow
 
@@ -40,8 +43,8 @@ def build_window(path: str | None = None):
         from modules.cube_io import load_envi_cube_for_viewer
 
         cube, wavelengths = load_envi_cube_for_viewer(path)
-    else:
-        cube, wavelengths = synthetic_cube()
+        return CubeViewerWindow(cube, wavelengths, source_path=path)
+    cube, wavelengths = synthetic_cube()
     return CubeViewerWindow(cube, wavelengths)
 
 

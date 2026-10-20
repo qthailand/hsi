@@ -4,3 +4,5 @@
 __pycache__/
 modules/camera/poa
 modules/camera/ximea
+tools/
+tests/

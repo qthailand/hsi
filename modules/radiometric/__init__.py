@@ -3,8 +3,10 @@
 Qt-free (``core``): ``compute_rowwise_factors`` (white-reference factors per slit
 row and band), ``compute_fluorescence_factors`` (ROI-average factors, Savitzky-Golay
 smoothed), ``process_cube`` (crop, calibrate, spatially bin, write ENVI BIP),
-``resample_cube`` (same, plus linear resampling to a wavelength grid) and
-``build_raw_cube_tmp`` / ``build_cal_cube_tmp`` (temporary band-stack memmaps).
+``resample_cube`` (same, plus linear resampling to a wavelength grid),
+``build_raw_cube_tmp`` / ``build_cal_cube_tmp`` (temporary band-stack memmaps),
+``check_factor_bands`` (refuses factors made for other bands) and
+``save_factor_profile`` / ``load_factor_profile`` (``.npy`` plus wavelength sidecar).
 Qt (loaded lazily, so ``import modules.radiometric`` does not import PyQt5):
 ``CalibrationWindow``, ``RoiDialog`` and the thread adapter ``Worker``.
 
@@ -27,9 +29,9 @@ Example:
     >>> mask = ...  # boolean (lines, samples) ROI                # doctest: +SKIP
     >>> factors = compute_fluorescence_factors('white_reference.bsq', meta, mask)['factors']  # doctest: +SKIP
 """
-from .core import rowwise_calculation_heavy_logic, fluo_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles
+from .core import rowwise_calculation_heavy_logic, fluo_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles, check_factor_bands, save_factor_profile, load_factor_profile
 
-__all__ = ['rowwise_calculation_heavy_logic', 'fluo_calculation_heavy_logic', 'create_datacube_logic', 'create_datacube_resampled_logic', 'build_raw_cube_tmp', 'build_cal_cube_tmp', 'REFLECTANCE_PROFILE_DIR', 'list_reflectance_profiles', 'compute_rowwise_factors', 'compute_fluorescence_factors', 'process_cube', 'resample_cube', 'CalibrationWindow', 'RoiDialog', 'Worker']
+__all__ = ['rowwise_calculation_heavy_logic', 'fluo_calculation_heavy_logic', 'create_datacube_logic', 'create_datacube_resampled_logic', 'build_raw_cube_tmp', 'build_cal_cube_tmp', 'REFLECTANCE_PROFILE_DIR', 'list_reflectance_profiles', 'check_factor_bands', 'save_factor_profile', 'load_factor_profile', 'compute_rowwise_factors', 'compute_fluorescence_factors', 'process_cube', 'resample_cube', 'CalibrationWindow', 'RoiDialog', 'Worker']
 __requires__ = ('cube_io',)
 __widgets__ = ('CalibrationWindow',)
 

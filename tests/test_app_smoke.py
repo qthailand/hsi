@@ -10,6 +10,8 @@ import types
 
 import numpy as np
 import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QKeySequence
 
 from hsi_fakes import FakeCamera, H, W
 
@@ -92,6 +94,49 @@ def test_scan_produces_a_cube_with_every_frame(main_window):
     assert wavelengths is not None and len(wavelengths) == bins
     # the real-time preview received the same number of columns as the cube
     assert pump(app, lambda: scan.cube_preview._current_shape[1] == scans, timeout=10)
+
+
+def test_a_scan_locks_and_folds_the_settings_then_restores_them(main_window):
+    app, window = main_window
+    window.show()
+    scan = window.scan_window
+    controller, controls, splitter = scan.controller, scan.camera_controls, scan.settings_splitter
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    locked = (controls.gain_spin, controls.exp_spin, controls.bin_combo, controls.keep_spectrogram_check,
+              scan.rotation_group, scan.linear_group)
+    before = splitter.sizes()
+    assert before[0] > 0 and all(w.isEnabled() for w in locked)
+    controller.start_scan()
+    assert controller.state == controller.SCANNING
+    assert splitter.sizes()[0] == 0 and not any(w.isEnabled() for w in locked)
+    assert controls.temp_spin.isEnabled()                      # the fan-cooled sensor readout stays readable
+    assert pump(app, lambda: '/ ~' in scan.status_info())      # Scan elapsed / ~expected, once the stage moves
+    assert pump(app, lambda: scan._pending_cube is not None)
+    assert controller.state == controller.PREVIEW
+    assert splitter.sizes() == before and all(w.isEnabled() for w in locked)
+    assert '/ ~' not in scan.status_info()
+
+
+def test_f5_and_esc_start_and_stop_a_scan_and_recorded_matches_the_cube(main_window):
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    for shortcut, key in ((scan.start_scan_shortcut, Qt.Key_F5), (scan.stop_scan_shortcut, Qt.Key_Escape)):
+        assert shortcut.key() == QKeySequence(key)
+        assert shortcut.context() == Qt.WidgetWithChildrenShortcut   # only with the focus in this window
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    scan.stop_scan_shortcut.activated.emit()                    # Esc in preview: Stop is disabled
+    assert controller.state == controller.PREVIEW
+    scan.start_scan_shortcut.activated.emit()                   # F5
+    assert controller.state == controller.SCANNING and 'Bin ' in scan.cube_preview_group.title()
+    assert pump(app, lambda: controller.recording and controller.preview_thread.recorded_count() > 5)
+    scan.start_scan_shortcut.activated.emit()                   # F5 again while scanning: nothing
+    assert controller.state == controller.SCANNING
+    scan.stop_scan_shortcut.activated.emit()                    # Esc: the cube is built from the frames so far
+    assert controller.state == controller.PREVIEW and scan._pending_cube is not None
+    assert scan._status['recorded'] == scan._pending_cube.shape[1]          # the cube's frames
+    assert scan.cube_preview_group.title() == 'Realtime Cube Preview'
+    assert pump(app, lambda: controller.stage is None)          # let the stage return home
 
 
 def test_linear_scan_keeps_acquisition_order_like_the_legacy_swir_app(main_window, monkeypatch):
@@ -225,7 +270,7 @@ def test_missing_camera_shows_an_error_and_keeps_the_main_window(monkeypatch):
 def _config_files():
     from pathlib import Path
     root = Path(__file__).resolve().parents[1] / 'config'
-    return {name: (root / name).read_bytes() for name in ('camera.json', 'scan.json')}
+    return {name: (root / name).read_bytes() for name in ('camera.json', 'scan.json', 'processing.json')}
 
 
 def test_tests_and_tools_never_write_the_users_settings(main_window):

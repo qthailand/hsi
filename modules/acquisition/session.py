@@ -45,8 +45,6 @@ class ScanOutcome:
             ``"reference"`` (visual-selection preview ready) or ``"reference_failed"``.
         images: Binned frames (``kind == "cube"``).
         raw: Raw sensor frames kept by Keep Spectrogram (may be empty).
-        tail: Frames the live preview has not received yet; the caller pushes them and
-            reports them with :meth:`ScanSession.note_preview_frames`.
         request_id: Visual-selection request this outcome answers, if any.
         reference_columns: RGB columns ``(slit, 3)`` collected for a visual-selection preview.
         error: Reason for ``"reference_failed"``.
@@ -55,7 +53,6 @@ class ScanOutcome:
     kind: str
     images: list = field(default_factory=list)
     raw: list = field(default_factory=list)
-    tail: list = field(default_factory=list)
     request_id: Optional[int] = None
     reference_columns: list = field(default_factory=list)
     error: str = ""
@@ -74,7 +71,6 @@ class ScanSession:
         self.images: list = []
         self.spectrograms: list = []
         self.sat_per_frame: list = []
-        self.preview_pushed = 0           # recorded frames already given to a live preview
         self.reference_preview_id: Optional[int] = None
         self.reference_columns: list = []
 
@@ -85,7 +81,6 @@ class ScanSession:
         self.images = []
         self.spectrograms = []
         self.sat_per_frame = []
-        self.preview_pushed = 0
         self.recording = False
         self.state = self.SCANNING
 
@@ -101,10 +96,6 @@ class ScanSession:
 
     # ── during the scan ───────────────────────────────────
 
-    def note_preview_frames(self, count: int) -> None:
-        """Record that ``count`` frames were handed to the live preview."""
-        self.preview_pushed += count
-
     def add_reference_column(self, columns: np.ndarray) -> None:
         """Append the RGB column ``(slit, 3)`` of one recorded frame of a visual-selection scan."""
         self.reference_columns.append(columns)
@@ -115,7 +106,7 @@ class ScanSession:
         """End the scan normally and return what to do with the recording.
 
         Args:
-            images: Binned frames taken from the worker's recorder.
+            images: Binned frames taken from the worker's recorder (after trimming).
             raw: Raw frames taken from the worker's recorder.
 
         Returns:
@@ -134,8 +125,7 @@ class ScanSession:
                                    error="No preview frames captured")
             return ScanOutcome("reference", request_id=request_id, reference_columns=columns)
         self.images, self.spectrograms = images, raw
-        return ScanOutcome("cube" if images else "empty", images=images, raw=raw,
-                           tail=images[self.preview_pushed:])
+        return ScanOutcome("cube" if images else "empty", images=images, raw=raw)
 
     def fail(self) -> Optional[int]:
         """Discard a scan whose motion failed; return the visual-selection request it voids.

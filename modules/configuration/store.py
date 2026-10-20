@@ -30,8 +30,8 @@ from modules.contracts import WavelengthCalibration
 logger=logging.getLogger(__name__)
 SECTIONS={
  'camera':('camera_backend','camera_id','camera_index','cti_path','default_gain','default_exposure_ms','default_bin','sensor_pixel_size','target_temperature_c'),
- 'scan':('stage_type','rotation_degree','rotation_speed_dps','linear_distance_mm','linear_speed_um_s','scan_trim_extra_ms'),
- 'processing':('resolution','resolution_source','fwhm_step_factor','raw_inverted','rgb_target_wavelengths','preprocessing_backend','profile_timing'),
+ 'scan':('stage_type','rotation_degree','rotation_speed_dps','linear_distance_mm','linear_speed_um_s','scan_trim_extra_ms','stage_device'),
+ 'processing':('resolution','resolution_source','fwhm_step_factor','raw_inverted','rgb_target_wavelengths','preprocessing_backend','profile_timing','wavelength_range_nm'),
  'dark':('dark_frame_folder','dark_frame_n_frames'),
  'smile':('smile_map_folder',),
 }
@@ -212,6 +212,33 @@ class ConfigStore:
             manifest['sections'][section]=target.name
             self._atomic(self.manifest,manifest)
         return True
+
+    def update_section_entry(self,section,key,entry,value):
+        """Set one entry of the object-valued setting ``key`` (``value=None`` removes it).
+
+        The other entries are taken from the file as it is now, not from memory, so a hand
+        edit or another copy of the app keeps its entries (used for the per-backend
+        ``wavelength_range_nm``). Entry names match without regard to case (readers
+        lower-case them), so a hand-written ``"POA"`` is replaced or removed too. Written as
+        :meth:`update_section` writes.
+
+        Args:
+            section: A section name, e.g. ``'processing'``.
+            key: The setting holding an object, e.g. ``'wavelength_range_nm'``.
+            entry: The entry name inside it, e.g. the camera backend.
+            value: Its new JSON value, or ``None`` to remove the entry.
+
+        Returns:
+            bool: True if the file was written.
+        """
+        manifest=self._read(self.manifest)
+        source=self._section_path(manifest,section)
+        current=self._read(source) if source.exists() else {}
+        entries=current.get(key)
+        entries=dict(entries) if isinstance(entries,dict) else {}
+        entries={k:v for k,v in entries.items() if str(k).lower()!=str(entry).lower()}
+        if value is not None:entries[entry]=value
+        return self.update_section(section,{key:entries})
 
     def save_wavelength_default(self,profile,config):
         """Persist after successful worker application, preserving split settings.

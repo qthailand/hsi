@@ -12,17 +12,15 @@ Data conventions:
 
 Threading:
     All methods take one internal lock and may be called from any thread.
-    :meth:`ScanRecorder.offer` and :meth:`ScanRecorder.pop_batch` are meant for the
-    worker, the others for the GUI.
+    :meth:`ScanRecorder.offer` is meant for the worker, the others for the GUI.  The list
+    returned by :meth:`ScanRecorder.live_frames` is appended to by the worker without
+    the reader holding the lock (``len`` and slicing of a list are atomic under the GIL).
 """
 from __future__ import annotations
 
 import threading
-import time
 
 import numpy as np
-
-PREVIEW_BATCH_INTERVAL = 1.0 / 30  # recorded frames reach a live preview in batches this often
 
 
 def _inside(stamp, window):
@@ -36,7 +34,7 @@ def _inside(stamp, window):
 
 
 class ScanRecorder:
-    """Collect the frames of one scan, plus an optional batch feed for live previews."""
+    """Collect the frames of one scan; a live preview reads the same list (:meth:`live_frames`)."""
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -45,9 +43,12 @@ class ScanRecorder:
         self._raw: list = []
         self._stamps: list = []         # camera time (ns or None) of each binned frame
         self._raw_stamps: list = []     # ... and of each raw frame
-        self._batch: list = []
-        self._last_batch_time = 0.0
+        self._min_stamp = None          # frames stamped earlier are not recorded (set_min_stamp)
+        self._live_dropped = 0          # ... and how many were refused so far
         self.last_trim = (0, 0)         # (frames dropped before, after) by the last take_frames
+        self.last_live_dropped = 0      # frames refused by offer before the last take_frames
+        # (first stamp, last stamp, frames without a stamp, frames) of the last take_frames
+        self.last_stamps = (None, None, 0, 0)
 
     @property
     def enabled(self) -> bool:
@@ -55,15 +56,36 @@ class ScanRecorder:
         return self._enabled
 
     def set_recording(self, active: bool) -> None:
-        """Arm or disarm recording; arming (False -> True) starts empty buffers."""
+        """Arm or disarm recording; arming (False -> True) starts empty buffers and clears
+        the :meth:`set_min_stamp` bound."""
         with self._lock:
             if active and not self._enabled:
                 self._frames = []
                 self._raw = []
                 self._stamps = []
                 self._raw_stamps = []
-                self._batch = []
+                self._min_stamp = None
+                self._live_dropped = 0
             self._enabled = bool(active)
+
+    def set_min_stamp(self, stamp) -> None:
+        """Stop recording frames stamped before ``stamp`` (camera ns; ``None`` = no bound).
+
+        Frames already recorded stay (``take_frames`` trims them); a frame without a
+        camera time is always recorded.
+        """
+        with self._lock:
+            self._min_stamp = stamp
+
+    def live_frames(self) -> list:
+        """The list the frames of the current recording are appended to (by reference).
+
+        A live preview reads it while it grows; :meth:`take_frames` returns this same
+        list object when nothing is trimmed.  Readers must not modify it.  Arming
+        starts a new list, so ask again after :meth:`set_recording`.
+        """
+        with self._lock:
+            return self._frames
 
     def count(self) -> int:
         """Number of frames recorded so far."""
@@ -80,17 +102,24 @@ class ScanRecorder:
                 is dropped when any frame has no camera time.
 
         Returns:
-            list: The kept binned frames, in order (``last_trim`` gives the counts dropped).
+            list: The kept binned frames, in order: the :meth:`live_frames` list itself
+            when nothing is dropped, else a new list (``last_trim`` gives the counts
+            dropped, ``last_stamps`` the first/last camera time of all recorded frames).
         """
         with self._lock:
             self._enabled = False
             frames, stamps, self._frames, self._stamps = self._frames, self._stamps, [], []
-            self._batch = []
             self.last_trim = (0, 0)
+            self.last_live_dropped, self._live_dropped = self._live_dropped, 0
+            known = [s for s in stamps if s is not None]
+            self.last_stamps = (known[0] if known else None, known[-1] if known else None,
+                                len(stamps) - len(known), len(stamps))
             if window is None or any(s is None for s in stamps):
                 return frames
             keep = [_inside(s, window) for s in stamps]
             self.last_trim = (sum(1 for k in keep if k < 0), sum(1 for k in keep if k > 0))
+            if self.last_trim == (0, 0):
+                return frames                   # the live list itself (a preview may show it)
             if all(s is not None for s in self._raw_stamps):
                 self._raw = [r for r, s in zip(self._raw, self._raw_stamps) if _inside(s, window) == 0]
             self._raw_stamps = []
@@ -111,33 +140,21 @@ class ScanRecorder:
             raw_frame: The sensor frame it came from; copied when ``keep_raw``.
             keep_raw: Also keep the raw frame (the "Keep Spectrogram" option).
             stamp: Camera time of the frame in ns (``None`` if unknown), used by
-                ``take_frames(window)``.
+                ``take_frames(window)`` and the :meth:`set_min_stamp` bound.
 
         Returns:
-            True if the frame was recorded.
+            True if the frame was recorded (not when disarmed, or stamped before the
+            :meth:`set_min_stamp` bound).
         """
         with self._lock:
             if not self._enabled:
+                return False
+            if self._min_stamp is not None and stamp is not None and stamp < self._min_stamp:
+                self._live_dropped += 1
                 return False
             self._frames.append(binned)
             self._stamps.append(stamp)
             if keep_raw:
                 self._raw.append(raw_frame.copy())
                 self._raw_stamps.append(stamp)
-            self._batch.append(binned)
             return True
-
-    def pop_batch(self, now: float | None = None):
-        """Return the frames recorded since the last batch if the interval elapsed, else ``None``.
-
-        The batch holds references only; it is what a live cube preview consumes.
-        """
-        if not self._batch:
-            return None
-        now = time.monotonic() if now is None else now
-        if now - self._last_batch_time < PREVIEW_BATCH_INTERVAL:
-            return None
-        with self._lock:
-            batch, self._batch = self._batch, []
-        self._last_batch_time = now
-        return batch or None

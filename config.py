@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from modules.acquisition.config import ProcessingConfig
+from modules.acquisition.config import ProcessingConfig, parse_wavelength_ranges
 from modules.camera.config import CameraConfig
 from modules.dark.config import DarkConfig
 from modules.smile.config import SmileConfig
@@ -58,7 +58,8 @@ def load_app_config(path: str | None = None) -> AppConfig:
                                                                  "resolution_source", "fwhm_step_factor",
                                                                  "target_temperature_c", "rotation_degree",
                                                                  "rotation_speed_dps", "linear_distance_mm",
-                                                                 "linear_speed_um_s", "scan_trim_extra_ms"}
+                                                                 "linear_speed_um_s", "scan_trim_extra_ms", "stage_device",
+                                                                 "wavelength_range_nm"}
     target_temperature = data.get("target_temperature_c")
     stage_defaults = StageConfig()
     if missing:
@@ -80,6 +81,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
         linear_distance_mm=float(data.get("linear_distance_mm", stage_defaults.linear_distance_mm)),
         linear_speed_um_s=float(data.get("linear_speed_um_s", stage_defaults.linear_speed_um_s)),
         scan_trim_extra_ms=float(data.get("scan_trim_extra_ms", stage_defaults.scan_trim_extra_ms)),
+        stage_device=str(data.get("stage_device") or ""),
         m=float(data.get("m", 0.2903)),
         c=float(data.get("c", 399.7910)),
         resolution=float(data.get("resolution", 2)),
@@ -92,6 +94,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
         smile_map_folder=str(data.get("smile_map_folder", os.path.join(PROJECT_ROOT, "smile_maps"))),
         rgb_target_wavelengths=tuple(float(v) for v in data.get("rgb_target_wavelengths", [645.0, 555.0, 465.0])),
         profile_timing=bool(data.get("profile_timing", True)),
+        wavelength_range_nm=parse_wavelength_ranges(data.get("wavelength_range_nm")),
     )
 
     for name in ('dark_frame_folder', 'smile_map_folder'):

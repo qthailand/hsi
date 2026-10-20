@@ -60,12 +60,12 @@ def controller():
         def __init__(self):
             self.session=ScanSession();self.reference_preview_ready=None;self.reference_preview_failed=None
     ns={'Controller':Controller}
-    c=ns['Controller']();c.PREVIEW='PREVIEW';c.SCANNING='SCANNING';c.state=c.PREVIEW;c.stage=None
+    c=ns['Controller']();c.PREVIEW='PREVIEW';c.enable_cube_preview=False;c.SCANNING='SCANNING';c.state=c.PREVIEW;c.stage=None
     c.dark_lib=SimpleNamespace(is_collecting=False);
-    c.preview_thread=SimpleNamespace(set_scanning=lambda _:None,set_keep_spectrogram=lambda _:None,set_recording=lambda _:None,take_recorded_frames=lambda *window:[],take_recorded_raw=lambda:[])
+    c.preview_thread=SimpleNamespace(set_scanning=lambda _:None,set_keep_spectrogram=lambda _:None,set_recording=lambda *a, **kw:None,take_recorded_frames=lambda *window, **kw:[],take_recorded_raw=lambda:[],live_recorded_frames=lambda:[])
     c._set_state=lambda state:setattr(c,'state',state)
     c.config=SimpleNamespace(**{k:v for k,v in CONTEXT.items() if k not in ('spatial_height','camera_bin')})
-    c.backend=SimpleNamespace(current_bin=1);c.win=SimpleNamespace(set_status=lambda _:None)
+    c.backend=SimpleNamespace(current_bin=1);c.win=SimpleNamespace(set_status=lambda _:None,start_scan_clock=lambda:None,set_recorded_count=lambda _:None)
     c.ready=[];c.failed=[];c.reference_preview_ready=lambda *args:c.ready.append(args);c.reference_preview_failed=lambda *args:c.failed.append(args)
     return c
 
@@ -79,6 +79,15 @@ def test_preview_busy_and_failure_recovery(monkeypatch):
     c.start_reference_preview(2);c.on_stage_error('open failed')
     assert c.failed==[(2,'open failed')] and c.session.reference_preview_id is None and c.state==c.PREVIEW
 
+def test_start_scan_waits_for_a_bin_change_still_being_applied():
+    # Started now, the worker would apply the bin mid-scan: two frame widths in one cube.
+    c=controller();statuses=[];c.win=SimpleNamespace(set_status=statuses.append)
+    c.preview_thread.bin_pending=True
+    c.start_scan()
+    assert c.state==c.PREVIEW and 'Bin change' in statuses[-1] and 'press Start again' in statuses[-1]
+    with pytest.raises(RuntimeError,match='could not be started'):c.start_reference_preview(5)   # the caller learns at once
+    assert c.session.reference_preview_id is None
+
 def test_preview_finalization_without_cube_and_empty_failure():
     c=controller();c.state=c.SCANNING;c.session.reference_preview_id=7
     c.session.reference_columns=[np.ones((120,3),np.float32)]*4
@@ -90,7 +99,7 @@ def test_preview_finalization_without_cube_and_empty_failure():
 def test_preview_has_one_column_per_recorded_frame():
     c=controller();c.state=c.SCANNING;c.session.reference_preview_id=9;c.current_wavelengths=None
     frames=[np.full((120,10),i,np.uint16) for i in range(6)]
-    c.preview_thread.take_recorded_frames=lambda *window:frames
+    c.preview_thread.take_recorded_frames=lambda *window, **kw:frames
     c.finish_scan();assert c.ready[0][0]==9 and c.ready[0][1].shape==(120,6,3)
 
 def test_overlay_compatibility_and_cached_update():

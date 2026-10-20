@@ -11,11 +11,15 @@ Data conventions:
 
 Threading:
     ``start()`` moves the worker to its own ``QThread``; a ``QTimer`` there
-    calls ``_tick`` at 15 fps.  ``push_frame``, ``push_frames``,
+    calls ``_tick`` at 15 fps.  ``push_frame``, ``push_frames``, ``set_frames``,
     ``set_wavelengths``, ``set_rgb_bands``, ``request_spectrum``, ``reset`` and
     ``set_display_mapper`` may be called from the GUI thread at any time (state
     is guarded by a lock).  Results come back through the signals, which Qt
     delivers to the receiver's thread (queued to the GUI thread for widgets).
+
+    A list given to ``set_frames`` is read in place on every tick while another
+    thread may still append to it (e.g. the scan recorder): ``len`` and slicing
+    of a list are atomic under the GIL, so no copy and no shared lock are needed.
 
 Example:
     >>> import numpy as np
@@ -82,6 +86,7 @@ class CubeRenderWorker(QObject):
         self._raw: np.ndarray | None = None     # (h, capacity, 3) float32
         self._filled = 0
         self._raw_bands: tuple[int, int, int] | None = None
+        self._rendered_from: list | None = None  # the list the cached columns were rendered from
         self._seen_epoch = 0
         self._vmin = 0.0
         self._vmax = 0.0
@@ -141,6 +146,22 @@ class CubeRenderWorker(QObject):
         """
         with self._lock:
             self._frames.extend(frames)
+            self._dirty = True
+
+    def set_frames(self, frames: list):
+        """Render from ``frames`` itself: a list its owner may keep appending to.
+
+        The list is read by reference on every tick (never copied).  Columns already
+        rendered from the previous list are kept for the leading frames both lists
+        share (same objects), so a list cut at the end costs no re-render; otherwise
+        the image is rendered again from frame 0.  Do not ``push_frame(s)`` into a list
+        owned by someone else.  Thread-safe.
+
+        Args:
+            frames: List of 2-D ``(slit, wavelength)`` arrays.
+        """
+        with self._lock:
+            self._frames = frames
             self._dirty = True
 
     def set_wavelengths(self, wl: np.ndarray | None):
@@ -211,6 +232,16 @@ class CubeRenderWorker(QObject):
             # Band change or empty cache => refill from frame 0.
             if bands != self._raw_bands or self._raw is None:
                 self._filled = 0
+            cut = False
+            if frames is not self._rendered_from:
+                # Another list (set_frames): keep the columns of the frames both share.
+                old, shared = self._rendered_from or [], 0
+                limit = min(self._filled, n, len(old))
+                while shared < limit and old[shared] is frames[shared]:
+                    shared += 1
+                cut = shared < self._filled
+                self._filled = shared
+                self._rendered_from = frames
             new_frames = frames[self._filled:n]
 
         if n == 0:
@@ -221,22 +252,26 @@ class CubeRenderWorker(QObject):
 
         # ── RGB composite (incremental: only new frames are copied) ──
         if dirty or new_frames:
-            self._render_rgb(new_frames, n, bands)
+            self._render_rgb(new_frames, n, bands, rescale=cut)
 
         # ── spectrum request ──
         if spec_req is not None:
             self._render_spectrum(frames[:n], spec_req)
 
     def _render_rgb(self, new_frames: list[np.ndarray], n: int,
-                    bands: tuple[int, int, int]):
+                    bands: tuple[int, int, int], rescale: bool = False):
         """Update the cached (H, N, 3) float32 image with new frames and emit.
 
         Already rendered columns are not recomputed unless the band
-        selection changed (refill) or the scan was reset.
+        selection changed (refill) or the scan was reset.  ``rescale``: columns were
+        cut off, so the min/max normalisation is taken again from those left.
         """
         try:
             if not new_frames and self._raw is None:
                 return
+            if rescale and self._filled:
+                kept = self._raw[:, :self._filled]
+                self._vmin, self._vmax = float(kept.min()), float(kept.max())
             if new_frames:
                 sample = new_frames[0]
                 if sample.ndim != 2 or sample.size == 0:
