@@ -365,6 +365,22 @@ class SpectrumSet:
         record.name = name
         return record
 
+    def set_class(self, rid: int, class_name: str) -> SpectrumRecord:
+        """Set a record's ``class_name`` (stripped; the same rules as a name, but classes
+        may be shared by many records).  Once it differs from the name it no longer
+        follows renames; setting it back to the name makes it follow again.
+
+        Returns:
+            SpectrumRecord: The record.
+
+        Raises:
+            KeyError: Unknown ``rid``.
+            TypeError, ValueError: Not a str, empty, or control characters.
+        """
+        record = self._records[rid]
+        record.class_name = _clean_name(class_name)
+        return record
+
     def set_color(self, rid: int, color: str) -> SpectrumRecord:
         """Give one record a new colour (the 'Set colour...' action); no other record changes.
 

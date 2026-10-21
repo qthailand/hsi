@@ -23,6 +23,12 @@ Layout::
 Tree:
     * The check box is the record's ``visible`` flag; the swatch is its colour.
     * F2 or a double click renames in place; ``rename_requested(rid, text)``.
+    * The Class column (double click there, or :meth:`SpectraPanel.edit_class`) sets the record's class;
+      ``class_requested(rid, text)``.  Records with the same class are pooled by the
+      segmentation; 'Segment...' is enabled when >= 2 classes have ready spectra.
+    * A 'Segmentation' root (set with :meth:`SpectraPanel.set_segmentation`) lists the
+      predicted pixels per class and 'unclassified'; its context menu shows / hides the
+      overlay or clears the segmentation.
     * Del deletes the selected records; ``delete_requested(rids)``.
     * Context menu: Rename, Set colour... (``QColorDialog``), Show +-sigma (areas only), Copy
       as text, Delete.
@@ -56,6 +62,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import qtawesome as qta
 from PyQt5.QtCore import QEvent, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import (
@@ -65,16 +72,34 @@ from PyQt5.QtWidgets import (
 )
 
 from modules.cube_viewer.roi_stats import snap_rect
+from modules.ui_kit.theme import ACCENT, ACCENT_DARK, BORDER, CARD, FIELD_HOVER, PLOT_FOREGROUND
 
 __all__ = ("SpectraPanel", "TREE_KEYS", "TOOL_BUTTONS")
 
+#: (tool, name, qtawesome icon, tooltip) of the image tools; the buttons show the icon only.
 TOOL_BUTTONS = (
-    ("point", "Point", "Point: a left click adds the spectrum of that pixel"),
-    ("rect", "Rect", "Rectangle: drag over the image; the mean and std of the pixels whose "
-                     "centre is inside are added (Esc cancels)"),
-    ("lasso", "Lasso", "Lasso: hold the left button and draw around an area; release closes "
-                       "it (Esc cancels)"),
+    ("point", "Point", "mdi6.crosshairs-gps",
+     "Point: a left click adds the spectrum of that pixel"),
+    ("rect", "Rect", "mdi6.vector-square",
+     "Rectangle: drag over the image; the mean and std of the pixels whose "
+     "centre is inside are added (Esc cancels)"),
+    ("lasso", "Lasso", "mdi6.lasso",
+     "Lasso: hold the left button and draw around an area; release closes "
+     "it (Esc cancels)"),
 )
+
+#: Joined (segmented) look of the tool buttons: one strip, outer corners rounded only.
+_TOOL_GROUP_STYLE = f"""
+QPushButton {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 0px;
+    padding: 0px; margin: 0px;
+}}
+QPushButton:hover {{ background: {FIELD_HOVER}; }}
+QPushButton:checked {{ background: {ACCENT_DARK}; border-color: {ACCENT}; }}
+QPushButton[segment="first"] {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+QPushButton[segment="last"] {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px; }}
+QPushButton[segment="middle"], QPushButton[segment="last"] {{ border-left: none; }}
+"""
 
 TREE_KEYS = frozenset({
     Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Space, Qt.Key_Home,
@@ -88,6 +113,10 @@ _PENDING_TEXT = "computing…"
 _FAILED_TEXT = "failed"
 _FAILED_COLOR = QColor("#ef5350")
 _SWATCH_PX = 12
+_SEGMENT_TIP = ("Classify every pixel from the classes of the spectra (needs at least two "
+                "classes with computed spectra; set a row's class in the Class column)")
+_SEG_ROLE = Qt.UserRole + 1          # class index of a Segmentation child (-1: unclassified)
+_STALE_COLOR = QColor("#ffb74d")
 _BIG = 1 << 40           # stands in for an unknown image size when snapping a lasso bbox
 
 
@@ -121,7 +150,7 @@ class _NoEditDelegate(QStyledItemDelegate):
 
 
 class _SpectraTree(QTreeWidget):
-    """The SPECTRA tree (columns Name | N px); see the module docstring.
+    """The SPECTRA tree (columns Name | N px | Class); see the module docstring.
 
     Signals:
         delete_pressed(): Del was pressed (the panel deletes the selection).
@@ -134,12 +163,13 @@ class _SpectraTree(QTreeWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tooltip_provider = None
-        self.setColumnCount(2)
-        self.setHeaderLabels(["Name", "N px"])
+        self.setColumnCount(3)
+        self.setHeaderLabels(["Name", "N px", "Class"])
         header = self.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.setItemDelegateForColumn(1, _NoEditDelegate(self))
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -211,6 +241,12 @@ class SpectraPanel(QWidget):
         delete_requested(list): rids to delete (Del key or the context menu).
         selection_changed(object): the highlighted rid (current selected row) or None.
         export_requested(): the 'Export...' button was clicked.
+        class_requested(int, str): ``(rid, class name)`` typed in the Class column
+            (already stripped and non-empty).
+        segment_requested(): the 'Segment...' button was clicked.
+        segmentation_overlay_requested(bool): Show / Hide overlay from the Segmentation
+            node's context menu.
+        clear_segmentation_requested(): 'Clear segmentation' from that menu.
     """
 
     tool_changed = pyqtSignal(str)
@@ -222,6 +258,11 @@ class SpectraPanel(QWidget):
     delete_requested = pyqtSignal(list)
     selection_changed = pyqtSignal(object)
     export_requested = pyqtSignal()
+    class_requested = pyqtSignal(int, str)
+    segment_requested = pyqtSignal()
+    segmentation_overlay_requested = pyqtSignal(bool)
+    clear_segmentation_requested = pyqtSignal()
+    segment_ready_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -238,24 +279,32 @@ class SpectraPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
-        tool_row = QHBoxLayout()
+        tool_strip = QWidget()
+        tool_strip.setStyleSheet(_TOOL_GROUP_STYLE)
+        tool_row = QHBoxLayout(tool_strip)
         tool_row.setContentsMargins(0, 0, 0, 0)
         tool_row.setSpacing(0)
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
         self._tool_buttons: dict = {}
-        for name, text, tip in TOOL_BUTTONS:
-            button = QPushButton(text)
+        segments = ["first"] + ["middle"] * (len(TOOL_BUTTONS) - 2) + ["last"]
+        for (name, text, icon, tip), segment in zip(TOOL_BUTTONS, segments):
+            button = QPushButton()
+            button.setIcon(qta.icon(icon, color=PLOT_FOREGROUND, color_on="#ffffff"))
+            button.setIconSize(QSize(18, 18))
+            button.setFixedSize(32, 26)
             button.setCheckable(True)
-            button.setToolTip(tip)
-            button.setMinimumWidth(48)      # below the style's 80 px default: fits the sidebar
+            button.setToolTip(f"{text} - {tip}")
+            button.setAccessibleName(text)
+            button.setProperty("segment", segment)
             button.setFocusPolicy(Qt.TabFocus)
             self._tool_group.addButton(button)
             self._tool_buttons[name] = button
             tool_row.addWidget(button)
+        tool_row.addStretch()
         self._tool_buttons["point"].setChecked(True)
         self._tool_group.buttonToggled.connect(self._on_tool_toggled)
-        lay.addLayout(tool_row)
+        lay.addWidget(tool_strip)
 
         self.tree = _SpectraTree()
         self.tree.set_tooltip_provider(self._item_tooltip)
@@ -265,6 +314,11 @@ class SpectraPanel(QWidget):
         font.setBold(True)
         self._root.setFont(0, font)
         self._root.setExpanded(True)
+        self._seg_root = QTreeWidgetItem(self.tree, ["Segmentation", "", ""])
+        self._seg_root.setFlags(Qt.ItemIsEnabled)
+        self._seg_root.setFont(0, font)
+        self._seg_root.setHidden(True)
+        self._seg_summary = None
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
@@ -287,6 +341,13 @@ class SpectraPanel(QWidget):
         button_row.addWidget(self.btn_export)
         button_row.addWidget(self.btn_clear_points)
         lay.addLayout(button_row)
+
+        self.btn_segment = QPushButton("Segment…")
+        self.btn_segment.setMinimumHeight(32)
+        self.btn_segment.setToolTip(_SEGMENT_TIP)
+        self.btn_segment.setEnabled(False)
+        self.btn_segment.clicked.connect(self.segment_requested)
+        lay.addWidget(self.btn_segment)
 
     # ── tools ─────────────────────────────────────────────
 
@@ -365,6 +426,8 @@ class SpectraPanel(QWidget):
             if item.checkState(0) != check:
                 item.setCheckState(0, check)
             item.setIcon(0, self._swatch(record.color))
+            if item.text(2) != record.class_name:
+                item.setText(2, record.class_name)
             item.setText(1, self._count_text(record))
             item.setForeground(1, _FAILED_COLOR if record.state == "failed" else
                                self.tree.palette().text())
@@ -373,6 +436,7 @@ class SpectraPanel(QWidget):
             item.setFont(1, font)
         finally:
             self._updating = False
+        self._update_segment_button()
 
     def remove_record(self, rid: int) -> None:
         """Remove the row of ``rid`` (nothing happens for an unknown rid)."""
@@ -387,6 +451,7 @@ class SpectraPanel(QWidget):
         finally:
             self._updating = False
         self._update_root()
+        self._update_segment_button()
         self._on_selection_changed()
 
     def clear(self) -> None:
@@ -400,6 +465,7 @@ class SpectraPanel(QWidget):
         self._records.clear()
         self._notes.clear()
         self._update_root()
+        self._update_segment_button()
         self._on_selection_changed()
 
     def record_ids(self) -> list:
@@ -447,6 +513,105 @@ class SpectraPanel(QWidget):
         self.tree.setCurrentItem(item, 0)
         self.tree.editItem(item, 0)
         return True
+
+    def edit_class(self, rid: int) -> bool:
+        """Open the in-place Class editor of ``rid``; True if it opened."""
+        item = self._items.get(rid)
+        if item is None:
+            return False
+        self.tree.setCurrentItem(item, 2)
+        self.tree.editItem(item, 2)
+        return True
+
+    def ready_class_names(self) -> list:
+        """Distinct class names of the ready records, in row order."""
+        names: dict = {}
+        for rid in self.record_ids():
+            record = self._records.get(rid)
+            if record is not None and record.is_ready:
+                names.setdefault(record.class_name, None)
+        return list(names)
+
+    def _update_segment_button(self) -> None:
+        """Enable 'Segment...' when >= 2 classes have ready spectra."""
+        ready = len(self.ready_class_names()) >= 2
+        self.btn_segment.setEnabled(ready)
+        if ready != getattr(self, "_segment_ready", None):
+            self._segment_ready = ready
+            self.segment_ready_changed.emit(ready)
+
+    # ── segmentation node ─────────────────────────────────
+
+    def set_segmentation(self, summary) -> None:
+        """Show (or with None remove) the 'Segmentation' node.
+
+        Args:
+            summary: ``SegmentSession.summary()`` dict (``label``, ``names``, ``colors``,
+                ``counts``, ``n_unclassified``, ``total``, ``stale``, ``overlay_visible``)
+                or None.  One child per class (swatch, predicted px, %) plus
+                'unclassified'; a stale result gets a '(stale)' badge.
+        """
+        self._seg_summary = summary
+        root = self._seg_root
+        self._updating = True
+        try:
+            root.takeChildren()
+            if summary is None:
+                root.setText(0, "Segmentation")
+                root.setHidden(True)
+                return
+            total = max(int(summary["total"]), 1)
+            badge = "  (stale)" if summary.get("stale") else ""
+            hidden = "" if summary.get("overlay_visible", True) else "  [hidden]"
+            root.setText(0, f"Segmentation – {summary['label']}{badge}{hidden}")
+            root.setForeground(0, _STALE_COLOR if summary.get("stale") else
+                               self.tree.palette().text())
+            rows = list(zip(summary["names"], summary["colors"], summary["counts"]))
+            for k, (name, color, count) in enumerate(rows):
+                child = QTreeWidgetItem([str(name), f"{int(count):,}",
+                                         f"{100.0 * int(count) / total:.1f} %"])
+                child.setIcon(0, self._swatch(color))
+                child.setData(0, _SEG_ROLE, k)
+                child.setFlags(Qt.ItemIsEnabled | Qt.ItemNeverHasChildren)
+                child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                root.addChild(child)
+            n_unc = int(summary["n_unclassified"])
+            child = QTreeWidgetItem(["unclassified", f"{n_unc:,}", f"{100.0 * n_unc / total:.1f} %"])
+            child.setData(0, _SEG_ROLE, -1)
+            child.setFlags(Qt.ItemIsEnabled | Qt.ItemNeverHasChildren)
+            child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            root.addChild(child)
+            root.setHidden(False)
+            root.setExpanded(True)
+        finally:
+            self._updating = False
+
+    def segmentation_item(self):
+        """The 'Segmentation' root item (hidden when there is no result)."""
+        return self._seg_root
+
+    def segmentation_rows(self) -> list:
+        """``[(name, predicted px, percent text)]`` of the Segmentation node's children."""
+        root = self._seg_root
+        return [(root.child(i).text(0), int(root.child(i).text(1).replace(",", "")),
+                 root.child(i).text(2)) for i in range(root.childCount())]
+
+    def segmentation_menu(self):
+        """Build (not show) the Segmentation node's menu, or None without a result.
+
+        Actions: Show overlay (checkable), Clear segmentation.
+        """
+        summary = self._seg_summary
+        if summary is None:
+            return None
+        menu = QMenu(self)
+        show = menu.addAction("Show overlay")
+        show.setCheckable(True)
+        show.setChecked(bool(summary.get("overlay_visible", True)))
+        show.toggled.connect(lambda checked: self.segmentation_overlay_requested.emit(bool(checked)))
+        menu.addSeparator()
+        menu.addAction("Clear segmentation", self.clear_segmentation_requested.emit)
+        return menu
 
     # ── band / tooltip ────────────────────────────────────
 
@@ -528,6 +693,11 @@ class SpectraPanel(QWidget):
         if item is self._root:
             return "Check = shown and exported.  F2 / double click: rename.  Del: delete.  " \
                    "Right click: colour, ±σ, copy."
+        if item is self._seg_root:
+            return ("Right click: show / hide the overlay or clear the segmentation.  "
+                    "'(stale)': spectra or classes changed after the run.")
+        if item.parent() is self._seg_root:
+            return f"{item.text(0)}: {item.text(1)} px ({item.text(2)})"
         rid = item.data(0, _RID_ROLE)
         return self.tooltip_text(rid) if rid is not None else ""
 
@@ -565,8 +735,11 @@ class SpectraPanel(QWidget):
     def _on_context_menu(self, pos) -> None:
         """Show the context menu of the row under ``pos``."""
         item = self.tree.itemAt(pos)
-        rid = item.data(0, _RID_ROLE) if item is not None else None
-        menu = self.context_menu(rid) if rid is not None else None
+        if item is not None and (item is self._seg_root or item.parent() is self._seg_root):
+            menu = self.segmentation_menu()
+        else:
+            rid = item.data(0, _RID_ROLE) if item is not None else None
+            menu = self.context_menu(rid) if rid is not None else None
         if menu is not None:
             menu.exec_(self.tree.viewport().mapToGlobal(pos))
             menu.deleteLater()
@@ -590,11 +763,17 @@ class SpectraPanel(QWidget):
 
     def _on_item_changed(self, item, column: int) -> None:
         """Turn a check-box toggle or an edited name into a request, then redraw the row."""
-        if self._updating or column != 0:
+        if self._updating or column not in (0, 2):
             return
         rid = item.data(0, _RID_ROLE)
         record = self._records.get(rid)
         if record is None:
+            return
+        if column == 2:
+            text = item.text(2).strip()
+            if text and text != record.class_name:
+                self.class_requested.emit(int(rid), text)
+            self._refresh(rid)
             return
         visible = item.checkState(0) == Qt.Checked
         if visible != bool(record.visible):
@@ -605,7 +784,7 @@ class SpectraPanel(QWidget):
 
     def _on_item_double_clicked(self, item, column: int) -> None:
         """A double click on the count column edits the name too."""
-        if column != 0 and item.data(0, _RID_ROLE) in self._items:
+        if column == 1 and item.data(0, _RID_ROLE) in self._items:
             self.tree.editItem(item, 0)
 
     def _on_selection_changed(self) -> None:

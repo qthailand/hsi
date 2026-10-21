@@ -1,4 +1,4 @@
-"""Interactive hyperspectral cube viewer: band browser, RGB composite, point / rectangle / lasso spectra with CSV / XLSX export.
+"""Interactive hyperspectral cube viewer: band browser, RGB composite, point / rectangle / lasso spectra with CSV / XLSX export, whole-cube segmentation (SAM ... SVM) with separability and method comparison.
 
 Public API:
 
@@ -11,6 +11,9 @@ Spectra (submodules, imported directly): ``roi_stats`` (exact ROI statistics, nu
 only), ``spectra`` (``SpectrumSet`` / ``SpectrumRecord``), ``spectra_export`` (plain CSV,
 XLSX, clipboard TSV), ``roi_draw`` (rectangle / lasso tools and overlays), ``jobs``
 (background ``JobRunner``) and ``spectra_panel`` (the sidebar SPECTRA panel).
+Segmentation (Phase 2): ``segment`` (numpy classifiers, thresholds, separability),
+``ml`` (Random Forest / SVM, optional scikit-learn), ``compare`` (method comparison),
+``segment_session`` (state, overlay, worker) and ``segment_dialog`` (the Segment dialog).
 
 Data conventions:
     * Cube: 3-D array ``(slit, scan, wavelength)`` = ``(H, W, bands)``, any numeric

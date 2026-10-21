@@ -5,12 +5,13 @@
 Interactive viewer for a hyperspectral cube `(slit, scan, wavelength)`:
 
 * `CubeViewerWindow` - the full viewer: band slider / play-pause sweep, single-band and RGB-composite display, zoom and pan, a SPECTRA panel with point / rectangle / lasso tools (a left click adds a pixel spectrum as before; a rectangle or lasso adds the mean of the area with a shaded +-std band), a spectra tree (show / hide, rename, colour, delete, copy), spectra export to plain CSV or XLSX, cube info and an "Export Datacube" dialog (ENVI BIP, GeoTIFF, raw binary).
+* Segment dialog (`segment_dialog.py`, 'Segment...' in the SPECTRA group) - classifies the whole cube from the spectra grouped by the tree's Class column with SAM, SCM, Euclidean, SID, Mahalanobis / LDA, Gaussian ML, Random Forest or SVM, shows the result as a class overlay with a reject threshold, and offers a separability analysis (spectral angle, JM distance, per-band F, ROI-consistency confusion) and a 'Compare methods' table (leave-one-ROI-out accuracy, macro-F1, timings).
 * `CubeImageCanvas` - single-band image canvas with zoom/pan, `pixel_clicked(ix, iy)`, dot overlay and the rectangle / lasso tools of `roi_draw.py`.
 * `RGBCompositeControls` - single-band / RGB toggle, R/G/B band spin boxes (default 645/555/465 nm) and stretch slider.
 
 ## Requirements
 
-* PyQt5, NumPy, `pyqtgraph` (spectrum plot); `matplotlib` only indirectly (cube_preview builds the shared tab20 palette with it); `openpyxl` optionally, for the XLSX spectra export (without it only CSV is offered).
+* PyQt5, NumPy, `pyqtgraph` (spectrum plot); `matplotlib` only indirectly (cube_preview builds the shared tab20 palette with it); `openpyxl` optionally, for the XLSX spectra export (without it only CSV is offered). scikit-learn optionally (Random Forest / SVM segmentation; without it they are listed but disabled).
 * Other modules: `cube_io` (export workers, ENVI loading), `cube_preview`, `live_view` (spectrum plot, display controls), `ui_kit` (zoom/pan, range slider) - see `__requires__`.
 * `import modules.cube_viewer` does not import PyQt5; classes load on first attribute access.
 
@@ -172,6 +173,36 @@ Measured paint cost (offscreen, i9-12900K, 1000 x 640 view of a 1762 x 1024 imag
 * A 5000-vertex lasso being drawn: 3-5 ms per paint, 5-11 us per mouse move. Outlines are 1 px lines because Qt draws those on a fast path: the self-overlapping 5000-vertex lasso takes 0.4 ms as a 1 px line and 60 ms as a 3.5 px halo plus 1.5 px line.
 * The base image itself still costs 45-50 ms per paint at 1000 % zoom (existing per-paint `pixmap.scaled`, unchanged).
 
+## Segmentation (Phase 2: `segment.py`, `ml.py`, `compare.py`, `segment_session.py`, `segment_dialog.py`)
+
+Give records a class in the tree's **Class** column (default = the record name; records with the same class are pooled: the class pixels are the union of their ROI pixels, and pixels claimed by two classes are left out of both and reported). **Segment…** in the SPECTRA group (enabled with >= 2 classes that have ready spectra) opens one non-modal Segment dialog owned by the viewer; the viewer closes it in `closeEvent`.
+
+Methods (dropdown; each shows only its own parameters and an estimated fit + full-image time from `compare.estimate_seconds`):
+
+| Method | Score | Parameters | Full 1024x1762x185 image (measured) |
+|---|---|---|---|
+| SAM (default) | angle (deg) | - | about 0.2 s |
+| SCM (spectral correlation) | angle (deg) | - | about 0.28 s |
+| Euclidean (raw DN) | distance | - | about 0.2 s |
+| Euclidean (brightness-normalised) | distance | - | about 0.24 s |
+| SID | divergence | - | about 0.83 s |
+| Mahalanobis / LDA (PCA + Ledoit-Wolf) | distance | `pca_dims` (20) | 0.25-0.27 s |
+| Gaussian ML / QDA (PCA + Ledoit-Wolf) | distance | `pca_dims` (10) | 0.28-0.37 s |
+| Random Forest (scikit-learn) | probability | trees, depth, leaf, PCA, normalise, threads, seed | fit 0.4-1.6 s + 1.4-2.1 s |
+| SVM (scikit-learn, RBF / linear, Platt) | probability | kernel, C, gamma, PCA, px per class, normalise, threads, seed | fit 0.1-0.5 s + 3.6-6.3 s (RBF), 1-1.5 s (linear) |
+
+Random Forest and SVM are listed but disabled (with a tooltip) when scikit-learn is missing.
+
+Thresholds: one reject slider. For angle / distance / divergence scores it is a global multiplier (0.5-3x) of each class's default threshold, 1.5 x P99 of the class's own training-pixel scores; for probabilities it is a minimum confidence (0-1). Moving it re-thresholds the stored best-label and score maps (`segment.apply_thresholds`, about 20 ms on the full image, debounced 60 ms), never a recompute. Unclassified pixels are transparent.
+
+Overlay and clearing: an Indexed8 image (index 0 transparent) painted over the base image and under the ROI outlines, so Point / Rect / Lasso stay usable. 'Show overlay' hides it but keeps the result (re-showing is instant); the opacity slider re-pushes the same pixmap. 'Clear segmentation' (dialog button, or the tree's Segmentation node menu) removes the overlay, the node and the result and leaves every ROI and spectrum; 'Clear All Points' also clears it. Any ROI / class / colour change after a run marks the result **stale** (orange badge in the tree and the dialog); it stays until you re-run or clear. The tree's Segmentation root has one row per class (swatch, px, %) plus 'unclassified'.
+
+Separability tab ("how different are the legends"): mean-to-mean spectral angles, Jeffries-Matusita distance (0-2, after PCA-10 with Ledoit-Wolf), the per-band ANOVA F curve against wavelength, and an ROI-consistency confusion matrix (leave-one-ROI-out when a class has >= 2 ROIs, else split-half; optimistic, since it is the same image), plus warnings (pairs closer than a class threshold, classes made only of points, fewer than 185 px, possible dark offset). 21-47 ms for 2-8 classes of 400 px.
+
+Compare tab: for the checked methods, leave-one-ROI-out (else split-half) accuracy and macro-F1 on the ROI pixels, fit time and estimated full-image time; the best row (macro-F1, then accuracy) is highlighted and 'Use this method' selects it in the Classify tab. 2.4 s on a real 3-class scene, 8 s for 8 classes and all 9 methods.
+
+All runs (classify, separability, compare) happen on the session's own `JobRunner` ('cube-viewer-segment'), separate from the ROI-statistics one, with progress and per-chunk cancel; ROI drawing stays responsive. Closing the viewer cancels them.
+
 ## Threading
 
 All widgets live in the GUI thread. The export dialog moves a `cube_io` export worker to its own `QThread`; closing the dialog or the viewer joins that thread (blocks until a running export ends).
@@ -191,6 +222,7 @@ Contract checks in `tests/test_module_contract.py`; export adapters are exercise
 * `tests/test_cube_viewer_phase0.py`: the splitter, band marker, R key and import rule.
 * `tests/test_cube_viewer_roi_stats.py`: ROI statistics.
 * `tests/test_cube_viewer_spectra_export.py`: records and the CSV / XLSX / TSV export.
+* `tests/test_cube_viewer_segment.py`, `tests/test_cube_viewer_ml_compare.py`, `tests/test_cube_viewer_segment_ui.py`, `tests/test_cube_viewer_segment_dialog.py`: segmentation core, RF / SVM and compare, the session / tree / overlay, and the Segment dialog.
 * `tests/test_cube_viewer_window.py`: the window with the SPECTRA panel. It covers point mode (unchanged), rect / lasso through the widgets, pending -> ready in the worker, memory maps, rename, delete / hide, the band marker (also during the sweep), tree focus keys, close during a job (also during a worker-side lasso mask), failed areas, the legend samples, names shown as text and never as markup, the stand-alone launcher's `source_path`, the context menu and the export dialog.
 
 Run `python -m pytest -q tests`.

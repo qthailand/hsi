@@ -32,6 +32,7 @@ Example:
 from __future__ import annotations
 
 import html
+import importlib
 import math
 import mmap
 import os
@@ -55,6 +56,14 @@ from modules.cube_viewer.canvas import CubeImageCanvas
 from modules.cube_viewer.jobs import JobRunner
 from modules.cube_viewer.roi_draw import TOOLS, _RoiPixmapLabel, roi_selection
 from modules.cube_viewer.roi_stats import point_stats, polygon_mask, roi_stats, snap_rect
+from modules.cube_viewer.segment_session import SegmentSession
+
+try:  # the Segment dialog (UI part 2); optional so the viewer works without it
+    _segment_dialog = importlib.import_module("modules.cube_viewer.segment_dialog")
+except ModuleNotFoundError as _exc:  # pragma: no cover - depends on the build state
+    if _exc.name != "modules.cube_viewer.segment_dialog":
+        raise
+    _segment_dialog = None
 from modules.cube_viewer.spectra import SpectrumSet
 from modules.cube_viewer.spectra_export import (
     HAVE_OPENPYXL, export_csv, export_xlsx, exportable, spectra_text,
@@ -93,6 +102,15 @@ _TOOL_HINTS = {
     "rect": "Rect tool: drag over the image (Esc cancels)",
     "lasso": "Lasso tool: hold the left button and draw around an area; release closes it",
 }
+
+
+def _segment_dialog_factory():
+    """``SegmentDialog`` class (``factory(viewer)``) when ``segment_dialog`` exists, else None.
+
+    The dialog module is optional while it is being built; a missing module disables the
+    'Segment...' button's dialog with a status message instead of failing.
+    """
+    return getattr(_segment_dialog, "SegmentDialog", None) if _segment_dialog is not None else None
 
 
 def _cube_in_ram(cube) -> bool:
@@ -516,6 +534,17 @@ class CubeViewerWindow(QWidget):
         self.spectra_panel.delete_requested.connect(self.delete_spectra)
         self.spectra_panel.selection_changed.connect(self._on_spectrum_selected)
         self.spectra_panel.export_requested.connect(self._export_spectra_dialog)
+        self.spectra_panel.class_requested.connect(self.set_spectrum_class)
+
+        # ── segmentation (Phase 2): own worker thread, overlay on both views ──
+        self.segment_session = SegmentSession(
+            cube, self.spectrum_set.records, views=(self.canvas, self._rgb_image), parent=self)
+        self.segment_session.state_changed.connect(self._on_segmentation_changed)
+        self.spectra_panel.segment_requested.connect(self._open_segment_dialog)
+        self.spectra_panel.segmentation_overlay_requested.connect(
+            self.segment_session.set_overlay_visible)
+        self.spectra_panel.clear_segmentation_requested.connect(self.clear_segmentation)
+        self._segment_dlg = None
         if not HAVE_OPENPYXL:
             self.spectra_panel.btn_export.setToolTip(
                 "Save the checked spectra as CSV.  Excel (XLSX) export needs openpyxl: "
@@ -931,6 +960,7 @@ class CubeViewerWindow(QWidget):
             self._discard_record(rid)
             return
         self.spectrum_set.set_stats(rid, stats)
+        self.segment_session.mark_stale()
         n = len(self.spectrum_set)
         if record.is_ready:
             self.spectra_panel.update_record(record)
@@ -961,6 +991,7 @@ class CubeViewerWindow(QWidget):
         self._remove_plot_items(rid)
         self.spectra_panel.remove_record(rid)
         self.spectrum_set.discard(rid)
+        self.segment_session.mark_stale()
         if self._selected_rid not in self.spectrum_set:
             self._selected_rid = None
         self._sync_overlays()
@@ -971,6 +1002,7 @@ class CubeViewerWindow(QWidget):
 
     def _record_added(self, record):
         """Show a new record in the panel, the views and (when ready) the plot."""
+        self.segment_session.mark_stale()
         self.spectra_panel.add_record(record)
         if record.is_ready:
             self._add_plot_items(record)
@@ -993,12 +1025,15 @@ class CubeViewerWindow(QWidget):
         record = self.spectrum_set.get(rid)
         if record is None:
             return False
+        old_class = record.class_name
         try:
             self.spectrum_set.rename(rid, name)
         except (TypeError, ValueError) as exc:
             self.spectra_panel.update_record(record)
             self._show_message(f"Name not changed: {exc}")
             return False
+        if record.class_name != old_class:
+            self.segment_session.mark_stale()
         entry = self._plot_entries.get(rid)
         if entry is not None:
             entry.curve.opts["name"] = record.name
@@ -1016,6 +1051,8 @@ class CubeViewerWindow(QWidget):
         record = self.spectrum_set.get(rid)
         if record is None:
             return
+        if bool(record.visible) != bool(visible):
+            self.segment_session.mark_stale()
         record.visible = bool(visible)
         self._apply_visibility(record)
         self.spectra_panel.update_record(record)
@@ -1049,6 +1086,30 @@ class CubeViewerWindow(QWidget):
             self._update_legend_sample(entry.curve)
         self.spectra_panel.update_record(record)
         self._repaint_overlays()
+        self.segment_session.mark_stale()
+        self.segment_session.refresh_colors()
+
+    def set_spectrum_class(self, rid: int, class_name: str) -> bool:
+        """Set the class of a spectrum (records with the same class are pooled by the
+        segmentation).  A refused name (empty, control characters) leaves the old class.
+
+        Returns:
+            bool: True when the class was accepted.
+        """
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return False
+        old = record.class_name
+        try:
+            self.spectrum_set.set_class(rid, class_name)
+        except (TypeError, ValueError) as exc:
+            self.spectra_panel.update_record(record)
+            self._show_message(f"Class not changed: {exc}")
+            return False
+        self.spectra_panel.update_record(record)
+        if record.class_name != old:
+            self.segment_session.mark_stale()
+        return True
 
     def delete_spectra(self, rids) -> int:
         """Delete spectra by rid; their pending jobs are cancelled.  Other colours stay.
@@ -1063,6 +1124,8 @@ class CubeViewerWindow(QWidget):
             self.spectra_panel.remove_record(rid)
             if self.spectrum_set.remove(rid) is not None:
                 removed += 1
+        if removed:
+            self.segment_session.mark_stale()
         if self._selected_rid not in self.spectrum_set:
             self._selected_rid = None
         self._sync_overlays()
@@ -1216,8 +1279,11 @@ class CubeViewerWindow(QWidget):
     # ──────────────────────────────────────────────────────
 
     def _clear_all_points(self):
-        """Clear all spectra (points and areas): records, jobs, overlays and plot."""
+        """Clear all spectra (points and areas): records, jobs, overlays, plot and the
+        segmentation."""
         self._jobs.cancel_all()
+        self.segment_session.cancel()
+        self.segment_session.clear()
         for rid in list(self._plot_entries):
             self._remove_plot_items(rid)
         self.spectrum_set.clear()
@@ -1227,6 +1293,34 @@ class CubeViewerWindow(QWidget):
         self.spectra_panel.btn_export.setEnabled(False)
         self.roi_label.setText("")
         self._refresh_status()
+
+    # ──────────────────────────────────────────────────────
+    #  SEGMENTATION
+    # ──────────────────────────────────────────────────────
+
+    def clear_segmentation(self):
+        """Remove the class overlay, the Segmentation node and the stored result
+        (ROIs and spectra stay)."""
+        self.segment_session.clear()
+
+    def _on_segmentation_changed(self):
+        """Session state changed: redraw the Segmentation node of the tree."""
+        if not self._closed:
+            self.spectra_panel.set_segmentation(self.segment_session.summary())
+
+    def _open_segment_dialog(self):
+        """'Segment...': show the non-modal Segment dialog (built by ``segment_dialog``)."""
+        if self._closed:
+            return
+        if self._segment_dlg is None:
+            factory = _segment_dialog_factory()
+            if factory is None:
+                self._show_message("The Segment dialog is not available")
+                return
+            self._segment_dlg = factory(self)
+        self._segment_dlg.show()
+        self._segment_dlg.raise_()
+        self._segment_dlg.activateWindow()
 
     # ──────────────────────────────────────────────────────
     #  SPECTRA — export
@@ -1542,6 +1636,10 @@ class CubeViewerWindow(QWidget):
             self._message_timer.stop()
             self._marker_timer.stop()
             self._jobs.shutdown()
+            if self._segment_dlg is not None:
+                self._segment_dlg.close()
+                self._segment_dlg = None
+            self.segment_session.shutdown()
             self.spectrum_set.clear()
             self._plot_entries.clear()
             self.spectra_panel.clear()

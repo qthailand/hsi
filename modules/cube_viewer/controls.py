@@ -24,14 +24,29 @@ Example:
 from __future__ import annotations
 
 import numpy as np
-from PyQt5.QtCore import Qt, pyqtSignal
+import qtawesome as qta
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QSpinBox, QPushButton,
+    QSpinBox, QPushButton, QButtonGroup,
 )
 
 from modules.ui_kit.range_slider import RangeSlider
+from modules.ui_kit.theme import ACCENT, ACCENT_DARK, BORDER, CARD, FIELD_HOVER, PLOT_FOREGROUND
+
+#: Joined (segmented) look of the Band / RGB toggle: one strip, outer corners rounded only.
+_MODE_TOGGLE_STYLE = f"""
+QPushButton {{
+    background: {CARD}; border: 1px solid {BORDER}; border-radius: 0px;
+    padding: 2px 10px; margin: 0px;
+}}
+QPushButton:hover {{ background: {FIELD_HOVER}; }}
+QPushButton:checked {{ background: {ACCENT_DARK}; border-color: {ACCENT}; color: #ffffff; }}
+QPushButton[segment="first"] {{ border-top-left-radius: 4px; border-bottom-left-radius: 4px; }}
+QPushButton[segment="last"] {{ border-top-right-radius: 4px; border-bottom-right-radius: 4px;
+                                border-left: none; }}
+"""
 
 
 def _auto_rgb_bands(
@@ -93,22 +108,32 @@ class RGBCompositeControls(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
-        # mode toggle
-        self._btn_single = QPushButton("Single Band")
-        self._btn_single.setCheckable(True)
+        # mode toggle: one segmented Band | RGB strip (exclusive button group)
+        mode_strip = QWidget()
+        mode_strip.setStyleSheet(_MODE_TOGGLE_STYLE)
+        mode_row = QHBoxLayout(mode_strip)
+        mode_row.setSpacing(0)
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._btn_single = QPushButton("Band")
+        self._btn_rgb = QPushButton("RGB")
+        for button, icon, tip, segment in (
+                (self._btn_single, "mdi6.image-filter-black-white", "Single Band: one wavelength band", "first"),
+                (self._btn_rgb, "mdi6.palette", "RGB Composite: three bands as red, green and blue", "last")):
+            button.setIcon(qta.icon(icon, color=PLOT_FOREGROUND, color_on="#ffffff"))
+            button.setIconSize(QSize(16, 16))
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            button.setProperty("segment", segment)
+            self._mode_group.addButton(button)
+            mode_row.addWidget(button)
+        mode_row.addStretch()
         self._btn_single.setChecked(True)
-        self._btn_rgb = QPushButton("RGB Composite")
-        self._btn_rgb.setCheckable(True)
 
         self._btn_single.clicked.connect(lambda: self._set_mode("single"))
         self._btn_rgb.clicked.connect(lambda: self._set_mode("rgb"))
-
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(0)
-        mode_row.setContentsMargins(0, 0, 0, 0)
-        mode_row.addWidget(self._btn_single)
-        mode_row.addWidget(self._btn_rgb)
-        lay.addLayout(mode_row)
+        lay.addWidget(mode_strip)
 
         # RGB band selectors
         self._spin_r = QSpinBox()
