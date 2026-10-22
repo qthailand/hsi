@@ -41,8 +41,9 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QThread, QTimer
-from PyQt5.QtGui import QColor, QKeySequence, QImage, QPixmap
+import qtawesome as qta
+from PyQt5.QtCore import QSize, Qt, QThread, QTimer
+from PyQt5.QtGui import QColor, QIcon, QKeySequence, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QSlider, QGroupBox, QComboBox, QPushButton,
@@ -52,10 +53,11 @@ from PyQt5.QtWidgets import (
 )
 
 from modules.live_view.mapping import DisplayMapper
-from modules.cube_viewer.canvas import CubeImageCanvas
+from modules.ui_kit.theme import PLOT_FOREGROUND
+from modules.cube_viewer.canvas import COLORMAP_GROUPS, CubeImageCanvas, colormap_lut
 from modules.cube_viewer.jobs import JobRunner
 from modules.cube_viewer.roi_draw import TOOLS, _RoiPixmapLabel, roi_selection
-from modules.cube_viewer.roi_stats import point_stats, polygon_mask, roi_stats, snap_rect
+from modules.cube_viewer.roi_stats import point_stats, polygon_mask, roi_median, roi_stats, snap_rect
 from modules.cube_viewer.segment_session import SegmentSession
 
 try:  # the Segment dialog (UI part 2); optional so the viewer works without it
@@ -64,7 +66,7 @@ except ModuleNotFoundError as _exc:  # pragma: no cover - depends on the build s
     if _exc.name != "modules.cube_viewer.segment_dialog":
         raise
     _segment_dialog = None
-from modules.cube_viewer.spectra import SpectrumSet
+from modules.cube_viewer.spectra import POLYGON_KINDS, SpectrumSet
 from modules.cube_viewer.spectra_export import (
     HAVE_OPENPYXL, export_csv, export_xlsx, exportable, spectra_text,
 )
@@ -87,6 +89,8 @@ INLINE_BYTES = 8 << 20
 # rows in total (polygon_mask costs ~0.15 us per edge-row crossing: ~10 ms at the limit; a
 # 300-vertex freehand lasso has a few thousand).  Larger ones are rasterised in the worker.
 INLINE_MASK_CROSSINGS = 1 << 16
+#: Starting sidebar width (px): the Band row (Display + Colormap) and tree columns fit.
+SIDEBAR_WIDTH = 340
 _CURVE_WIDTH = 1.5
 _FILL_ALPHA = 50
 _MESSAGE_MS = 6000
@@ -101,7 +105,16 @@ _TOOL_HINTS = {
     "point": "Point tool: click a pixel to add its spectrum",
     "rect": "Rect tool: drag over the image (Esc cancels)",
     "lasso": "Lasso tool: hold the left button and draw around an area; release closes it",
+    "polygon": "Polygon tool: click the corners; Enter / right-click / double-click closes, "
+               "Backspace removes the last corner",
 }
+
+
+def _colormap_icon(name: str) -> QIcon:
+    """A 48 x 10 gradient swatch of a matplotlib colormap, for the colormap combo."""
+    strip = np.ascontiguousarray(np.repeat(colormap_lut(name)[None, ::4], 10, axis=0)[:, :48])
+    image = QImage(strip.data, strip.shape[1], 10, 3 * strip.shape[1], QImage.Format_RGB888).copy()
+    return QIcon(QPixmap.fromImage(image))
 
 
 def _segment_dialog_factory():
@@ -152,7 +165,7 @@ def _fill_brush(color: str):
 class _PlotEntry:
     """The plot items of one record: its curve and, for areas, the +-std fill."""
 
-    __slots__ = ("curve", "fill", "lo", "hi", "y_mean", "y_std")
+    __slots__ = ("curve", "fill", "lo", "hi", "y_mean", "y_std", "median")
 
     def __init__(self, curve, fill=None, lo=None, hi=None, y_mean=(math.inf, -math.inf),
                  y_std=(math.inf, -math.inf)):
@@ -162,6 +175,7 @@ class _PlotEntry:
         self.hi = hi
         self.y_mean = y_mean        # finite (min, max) of the mean
         self.y_std = y_std          # finite (min, max) of mean -+ std
+        self.median = None          # dashed median curve (areas, on request)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -283,7 +297,10 @@ class ExportDialog(QDialog):
             QMessageBox.warning(self, "Error", "Select an output path first.")
             return
 
-        cube_t = np.transpose(self.cube, (2, 0, 1)).copy()
+        # A band-first view, not a copy: the writers go slice by slice (copying each line,
+        # band or frame as they write), so the files are byte-identical without the
+        # 2.75 s / +668 MB transpose copy that used to block the GUI thread.
+        cube_t = np.transpose(self.cube, (2, 0, 1))
         wl = (
             self.wavelengths
             if self.wavelengths is not None
@@ -458,6 +475,8 @@ class CubeViewerWindow(QWidget):
         self._plot_entries: dict[int, _PlotEntry] = {}
         self._selected_rid = None
         self._saturation = self._config_number("full_scale")
+        # ENVI 'data ignore value' (config key data_ignore_value): no-data in every statistic
+        self._ignore_value = self._config_number("data_ignore_value")
         self._in_ram = _cube_in_ram(cube)
         self._x = (np.asarray(wavelengths, dtype=np.float64) if self._has_wavelengths()
                    else np.arange(self.bands, dtype=np.float64))
@@ -489,8 +508,10 @@ class CubeViewerWindow(QWidget):
         if display_mapper is not None:
             bd = display_mapper.bit_depth
         self.display_controls = DisplayControls(bit_depth=bd)
-        if display_mapper is not None:
-            self.canvas.set_display_mapper(display_mapper)
+        # RAW (true brightness) by default; the Display box switches RAW / Enhance.
+        self.canvas.set_display_mapper(display_mapper if display_mapper is not None
+                                       else self.display_controls.current_mapper())
+        self.display_controls.mapper_changed.connect(self._on_display_mapper_changed)
 
         # ── spectrum plot ──
         self.spectrum = SpectrumPlot()
@@ -502,6 +523,26 @@ class CubeViewerWindow(QWidget):
         # must not pull the auto range of an empty plot towards its wavelength.
         pw.removeItem(self.spectrum.band_line)
         pw.addItem(self.spectrum.band_line, ignoreBounds=True)
+        # R / G / B composite bands, shown in the RGB view instead of the band marker
+        self._rgb_lines = []
+        for colour in ("#ff5252", "#69f0ae", "#448aff"):
+            line = pg.InfiniteLine(angle=90, movable=False,
+                                   pen=pg.mkPen(colour, width=1.5, style=Qt.DashLine))
+            line.setVisible(False)
+            pw.addItem(line, ignoreBounds=True)
+            self._rgb_lines.append(line)
+        # hover read-out: a crosshair and the visible spectra's values at the nearest band
+        self._hover_line = pg.InfiniteLine(angle=90, movable=False,
+                                           pen=pg.mkPen("#9e9e9e", width=1, style=Qt.DotLine))
+        self._hover_line.setVisible(False)
+        pw.addItem(self._hover_line, ignoreBounds=True)
+        self._hover_text = pg.TextItem(anchor=(1, 0), fill=pg.mkBrush(30, 32, 36, 220))   # top right: the legend is top left
+        self._hover_text.setZValue(100)
+        self._hover_text.setVisible(False)
+        pw.addItem(self._hover_text, ignoreBounds=True)
+        self._hover_proxy = pg.SignalProxy(pw.scene().sigMouseMoved, rateLimit=30,
+                                           slot=self._on_plot_hover)
+        self._medians: dict = {}            # rid -> (B,) float64 median, computed on request
         if not self._has_wavelengths():
             pw.getAxis("bottom").setLabel("Band")
 
@@ -523,6 +564,10 @@ class CubeViewerWindow(QWidget):
         # ── SPECTRA panel (sidebar) ──
         self.spectra_panel = SpectraPanel()
         self.spectra_panel.set_image_size(self.h, self.w)
+        self.spectra_panel.set_cube_name(self.spectrum_set.source_name)
+        self.spectra_panel.view_mode_requested.connect(self._rgb_controls.set_mode)
+        self._rgb_controls.bands_changed.connect(lambda *_: self._update_rgb_markers())
+        self._rgb_controls.mode_changed.connect(self.spectra_panel.set_view_mode)
         self.btn_clear_points = self.spectra_panel.btn_clear_points
         self.btn_clear_points.clicked.connect(self._clear_all_points)
         self.spectra_panel.tool_changed.connect(self.set_tool)
@@ -530,6 +575,7 @@ class CubeViewerWindow(QWidget):
         self.spectra_panel.rename_requested.connect(self.rename_spectrum)
         self.spectra_panel.color_requested.connect(self.set_spectrum_color)
         self.spectra_panel.show_std_changed.connect(self.set_spectrum_show_std)
+        self.spectra_panel.show_median_changed.connect(self.set_spectrum_show_median)
         self.spectra_panel.copy_requested.connect(self.copy_spectra)
         self.spectra_panel.delete_requested.connect(self.delete_spectra)
         self.spectra_panel.selection_changed.connect(self._on_spectrum_selected)
@@ -598,7 +644,7 @@ class CubeViewerWindow(QWidget):
         self._hsplit.addWidget(right)
         self._hsplit.setStretchFactor(0, 0)
         self._hsplit.setStretchFactor(1, 1)
-        self._hsplit.setSizes([240, 800])
+        self._hsplit.setSizes([SIDEBAR_WIDTH, 800])
 
         root.addWidget(self._hsplit)
 
@@ -617,15 +663,17 @@ class CubeViewerWindow(QWidget):
         g_mode = QGroupBox("DISPLAY MODE")
         g_mode_lay = QVBoxLayout()
         g_mode_lay.addWidget(self._rgb_controls)
+        # RAW / Enhance sits with the Band | RGB toggle; Band view only (RGB has its own stretch)
+        band_box = QWidget()                # Band view only: RAW/Enhance + colormap
+        band_lay = QVBoxLayout(band_box)
+        band_lay.setContentsMargins(0, 0, 0, 0)
+        band_lay.setSpacing(4)
+        band_lay.addWidget(self.display_controls)
+        band_lay.addLayout(self._build_colormap_row())
+        g_mode_lay.addWidget(band_box)
         g_mode.setLayout(g_mode_lay)
         lay.addWidget(g_mode)
-
-        # display controls
-        g1 = QGroupBox("DISPLAY")
-        l1 = QVBoxLayout()
-        l1.addWidget(self.display_controls)
-        g1.setLayout(l1)
-        lay.addWidget(g1)
+        self._display_group = band_box
 
         # ★ spectra: tools, tree, Export… and Clear All Points (the old button's slot)
         g_spectra = QGroupBox("SPECTRA")
@@ -669,6 +717,7 @@ class CubeViewerWindow(QWidget):
             kl = QLabel(key)
             kl.setFixedWidth(52)
             dl = QLabel(desc)
+            dl.setWordWrap(True)            # never sets the sidebar width
             row.addWidget(kl)
             row.addWidget(dl)
             l3.addLayout(row)
@@ -764,6 +813,11 @@ class CubeViewerWindow(QWidget):
         QShortcut(QKeySequence(Qt.Key_Minus),   self, self._zoom_out)
         QShortcut(QKeySequence(Qt.Key_0),       self, self._zoom_fit)
         QShortcut(QKeySequence(Qt.Key_1),       self, self._zoom_actual)
+        # Only while the focus is inside this viewer: a second viewer (or another module
+        # window in the MDI area) never receives these keys.
+        for shortcut in self.findChildren(QShortcut):
+            if shortcut.parent() is self:
+                shortcut.setContext(Qt.WidgetWithChildrenShortcut)
 
     # ──────────────────────────────────────────────────────
     #  DISPLAY MODE SWITCH
@@ -775,6 +829,7 @@ class CubeViewerWindow(QWidget):
     # ★ _on_display_mode_changed — update zoom label when switching
     def _on_display_mode_changed(self, mode: str):
         is_rgb = (mode == "rgb")
+        self._display_group.setVisible(not is_rgb)      # RAW/Enhance applies to the Band view only
         if is_rgb:
             self._display_stack.setCurrentIndex(1)
             self._overlay.setVisible(False)
@@ -788,6 +843,7 @@ class CubeViewerWindow(QWidget):
         # both views draw the same record overlays, so nothing needs re-syncing
         # ★ update zoom label for active canvas
         self._on_zoom_changed(self._active_canvas().zoom_percent)
+        self._update_rgb_markers()
 
     def _on_composite_updated(self, rgb8: np.ndarray):
         h, w, ch = rgb8.shape
@@ -841,7 +897,8 @@ class CubeViewerWindow(QWidget):
         if self._closed:
             return None
         record = self.spectrum_set.add("point", {"x": int(ix), "y": int(iy)})
-        stats = point_stats(self.cube, int(ix), int(iy), saturation=self._saturation)
+        stats = point_stats(self.cube, int(ix), int(iy), saturation=self._saturation,
+                            ignore_value=self._ignore_value)
         self.spectrum_set.set_stats(record.rid, stats)
         self._record_added(record)
         if record.state == "failed":
@@ -863,7 +920,7 @@ class CubeViewerWindow(QWidget):
         stays ``'pending'`` (dashed outline, 'computing...') until the result arrives.
 
         Args:
-            kind: ``'rect'`` or ``'lasso'``.
+            kind: ``'rect'``, ``'lasso'`` or ``'polygon'`` (vertex geometry like a lasso).
             geometry: Rect ``{'c0', 'r0', 'c1', 'r1'}`` (ints, half-open) or lasso
                 ``{'vertices': [[x, y], ...]}`` (float image-corner coordinates), as
                 emitted by ``roi_drawn``.
@@ -886,24 +943,25 @@ class CubeViewerWindow(QWidget):
                 self._show_message("Rectangle discarded: it encloses no pixel centre")
                 return None
             geometry = dict(geometry, c0=bbox[0], r0=bbox[1], c1=bbox[2], r1=bbox[3])
-        elif kind == "lasso":
+        elif kind in POLYGON_KINDS:
+            label = kind.capitalize()
             vertices = np.asarray(geometry["vertices"], dtype=np.float64).reshape(-1, 2)
             if vertices.shape[0] < 3:
-                self._show_message("Lasso discarded: it needs at least 3 points")
+                self._show_message(f"{label} discarded: it needs at least 3 points")
                 return None
             bbox = snap_rect(float(vertices[:, 0].min()), float(vertices[:, 1].min()),
                              float(vertices[:, 0].max()), float(vertices[:, 1].max()), h, w)
             if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-                self._show_message("Lasso discarded: it encloses no pixel centre")
+                self._show_message(f"{label} discarded: it encloses no pixel centre")
                 return None
             if _lasso_crossings(vertices) <= INLINE_MASK_CROSSINGS:
                 c0, r0, mask = polygon_mask(vertices, h, w)
                 if not mask.any():
-                    self._show_message("Lasso discarded: it encloses no pixel centre")
+                    self._show_message(f"{label} discarded: it encloses no pixel centre")
                     return None
                 bbox = (c0, r0, c0 + mask.shape[1], r0 + mask.shape[0])
         else:
-            raise ValueError(f"kind must be 'rect' or 'lasso', got {kind!r}")
+            raise ValueError(f"kind must be 'rect', 'lasso' or 'polygon', got {kind!r}")
 
         record = self.spectrum_set.add(kind, geometry)
         self._record_added(record)
@@ -912,7 +970,8 @@ class CubeViewerWindow(QWidget):
         inline = self._in_ram and cost <= self.inline_bytes and (kind == "rect" or mask is not None)
         if inline:
             try:
-                stats = roi_stats(self.cube, bbox, mask, saturation=self._saturation)
+                stats = roi_stats(self.cube, bbox, mask, saturation=self._saturation,
+                                  ignore_value=self._ignore_value)
             except Exception as exc:  # noqa: BLE001 - shown on the record, never raised in a slot
                 self._record_failed(record.rid, f"{type(exc).__name__}: {exc}")
             else:
@@ -929,27 +988,144 @@ class CubeViewerWindow(QWidget):
 
         It holds its own references to the cube and the geometry, never to widgets.
         """
-        cube, saturation = self.cube, self._saturation
+        cube, saturation, ignore_value = self.cube, self._saturation, self._ignore_value
         kind, geometry, h, w = record.kind, record.geometry, self.h, self.w
 
         def job(cancel):
             box, local_mask = bbox, mask
-            if kind == "lasso" and local_mask is None:
+            if kind in POLYGON_KINDS and local_mask is None:
                 # a huge lasso: its mask is rasterised here, cancellable per ~10 ms batch
                 box, local_mask, _ = roi_selection(kind, geometry, h, w, cancel=cancel)
-            return roi_stats(cube, box, local_mask, saturation=saturation, cancel=cancel)
+            return roi_stats(cube, box, local_mask, saturation=saturation,
+                             ignore_value=ignore_value, cancel=cancel)
 
         return job
 
     def _on_job_done(self, rid: int, stats):
         """Worker result (GUI thread); late results of deleted records are ignored."""
-        if not self._closed:
+        if self._closed:
+            return
+        if rid < 0:                         # a median job (key -rid - 1)
+            self._median_finished(-rid - 1, stats)
+        else:
             self._record_finished(rid, stats)
 
     def _on_job_failed(self, rid: int, message: str):
         """Worker error (GUI thread)."""
-        if not self._closed:
+        if self._closed:
+            return
+        if rid < 0:
+            self._show_message(f"Median failed: {message}")
+        else:
             self._record_failed(rid, message)
+
+    # ── median spectra (Phase 4) ──────────────────────────
+
+    @staticmethod
+    def _median_key(rid: int) -> int:
+        """JobRunner key of a record's median job (negative: never a record id)."""
+        return -int(rid) - 1
+
+    def set_spectrum_show_median(self, rid: int, show: bool) -> None:
+        """Show / hide an area's dashed median curve; the first show computes it in the worker."""
+        record = self.spectrum_set.get(rid)
+        if record is None or not record.is_area:
+            return
+        record.show_median = bool(show)
+        if show and rid not in self._medians:
+            if not self._jobs.is_pending(self._median_key(rid)):
+                self._jobs.submit(self._median_key(rid), self._median_job(record))
+                self._show_message(f"{record.name}: computing the median…")
+            return
+        self._apply_median_curve(record)
+
+    def _median_job(self, record):
+        """Worker job: the median of a record's pixels (own references, no widgets)."""
+        cube, ignore_value = self.cube, self._ignore_value
+        kind, geometry, h, w = record.kind, record.geometry, self.h, self.w
+
+        def job(cancel):
+            box, mask, n_px = roi_selection(kind, geometry, h, w, cancel=cancel)
+            if n_px == 0:
+                raise ValueError("no pixel inside")
+            return roi_median(cube, box, mask, ignore_value=ignore_value, cancel=cancel)
+        return job
+
+    def _median_finished(self, rid: int, median):
+        """GUI thread: store a median and draw it if still wanted."""
+        record = self.spectrum_set.get(rid)
+        if record is None:
+            return
+        self._medians[rid] = np.asarray(median, dtype=np.float64)
+        self._apply_median_curve(record)
+        self._refresh_status()
+
+    def _apply_median_curve(self, record):
+        """Create / update / hide the dashed median curve of ``record``."""
+        entry = self._plot_entries.get(record.rid)
+        median = self._medians.get(record.rid)
+        if entry is None or median is None:
+            return
+        pen = pg.mkPen(color=record.color, width=_CURVE_WIDTH, style=Qt.DashLine)
+        if entry.median is None:
+            entry.median = pg.PlotDataItem(self._x, median, pen=pen, connect="finite")
+            self.spectrum.pw.addItem(entry.median)       # no name: no legend entry
+        else:
+            entry.median.setPen(pen)
+        entry.median.setVisible(bool(record.visible and record.show_median))
+
+    # ── R / G / B markers and hover read-out (Phase 4) ────
+
+    def _band_x(self, band: int) -> float:
+        """x position of a band on the plot (nm, or the band index)."""
+        return float(self.wavelengths[band]) if self._has_wavelengths() else float(band)
+
+    def _update_rgb_markers(self):
+        """RGB view: dashed R / G / B lines at the composite bands; Band view: the band marker."""
+        if self._closed:
+            return
+        rgb = self._rgb_controls.is_rgb_mode()
+        for line, band in zip(self._rgb_lines, self._rgb_controls.rgb_bands()):
+            line.setPos(self._band_x(band))
+            line.setVisible(rgb)
+        self.spectrum.band_line.setVisible(not rgb)
+
+    def _on_plot_hover(self, event):
+        """Crosshair + values of the visible spectra at the band nearest the pointer."""
+        if self._closed:
+            return
+        pos = event[0]
+        plot = self.spectrum.pw.getPlotItem()
+        if not plot.sceneBoundingRect().contains(pos) or not self._plot_entries:
+            self._hover_line.setVisible(False)
+            self._hover_text.setVisible(False)
+            return
+        x = plot.vb.mapSceneToView(pos).x()
+        band = int(np.argmin(np.abs(np.asarray(self._x, dtype=np.float64) - x)))
+        bx = self._band_x(band)
+        unit = f"{bx:.1f} nm" if self._has_wavelengths() else f"band {band}"
+        lines = [f"<b>{unit}</b>  (band {band})"]
+        for record in self.spectrum_set:
+            if record.rid not in self._plot_entries or not record.visible:
+                continue
+            value = float(record.stats.mean[band])
+            text = f"{value:,.1f}" if math.isfinite(value) else "-"
+            if record.is_area and math.isfinite(float(record.stats.std[band])):
+                text += f" &plusmn; {float(record.stats.std[band]):,.1f}"
+            median = self._medians.get(record.rid)
+            if median is not None and record.show_median and math.isfinite(float(median[band])):
+                text += f" (med {float(median[band]):,.1f})"
+            lines.append(f'<span style="color:{record.color}">&#9632;</span> '
+                         f"{html.escape(record.name)}: {text}")
+            if len(lines) > 12:
+                lines.append("…")
+                break
+        self._hover_line.setPos(bx)
+        self._hover_line.setVisible(True)
+        (_x0, x1), (_y0, y1) = plot.vb.viewRange()
+        self._hover_text.setHtml("<br>".join(lines))
+        self._hover_text.setPos(x1, y1)
+        self._hover_text.setVisible(True)
 
     def _record_finished(self, rid: int, stats):
         """Attach the statistics of an area and show it (or drop a 0-px lasso)."""
@@ -1083,6 +1259,9 @@ class CubeViewerWindow(QWidget):
             entry.curve.setPen(pg.mkPen(color=record.color, width=_CURVE_WIDTH))
             if entry.fill is not None:
                 entry.fill.setBrush(_fill_brush(record.color))
+            if entry.median is not None:
+                entry.median.setPen(pg.mkPen(color=record.color, width=_CURVE_WIDTH,
+                                             style=Qt.DashLine))
             self._update_legend_sample(entry.curve)
         self.spectra_panel.update_record(record)
         self._repaint_overlays()
@@ -1208,6 +1387,10 @@ class CubeViewerWindow(QWidget):
         pw.removeItem(entry.curve)
         if entry.fill is not None:
             pw.removeItem(entry.fill)
+        if entry.median is not None:
+            pw.removeItem(entry.median)
+        self._jobs.cancel(self._median_key(rid))
+        self._medians.pop(rid, None)
 
     def _apply_visibility(self, record):
         """Show / hide the plot items of ``record`` from its ``visible`` / ``show_std``.
@@ -1222,6 +1405,8 @@ class CubeViewerWindow(QWidget):
         self._update_legend_sample(entry.curve)
         if entry.fill is not None:
             entry.fill.setVisible(bool(record.visible and record.show_std))
+        if entry.median is not None:
+            entry.median.setVisible(bool(record.visible and record.show_median))
 
     def _update_legend_sample(self, curve):
         """Repaint the legend sample of ``curve`` (after a pen or visibility change)."""
@@ -1369,6 +1554,8 @@ class CubeViewerWindow(QWidget):
             "axis_order": _AXIS_ORDER,
             "saturation_level": (self._saturation if self._saturation is not None
                                  else "none (not counted)"),
+            "data_ignore_value": (self._ignore_value if self._ignore_value is not None
+                                  else "none"),
             "camera_bin": self.camera_bin,
         }
         for key in _CONFIG_SCALARS:
@@ -1461,7 +1648,7 @@ class CubeViewerWindow(QWidget):
             x = float(self.current_band)
         line = self.spectrum.band_line
         line.setPos(x)
-        line.setVisible(True)
+        line.setVisible(not self._rgb_controls.is_rgb_mode())      # RGB view: R/G/B lines
 
     def _step(self, delta: int):
         v = max(0, min(self.current_band + delta, self.bands - 1))
@@ -1492,6 +1679,62 @@ class CubeViewerWindow(QWidget):
         """Push the current band, a 2-D ``(slit, scan)`` view of the cube, to the canvas."""
         img = self.cube[:, :, self.current_band]
         self.canvas.set_array(img)
+
+    def _build_colormap_row(self) -> QHBoxLayout:
+        """'Colormap' combo (None + matplotlib's page, by section) and a Reverse check box."""
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.setToolTip("Colour the band image (after RAW / Enhance); None = grey")
+        self.colormap_combo.setIconSize(QSize(32, 10))
+        # size to ~10 characters, not to the longest section title; the list opens wide
+        self.colormap_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.colormap_combo.setMinimumContentsLength(6)
+        self.colormap_combo.view().setMinimumWidth(260)
+        self.colormap_combo.addItem("None", None)
+        model = self.colormap_combo.model()
+        for title, names in COLORMAP_GROUPS:
+            self.colormap_combo.addItem(f"\u2500\u2500 {title} \u2500\u2500", None)
+            model.item(self.colormap_combo.count() - 1).setEnabled(False)
+            for name in names:
+                self.colormap_combo.addItem(_colormap_icon(name), name, name)
+        self.colormap_reverse = QPushButton()           # icon toggle: fits the sidebar
+        self.colormap_reverse.setIcon(qta.icon("mdi6.swap-horizontal", color=PLOT_FOREGROUND,
+                                               color_on="#ffffff"))
+        self.colormap_reverse.setCheckable(True)
+        self.colormap_reverse.setFixedSize(26, 24)
+        self.colormap_reverse.setToolTip("Reverse the colormap (<name>_r)")
+        self.colormap_reverse.setAccessibleName("Reverse colormap")
+        self.colormap_reverse.setEnabled(False)
+        self.colormap_combo.currentIndexChanged.connect(self._on_colormap_changed)
+        self.colormap_reverse.toggled.connect(self._on_colormap_changed)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        icon = QLabel()                    # a palette icon, not 140 px of text
+        icon.setPixmap(qta.icon("mdi6.palette-swatch", color=PLOT_FOREGROUND).pixmap(16, 16))
+        icon.setToolTip("Colormap of the band image")
+        row.addWidget(icon)
+        row.addWidget(self.colormap_combo, stretch=1)
+        row.addWidget(self.colormap_reverse)
+        return row
+
+    def set_colormap(self, name=None, reverse: bool = False) -> None:
+        """Select a band-view colormap by name (``None`` = grey), as the combo does.
+
+        Raises:
+            KeyError: ``name`` is not in the list.
+        """
+        index = 0 if name is None else self.colormap_combo.findData(name)
+        if index < 0:
+            raise KeyError(f"unknown colormap {name!r}")
+        self.colormap_reverse.blockSignals(True)
+        self.colormap_reverse.setChecked(bool(reverse))
+        self.colormap_reverse.blockSignals(False)
+        self.colormap_combo.setCurrentIndex(index)
+        self._on_colormap_changed()
+
+    def _on_colormap_changed(self, *_):
+        name = self.colormap_combo.currentData()
+        self.colormap_reverse.setEnabled(name is not None)
+        self.canvas.set_colormap(name, self.colormap_reverse.isChecked())
 
     def _on_display_mapper_changed(self, mapper: DisplayMapper):
         self.canvas.set_display_mapper(mapper)
@@ -1524,7 +1767,7 @@ class CubeViewerWindow(QWidget):
                 f"λ={self.wavelengths[self.current_band]:.{self.resolution}f} nm"
             )
         if len(self.spectrum_set):
-            pending = len(self._jobs.pending())
+            pending = sum(1 for key in self._jobs.pending() if key >= 0)   # not median jobs
             parts.append(f"{len(self.spectrum_set)} spectra"
                          + (f" ({pending} computing…)" if pending else ""))
         if self._message:

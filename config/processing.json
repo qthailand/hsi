@@ -10,10 +10,5 @@
     555.0,
     465.0
   ],
-  "wavelength_range_nm": {
-    "poa": [
-      399.7,
-      500.1
-    ]
-  }
+  "wavelength_range_nm": {}
 }

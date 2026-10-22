@@ -61,10 +61,12 @@ import numpy as np
 
 from .roi_stats import RoiStats
 
-__all__ = ["KINDS", "AREA_KINDS", "STATES", "SpectrumRecord", "SpectrumSet"]
+__all__ = ["KINDS", "AREA_KINDS", "POLYGON_KINDS", "STATES", "SpectrumRecord", "SpectrumSet"]
 
-KINDS = ("point", "rect", "lasso")
-AREA_KINDS = ("rect", "lasso")
+KINDS = ("point", "rect", "lasso", "polygon")
+AREA_KINDS = ("rect", "lasso", "polygon")
+#: Kinds whose geometry is ``{"vertices": [[x, y], ...]}`` (freehand lasso or click-vertex polygon).
+POLYGON_KINDS = ("lasso", "polygon")
 STATES = ("pending", "ready", "failed")
 
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -109,6 +111,7 @@ class SpectrumRecord:
     color: str
     visible: bool = True
     show_std: bool = True
+    show_median: bool = False
     state: str = "pending"
     stats: RoiStats | None = None
     created_at: str = field(default_factory=_now_iso)

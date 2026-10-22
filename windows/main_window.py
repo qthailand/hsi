@@ -15,6 +15,7 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QMdiArea,
@@ -23,13 +24,17 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QAction,
     QMenuBar,
-    QVBoxLayout
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
 )
 from PyQt5.QtGui import QPixmap, QColor, QIcon, QBrush
 
 
+import qtawesome as qta
+
 from config import load_app_config
-from modules.cube_io import load_envi_cube_for_viewer
+from modules.cube_io import as_analysis_cube, envi_value_fields, load_envi_cube_for_viewer
 from modules.ui_kit.title_bar import IOSTitleBar
 from modules.ui_kit import theme
 from windows.scan_window import ScanWindow
@@ -202,6 +207,21 @@ class MainWindow(QMainWindow):
     # ── status bar polling ────────────────────────────────────────
 
     def _create_status_timer(self):
+        # Sensor temperature: a permanent widget (qtawesome icon + text) at the right of the
+        # status bar, shown while the active window reports one (``status_temperature()``)
+        self.temp_status = QWidget()
+        temp_lay = QHBoxLayout(self.temp_status)
+        temp_lay.setContentsMargins(0, 0, 6, 0)
+        temp_lay.setSpacing(3)
+        self.temp_status_icon = QLabel()
+        self.temp_status_icon.setPixmap(
+            qta.icon("fa5s.thermometer-half", color="#ef5350").pixmap(14, 14))
+        self.temp_status_text = QLabel()
+        temp_lay.addWidget(self.temp_status_icon)
+        temp_lay.addWidget(self.temp_status_text)
+        self.statusBar().addPermanentWidget(self.temp_status)
+        self.temp_status.hide()
+
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(_STATUS_POLL_MS)
         self._status_timer.timeout.connect(self._update_status_bar)
@@ -212,10 +232,14 @@ class MainWindow(QMainWindow):
 
     def _update_status_bar(self):
         sub = self.mdi.activeSubWindow()
+        widget = sub.widget() if sub is not None else None
+        temp = widget.status_temperature() if hasattr(widget, "status_temperature") else None
+        if temp is not None:
+            self.temp_status_text.setText(f"{temp:.1f}°C")
+        self.temp_status.setVisible(temp is not None)
         if sub is None:
             self.statusBar().showMessage("")
             return
-        widget = sub.widget()
         if hasattr(widget, "status_info"):
             self.statusBar().showMessage(widget.status_info())
         else:
@@ -299,6 +323,7 @@ class MainWindow(QMainWindow):
                 cube=cube, wavelengths=wavelengths,
                 title=f"ENVI Cube {Path(path).name}",
                 source_path=path,
+                header_values=envi_value_fields(path),
             )
         except Exception as e:
             logger.exception("Failed to open ENVI cube: %s", e)
@@ -317,13 +342,25 @@ class MainWindow(QMainWindow):
             camera_bits = {**(camera_bits or {}), **self.scan_controller.last_scan_temperatures}
         self.create_cube_viewer(cube, wavelengths, camera_bits=camera_bits)
 
-    def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None):
+    def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None,
+                           header_values=None):
         """Open a Cube Viewer; ``camera_bits`` (``camera_bit_info``) goes into the ENVI export header.
 
         ``source_path`` (the opened ENVI header) names the viewer's area spectra and its
         default spectra export file; None for a cube that has no file yet.
         """
         from modules.cube_viewer.window import CubeViewerWindow
+
+        # Any source (BIP/BIL/BSQ file, or a scan) -> contiguous BIP for the analysis;
+        # BSQ/BIL are transposed once here (about 1 s per 640 MiB), BIP passes through.
+        if not cube.flags.c_contiguous:
+            self.statusBar().showMessage("Preparing cube for analysis (transposing to BIP)\u2026")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                cube = as_analysis_cube(cube)
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.statusBar().clearMessage()
 
         mapper = None
         if self.scan_window is not None:
@@ -343,6 +380,8 @@ class MainWindow(QMainWindow):
                         'default_exposure_ms'):
                 if hasattr(self.config, key):
                     cfg[key] = getattr(self.config, key)
+        if header_values:               # the cube's own 'data ignore value' / 'data full scale'
+            cfg = {**cfg, **header_values}
         if camera_bits:
             cfg = {**cfg, **camera_bits}
 

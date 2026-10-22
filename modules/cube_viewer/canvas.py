@@ -21,12 +21,43 @@ Example:
 from __future__ import annotations
 
 import numpy as np
+from matplotlib import colormaps
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QEvent
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
 from PyQt5.QtWidgets import QWidget, QSizePolicy
 
 from modules.cube_preview.widget import TAB20_QCOLORS
 from modules.cube_viewer.roi_draw import RoiDrawMixin
+from modules.live_view.mapping import DisplayMode
+
+#: The colormaps of matplotlib's "Choosing Colormaps" page, by its sections (names this
+#: matplotlib does not have are dropped).  ``None`` (no colormap) is the original grey image.
+_COLORMAP_PAGE = (
+    ("Perceptually Uniform Sequential", ("viridis", "plasma", "inferno", "magma", "cividis")),
+    ("Sequential", ("Greys", "Purples", "Blues", "Greens", "Oranges", "Reds", "YlOrBr",
+                    "YlOrRd", "OrRd", "PuRd", "RdPu", "BuPu", "GnBu", "PuBu", "YlGnBu",
+                    "PuBuGn", "BuGn", "YlGn")),
+    ("Sequential (2)", ("binary", "gist_yarg", "gist_gray", "gray", "bone", "pink", "spring",
+                        "summer", "autumn", "winter", "cool", "Wistia", "hot", "afmhot",
+                        "gist_heat", "copper")),
+    ("Diverging", ("PiYG", "PRGn", "BrBG", "PuOr", "RdGy", "RdBu", "RdYlBu", "RdYlGn",
+                   "Spectral", "coolwarm", "bwr", "seismic", "berlin", "managua", "vanimo")),
+    ("Cyclic", ("twilight", "twilight_shifted", "hsv")),
+    ("Qualitative", ("Pastel1", "Pastel2", "Paired", "Accent", "Dark2", "Set1", "Set2", "Set3",
+                     "tab10", "tab20", "tab20b", "tab20c")),
+    ("Miscellaneous", ("flag", "prism", "ocean", "gist_earth", "terrain", "gist_stern",
+                       "gnuplot", "gnuplot2", "CMRmap", "cubehelix", "brg", "gist_rainbow",
+                       "rainbow", "jet", "turbo", "nipy_spectral", "gist_ncar")),
+)
+COLORMAP_GROUPS = tuple((title, tuple(n for n in names if n in colormaps))
+                        for title, names in _COLORMAP_PAGE)
+
+
+def colormap_lut(name: str, reverse: bool = False) -> np.ndarray:
+    """``(256, 3)`` uint8 RGB table of a matplotlib colormap (``reverse``: the ``_r`` order)."""
+    rgba = colormaps[name](np.linspace(0.0, 1.0, 256))
+    lut = np.round(rgba[:, :3] * 255.0).astype(np.uint8)
+    return np.ascontiguousarray(lut[::-1] if reverse else lut)
 from modules.ui_kit.zoom_pan import ZoomPanMixin
 
 
@@ -105,12 +136,46 @@ class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
 
         Args:
             mapper: A ``modules.live_view.mapping.DisplayMapper`` (or ``None``).
-                Note: the current rendering still uses the percentile stretch
-                and does not consult the mapper.
+                RAW maps integer cubes linearly from ``0 .. 2**bit_depth - 1`` to
+                0..255 (true brightness); ENHANCE, ``None`` and float cubes use the
+                1-99 % percentile stretch.
         """
         self._display_mapper = mapper
         self._update_pixmap()
         self.update()
+
+    def set_colormap(self, name=None, reverse: bool = False) -> None:
+        """Colour the band image with a matplotlib colormap (after the RAW/Enhance mapping).
+
+        Args:
+            name: A matplotlib colormap name (see ``COLORMAP_GROUPS``), or ``None`` for no
+                colormap: the original grey image, bit for bit (``reverse`` is ignored).
+            reverse: Use the reversed map (``<name>_r``).
+
+        Raises:
+            KeyError: ``name`` is not a matplotlib colormap.
+        """
+        if name is not None and name not in colormaps:
+            raise KeyError(f"unknown colormap {name!r}")
+        self._colormap = (name, bool(reverse) and name is not None)
+        self._lut = None if name is None else colormap_lut(name, reverse)
+        self._update_pixmap()
+        self.update()
+
+    @property
+    def colormap(self) -> tuple:
+        """``(name or None, reverse)`` of the current colormap; ``(None, False)`` by default."""
+        return getattr(self, "_colormap", (None, False))
+
+    def _to_pixmap(self, arr8: np.ndarray) -> QPixmap:
+        """QPixmap of a 2-D uint8 image: grey, or through the colormap table."""
+        h, w = arr8.shape
+        lut = getattr(self, "_lut", None)
+        if lut is None:
+            arr8 = np.ascontiguousarray(arr8)
+            return QPixmap.fromImage(QImage(arr8.data, w, h, w, QImage.Format_Grayscale8).copy())
+        rgb = np.ascontiguousarray(lut[arr8])
+        return QPixmap.fromImage(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy())
 
     def add_click_point(self, ix: int, iy: int):
         """Mark an image pixel with a coloured dot and its ``(ix,iy)`` label.
@@ -134,6 +199,12 @@ class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
             self._pixmap = None
             return
 
+        mapper = self._display_mapper
+        if (mapper is not None and mapper.mode is DisplayMode.RAW
+                and np.issubdtype(self._array.dtype, np.integer)):
+            self._pixmap = self._to_pixmap(mapper.to_uint8(self._array))
+            return
+
         arr = self._array.astype(np.float32)
         lo = np.percentile(arr, 1.0)
         hi = np.percentile(arr, 99.0)
@@ -141,9 +212,7 @@ class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
             hi = lo + 1.0
         arr = np.clip((arr - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
 
-        h, w = arr.shape
-        qimg = QImage(arr.data, w, h, w, QImage.Format_Grayscale8).copy()
-        self._pixmap = QPixmap.fromImage(qimg)
+        self._pixmap = self._to_pixmap(arr)
 
     # ── painting ──────────────────────────────────────────
 
@@ -168,11 +237,18 @@ class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
         scaled_h = int(img_h * sy)
 
         if scaled_w > 0 and scaled_h > 0:
-            scaled = self._pixmap.scaled(
-                scaled_w, scaled_h,
-                Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
-            )
-            painter.drawPixmap(int(ox), int(oy), scaled)
+            if sx > 1.0 or sy > 1.0:
+                # Zoomed in: the painter scales only what lands on screen (a full
+                # scaled() copy cost ~60 ms and hundreds of MB per paint at 1000 %).
+                painter.drawPixmap(QRectF(int(ox), int(oy), scaled_w, scaled_h),
+                                   self._pixmap, QRectF(0, 0, img_w, img_h))
+            else:
+                # Fit / zoomed out: unchanged (scaled()'s area filter for downscaling).
+                scaled = self._pixmap.scaled(
+                    scaled_w, scaled_h,
+                    Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
+                )
+                painter.drawPixmap(int(ox), int(oy), scaled)
 
         self._roi_paint_class_overlay(painter)
 
@@ -223,7 +299,9 @@ class CubeImageCanvas(QWidget, ZoomPanMixin, RoiDrawMixin):
         self._zp_wheel_event(event)
 
     def mouseDoubleClickEvent(self, event):
-        """Forward double clicks to the zoom mixin (Qt override)."""
+        """A double click closes a polygon being drawn, else zooms to fit (Qt override)."""
+        if self._roi_mouse_double_click(event):
+            return
         if self._zp_mouse_double_click(event):
             return
 

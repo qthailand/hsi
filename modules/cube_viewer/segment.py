@@ -310,7 +310,7 @@ def _record_pixels(kind, geometry, height, width, cancel=None):
         c0, c1 = (min(max(int(geometry[k]), 0), w) for k in ("c0", "c1"))
         r0, r1 = (min(max(int(geometry[k]), 0), h) for k in ("r0", "r1"))
         return (c0, r0, c1, r1), None, max(0, c1 - c0) * max(0, r1 - r0)
-    if kind == "lasso":
+    if kind in ("lasso", "polygon"):
         vertices = np.asarray(geometry["vertices"], dtype=np.float64).reshape(-1, 2)
         c0, r0, mask = polygon_mask(vertices, h, w, cancel=cancel)
         return (c0, r0, c0 + mask.shape[1], r0 + mask.shape[0]), mask, int(np.count_nonzero(mask))

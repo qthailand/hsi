@@ -203,6 +203,29 @@ Compare tab: for the checked methods, leave-one-ROI-out (else split-half) accura
 
 All runs (classify, separability, compare) happen on the session's own `JobRunner` ('cube-viewer-segment'), separate from the ROI-statistics one, with progress and per-chunk cancel; ROI drawing stays responsive. Closing the viewer cancels them.
 
+## Phase 4 additions
+
+* **Polygon tool** (`roi_draw.py`, record kind `'polygon'`, vertex geometry like a lasso): each
+  left click adds a corner; Enter, a right click, a double click or a click within
+  `POLYGON_CLOSE_PX` (8 px) of the first corner closes it; Backspace removes the last corner,
+  Esc cancels.  A double click outside a drawing still zooms to fit.
+* **Cubes > <cube> > Band / RGB** at the top of the SPECTRA tree: a click switches the view
+  (`RGBCompositeControls.set_mode`); the shown view is bold and follows the toggle.
+* **ENVI 'data ignore value' / 'data full scale'**: `cube_io.envi_value_fields(hdr)` reads them;
+  opening an ENVI file passes them in the viewer config (`data_ignore_value`, `full_scale`).
+  The ignore value is no data for points (`point_stats(..., ignore_value=)`), areas and medians,
+  and is written to the XLSX Metadata sheet.
+* **Spectrum plot**: dashed R / G / B lines at the composite bands in the RGB view (instead of the
+  band marker); a hover crosshair with the visible spectra's mean (+- std, median) at the
+  nearest band; **Show median** in a record's menu draws its per-band median as a dashed curve
+  (`roi_stats.roi_median`, computed once in the worker; it needs every pixel: about
+  `n_px x B` values in memory).  Medians are not exported.
+* **Layout and speed**: any BSQ / BIL / BIP file (and a scan) reaches the viewer as contiguous BIP
+  (`cube_io.as_analysis_cube`, about 1 s per 640 MiB for BSQ / BIL); the RGB composite is built
+  only when the RGB view shows; zoomed-in painting draws only the visible part; viewer shortcuts
+  act only with the focus in that viewer.  A classification run times the fitted model on rows of
+  the cube and asks before a run longer than `segment_session.SLOW_RUN_S` (20 s).
+
 ## Threading
 
 All widgets live in the GUI thread. The export dialog moves a `cube_io` export worker to its own `QThread`; closing the dialog or the viewer joins that thread (blocks until a running export ends).

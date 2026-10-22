@@ -58,6 +58,57 @@ __all__ = ("SegmentSession", "JOB_RUN", "JOB_SEPARABILITY", "JOB_COMPARE",
 
 #: JobRunner keys of the three kinds of job (one live job per kind).
 JOB_RUN, JOB_SEPARABILITY, JOB_COMPARE = 1, 2, 3
+#: A run whose measured full-image time exceeds this (seconds) waits for ``continue_run``.
+SLOW_RUN_S = 20.0
+#: The fitted model is timed on up to this many pixels (whole rows spread over the image)...
+PROBE_PIXELS = 4096
+#: ...or for this long (seconds), whichever comes first, before a run.
+PROBE_SECONDS = 0.5
+
+
+def _format_seconds(seconds: float) -> str:
+    """``42 s`` below two minutes, else ``m min ss s``."""
+    seconds = float(seconds)
+    if seconds < 120:
+        return f"{seconds:.0f} s"
+    return f"{int(seconds // 60)} min {int(seconds % 60):02d} s"
+
+
+def measure_classify_seconds(cube, model, *, cancel=None, chunk_rows: int = 8) -> float:
+    """Full-image ``classify_cube`` time of a fitted ``model``, measured on this cube.
+
+    Classifies blocks of ``chunk_rows`` whole rows (the run's chunk size) spread evenly
+    over the image, one block at a time, until about
+    ``PROBE_PIXELS`` pixels or ``PROBE_SECONDS`` have been spent (at least one row), and
+    scales the time per row to all rows.  So the estimate reflects the real model (an
+    SVM's support vectors), this machine and this cube's layout, and the probe stays
+    short even for a very slow model.
+
+    Args:
+        cube: ``(H, W, B)`` cube the run will classify.
+        model: A fitted ``segment`` model.
+        cancel: Optional ``cancel()`` polled by ``classify_cube``.
+        chunk_rows: Rows per block, as the run uses (default 8).
+
+    Returns:
+        float: Seconds for all ``H`` rows (0.0 for an empty cube).
+    """
+    height, width = int(cube.shape[0]), int(cube.shape[1])
+    if height == 0 or width == 0:
+        return 0.0
+    block = int(min(height, chunk_rows))           # the run's chunk size: same per-call overhead
+    n_blocks = int(max(1, round(PROBE_PIXELS / (width * block))))
+    starts = np.unique(np.linspace(0, height - block, n_blocks).astype(np.intp))
+    spent, done = 0.0, 0
+    for start in starts:
+        probe = np.ascontiguousarray(cube[start:start + block])
+        started = time.perf_counter()
+        _segment.classify_cube(probe, model, chunk_rows=block, cancel=cancel)
+        spent += time.perf_counter() - started
+        done += block
+        if spent >= PROBE_SECONDS:
+            break
+    return spent / done * height
 #: Range of the global threshold multiplier.
 SCALE_RANGE = (0.5, 3.0)
 #: Overlay opacity of a new session.
@@ -102,6 +153,9 @@ class SegmentSession(QObject):
             names and ``'build_warnings'``).
         compare_ready(object): the ``compare.compare_methods`` rows (list of dicts).
         failed(str): a job failed (``'<Type>: text'``).
+        confirm_needed(float, str): a fitted run would take this many seconds (measured,
+            more than ``SLOW_RUN_S``) and waits: ``continue_run()`` classifies with the
+            already fitted model, ``discard_pending()`` drops it.  The text says why.
     """
 
     state_changed = pyqtSignal()
@@ -110,6 +164,7 @@ class SegmentSession(QObject):
     separability_ready = pyqtSignal(object)
     compare_ready = pyqtSignal(object)
     failed = pyqtSignal(str)
+    confirm_needed = pyqtSignal(float, str)
     _job_progress = pyqtSignal(int, int, float, str)      # (job key, token, fraction, text)
 
     def __init__(self, cube, records_provider, views=(), parent=None):
@@ -150,6 +205,9 @@ class SegmentSession(QObject):
         self._image = None                           # Indexed8 QImage
         self._pixmap = None
         self._run_started = 0.0
+        self._pending_fit = None                     # (classes, warnings, model, generation)
+        self.pending_estimate_s = None               # measured seconds of the waiting run
+        self.last_estimate_s = None                  # measured seconds of the last fitted run
 
     # ── configuration ─────────────────────────────────────
 
@@ -215,11 +273,14 @@ class SegmentSession(QObject):
         """True while any job (run, separability, compare) is queued or running."""
         return bool(self._runner.pending())
 
-    def run(self) -> None:
+    def run(self, confirmed: bool = False) -> None:
         """Build the classes, fit the current method and classify the cube in the worker.
 
-        Emits ``progress`` while running, then ``result_ready`` (or ``failed``).  A run
-        already in progress is cancelled first.
+        After fitting, the model is timed on rows of this cube
+        (:func:`measure_classify_seconds`).  When the full image would take longer than
+        ``SLOW_RUN_S`` and ``confirmed`` is false, the run stops there and emits
+        ``confirm_needed``; otherwise it classifies and emits ``result_ready`` (or
+        ``failed``).  A run already in progress is cancelled first.
 
         Raises:
             RuntimeError: The session was shut down.
@@ -231,6 +292,7 @@ class SegmentSession(QObject):
         max_px, seed, rows = self.max_per_class, self.seed, self.chunk_rows
         generation = self._generation
         report = self._reporter(JOB_RUN)
+        classify = self._classify_job(cube, rows, report)
 
         def job(cancel):
             report(0.0, "building classes")
@@ -242,14 +304,60 @@ class SegmentSession(QObject):
                 raise ValueError(f"at most {MAX_CLASSES} classes can be shown, got {len(classes)}")
             report(0.03, "fitting")
             model = _segment.fit(method, classes, params, cancel=cancel)
+            warns = list(warns) + list(getattr(model, "warnings", []))
+            report(0.08, "timing the model")
+            estimate = measure_classify_seconds(cube, model, cancel=cancel, chunk_rows=rows)
+            if estimate > SLOW_RUN_S and not confirmed:
+                return ("confirm", classes, warns, model, generation, estimate)
+            return ("result",) + classify(cancel, classes, warns, model, generation) + (estimate,)
+
+        self._pending_fit = None
+        self.pending_estimate_s = None
+        self._run_started = time.perf_counter()
+        self._submit(JOB_RUN, job)
+
+    def _classify_job(self, cube, rows, report):
+        """The classification part of a run, as a function the worker calls."""
+        def classify(cancel, classes, warns, model, generation):
             report(0.1, "classifying")
             result = _segment.classify_cube(
                 cube, model, chunk_rows=rows, cancel=cancel,
                 progress=lambda f: report(0.1 + 0.9 * f, "classifying"))
-            return classes, list(warns) + list(getattr(model, "warnings", [])), result, generation
+            return classes, warns, result, generation
+        return classify
+
+    def continue_run(self) -> None:
+        """Classify with the fitted model a ``confirm_needed`` run is waiting with.
+
+        Raises:
+            RuntimeError: No run is waiting, or the session was shut down.
+        """
+        self._check_open()
+        if self._pending_fit is None:
+            raise RuntimeError("no run is waiting for confirmation")
+        classes, warns, model, generation = self._pending_fit
+        estimate = self.pending_estimate_s
+        self._pending_fit = None
+        self.pending_estimate_s = None
+        classify = self._classify_job(self._cube, self.chunk_rows, self._reporter(JOB_RUN))
+
+        def job(cancel):
+            return ("result",) + classify(cancel, classes, warns, model, generation) + (estimate,)
 
         self._run_started = time.perf_counter()
         self._submit(JOB_RUN, job)
+
+    def discard_pending(self) -> None:
+        """Drop the fitted model of a run waiting for confirmation (no-op otherwise)."""
+        if self._pending_fit is not None:
+            self._pending_fit = None
+            self.pending_estimate_s = None
+            self.state_changed.emit()
+
+    @property
+    def run_pending_confirmation(self) -> bool:
+        """True while a fitted run waits for ``continue_run`` / ``discard_pending``."""
+        return self._pending_fit is not None
 
     def compute_separability(self, method: str = "sam", params=None) -> None:
         """Build the classes and run ``segment.separability`` in the worker (``separability_ready``)."""
@@ -489,8 +597,21 @@ class SegmentSession(QObject):
         """GUI thread: a job finished."""
         if self._closed:
             return
-        if key == JOB_RUN:
-            classes, warnings, result, generation = payload
+        if key == JOB_RUN and payload[0] == "confirm":
+            _, classes, warnings, model, generation, estimate = payload
+            self._pending_fit = (classes, warnings, model, generation)
+            self.pending_estimate_s = self.last_estimate_s = float(estimate)
+            info = _segment.METHODS.get(getattr(model, "method", self.method))
+            label = info.label if info is not None else self.method
+            detail = f"{label}: about {_format_seconds(estimate)} for the full image (measured)"
+            n_support = getattr(model, "n_support", 0)
+            if n_support:
+                detail += f"; {n_support:,} support vectors"
+            self.confirm_needed.emit(float(estimate), detail)
+            self.state_changed.emit()
+        elif key == JOB_RUN:
+            _, classes, warnings, result, generation, estimate = payload
+            self.last_estimate_s = float(estimate)
             self._drop_result()
             self.classes = list(classes)
             self.warnings = list(warnings)

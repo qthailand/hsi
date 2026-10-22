@@ -1,9 +1,11 @@
 *.pyc
 *.npz
 *.dll
+*.json
 __pycache__/
 modules/camera/poa
 modules/camera/ximea
 tools/
 tests/
 config/
+calibration/

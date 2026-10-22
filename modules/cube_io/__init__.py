@@ -4,6 +4,8 @@ Public API:
 
 * ``create_pushbroom_cube_from_corrected`` - stack corrected frames into a cube.
 * ``load_envi_cube_for_viewer`` - open an ENVI cube lazily (memory map) plus wavelengths.
+* ``as_analysis_cube`` - the cube as C-contiguous BIP in memory (BSQ/BIL transposed once).
+* ``envi_value_fields`` - an ENVI header's 'data ignore value' / 'data full scale'.
 * ``parse_envi_header`` / ``read_envi_band`` - minimal ENVI header and single-band reader.
 * ``HypercubeWriter`` (ENVI BIP), ``GeoTIFFWriter``, ``SpectrogramWriter``
   (raw binary), ``save_hdf5`` - exporters.
@@ -41,7 +43,8 @@ Example:
     >>> create_pushbroom_cube_from_corrected(frames).shape           # (slit, scan, wavelength)
     (4, 3, 10)
 """
-from .core import create_pushbroom_cube_from_corrected, load_envi_cube_for_viewer
+from .core import (as_analysis_cube, create_pushbroom_cube_from_corrected, envi_value_fields,
+                   load_envi_cube_for_viewer)
 
 from .envi import parse_envi_header, _read_envi_band_float32 as read_envi_band
 from .writers import HypercubeWriter, GeoTIFFWriter, SpectrogramWriter
@@ -50,6 +53,8 @@ from .hdf5 import save_hdf5
 __all__ = (
     "create_pushbroom_cube_from_corrected",
     "load_envi_cube_for_viewer",
+    "as_analysis_cube",
+    "envi_value_fields",
     "parse_envi_header",
     "read_envi_band",
     "HypercubeWriter",

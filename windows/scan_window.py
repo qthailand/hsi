@@ -426,9 +426,6 @@ class ScanWindow(QWidget):
             started, expected = self._scan_clock
             scan_time = (f"Scan {_format_duration(time.monotonic() - started)}"
                          f" / ~{_format_duration(expected)}  ·  ")
-        temp_str = ""
-        if s["temp"] > -900:
-            temp_str = f"  ·  \U0001f321 {s['temp']:.1f}\u00b0C"
         return (
             f"{s['state']}  ·  "
             f"{scan_time}"
@@ -438,8 +435,12 @@ class ScanWindow(QWidget):
             f"Recorded {s['recorded']:,}  ·  "
             f"Y {s['y']}  ·  "
             f"Sharpness {s['sharpness']:.1f}"
-            f"{temp_str}"
         )
+
+    def status_temperature(self):
+        """Sensor temperature (°C) for the status bar's thermometer, or ``None`` when unknown."""
+        temp = self._status["temp"]
+        return temp if temp > -900 else None
 
     # ── cube ready ───────────────────────────────────────────────
 

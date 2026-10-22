@@ -519,3 +519,35 @@ def test_a_scan_shows_its_settings_in_the_preview_title_and_the_viewer_buttons_s
     win.distance_mm_spin.setValue(25.0); win.speed_um_s_spin.setValue(1500.0)
     assert win.scan_settings_summary().endswith('17 bands 500.9–599.8 nm  ·  25.000 mm @ 1500 µm/s')
     win.close()
+
+
+def test_the_status_bar_shows_the_temperature_with_a_thermometer_icon():
+    from PyQt5.QtWidgets import QMainWindow, QMdiArea, QWidget
+    import config as app_config
+    import windows.main_window as main_window_module
+    import windows.scan_window as scan_window_module
+    app = QApplication.instance() or QApplication([])
+    win = scan_window_module.ScanWindow(app_config.AppConfig())
+    assert win.status_temperature() is None                     # -999: unknown
+    win.set_temperature(39.14)
+    assert win.status_temperature() == 39.14
+    assert '\U0001f321' not in win.status_info() and '\u00b0C' not in win.status_info()
+
+    class Shell(QMainWindow):                                   # the shell's status bar only
+        _create_status_timer = main_window_module.MainWindow._create_status_timer
+        _update_status_bar = main_window_module.MainWindow._update_status_bar
+
+    host = Shell()
+    host.mdi = QMdiArea()
+    host.setCentralWidget(host.mdi)
+    host._create_status_timer()
+    host._status_timer.stop()
+    assert not host.temp_status_icon.pixmap().isNull()
+    sub = host.mdi.addSubWindow(win)
+    host.mdi.setActiveSubWindow(sub)
+    host._update_status_bar()
+    assert not host.temp_status.isHidden() and host.temp_status_text.text() == '39.1\u00b0C'
+    host.mdi.setActiveSubWindow(host.mdi.addSubWindow(QWidget()))  # no temperature: hidden
+    host._update_status_bar()
+    assert host.temp_status.isHidden()
+    host.close()

@@ -144,7 +144,7 @@ class GeoTIFFWriter:
 
             with rasterio.open(self.save_path, "w", **self.geo_meta) as dst:
                 for i in range(self.count):
-                    data = self.hypercube[i]
+                    data = np.ascontiguousarray(self.hypercube[i])   # views welcome (no-op if contiguous)
                     wl = self.linear_spectrum[i]
                     dst.update_tags(bidx=i + 1, WAVELENGTH=f"{wl:.3f}", WAVELENGTH_UNIT="nm")
                     dst.set_band_description(i + 1, f"Band {i + 1} (λ={wl:.3f} nm)")

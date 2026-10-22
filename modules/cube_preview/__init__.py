@@ -22,6 +22,7 @@ Threading:
     ``QApplication.aboutToQuit``).  ``import modules.cube_preview`` does not
     import PyQt5; classes load lazily on first access (``find_closest_band``
     and the colour table need Qt/matplotlib too, so they are lazy as well).
+    The widget also needs ``qtawesome`` (the fit button icon).
 
 Embedding:
     ``RealtimeCubePreviewWidget`` and ``CenteredPixmapLabel`` can be built with no

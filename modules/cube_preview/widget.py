@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import qtawesome as qta
 from matplotlib import colormaps
 
 from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QRectF
@@ -351,7 +352,7 @@ class RealtimeCubePreviewWidget(QWidget):
         |     yellow shape outline      | Clear        |
         |                               | scores       |
         +-------------------------------+--------------+
-        |  --o========================o--  2.0-98.0%   |   percentile stretch
+        | [fit] --o====================o--  2.0-98.0%   |   fit + percentile stretch
         +----------------------------------------------+
         |  Frames: 1029  |  Point 2: x=120 y=67 (2)    |
         |  [Clear Spectra]                             |
@@ -366,7 +367,8 @@ class RealtimeCubePreviewWidget(QWidget):
     nearest to ``rgb_target_wavelengths`` initially; the user can drag the R/G/B
     lines in the plot to change them.  Clicking the image plots the spectrum of that
     pixel (each click adds a curve; "Clear Spectra" removes them).  The 2..98 %
-    slider stretches the display per channel.  "Check Circle" / "Check Square" find a
+    slider stretches the display per channel; the fit button left of it resets zoom/pan
+    (as a double click on the image does).  "Check Circle" / "Check Square" find a
     round / square target on the displayed image (``shape_check.detect_shape``), outline it
     in yellow and show circularity / squareness and the scan/slit ratio W/H used to
     calibrate the stage speed (new speed = speed x W/H); "Clear" removes them.
@@ -474,9 +476,16 @@ class RealtimeCubePreviewWidget(QWidget):
         self._stretch_slider = RangeSlider(low=0.02, high=0.98)
         self._stretch_slider.range_changed.connect(self._on_stretch_changed)
 
+        # fit button: same as a double click on the image
+        self._btn_fit = QPushButton(qta.icon("fa5b.adn", color="#e0e0e0"), "")
+        self._btn_fit.setFixedSize(24, 24)
+        self._btn_fit.setToolTip("Fit image to the preview (reset zoom and pan)")
+        self._btn_fit.clicked.connect(self.image_label.zoom_fit)
+
         stretch_row = QHBoxLayout()
         stretch_row.setContentsMargins(0, 0, 0, 0)
         stretch_row.setSpacing(6)
+        stretch_row.addWidget(self._btn_fit)
         stretch_row.addWidget(self._stretch_slider, stretch=1)
         stretch_row.addWidget(self._stretch_label)
 

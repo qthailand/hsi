@@ -83,7 +83,9 @@ from modules.cube_viewer.roi_stats import polygon_mask, snap_rect
 __all__ = ("TOOLS", "LASSO_MAX_VERTICES", "LASSO_MIN_WIDGET_PX", "LASSO_MIN_IMAGE_PX",
            "RoiDrawMixin", "roi_selection")
 
-TOOLS = ("point", "rect", "lasso")
+TOOLS = ("point", "rect", "lasso", "polygon")
+#: A polygon closes when a click lands within this many widget px of its first vertex.
+POLYGON_CLOSE_PX = 8.0
 LASSO_MAX_VERTICES = 5000
 LASSO_MIN_WIDGET_PX = 2.0
 LASSO_MIN_IMAGE_PX = 1.0
@@ -135,7 +137,7 @@ def roi_selection(kind, geometry, height, width, *, cancel=None):
         c0, c1 = (min(max(int(geometry[k]), 0), w) for k in ("c0", "c1"))
         r0, r1 = (min(max(int(geometry[k]), 0), h) for k in ("r0", "r1"))
         return (c0, r0, c1, r1), None, max(0, c1 - c0) * max(0, r1 - r0)
-    if kind == "lasso":
+    if kind in ("lasso", "polygon"):
         vertices = np.asarray(geometry["vertices"], dtype=np.float64).reshape(-1, 2)
         c0, r0, mask = polygon_mask(vertices, h, w, cancel=cancel)
         bbox = (c0, r0, c0 + mask.shape[1], r0 + mask.shape[0])
@@ -156,7 +158,7 @@ def _area_path(kind, geometry) -> QPainterPath:
     if kind == "rect":
         c0, r0, c1, r1 = (float(geometry[k]) for k in ("c0", "r0", "c1", "r1"))
         path.addRect(QRectF(c0, r0, c1 - c0, r1 - r0))
-    elif kind == "lasso":
+    elif kind in ("lasso", "polygon"):
         vertices = geometry.get("vertices") or ()
         if len(vertices) >= 2:
             path.addPolygon(QPolygonF([QPointF(float(x), float(y)) for x, y in vertices]))
@@ -279,7 +281,7 @@ class RoiDrawMixin:
         if d.kind == "rect":
             c0, r0, c1, r1 = self._roi_snapped(d)
             return {"kind": "rect", "c0": c0, "r0": r0, "c1": c1, "r1": r1}
-        return {"kind": "lasso", "vertices": [[x, y] for x, y in d.vertices]}
+        return {"kind": d.kind, "vertices": [[x, y] for x, y in d.vertices]}
 
     def _zp_widget_to_image_f(self, wx: float, wy: float) -> tuple[float, float]:
         """Map widget coordinates to float image-corner coordinates (no clipping, no truncation)."""
@@ -362,7 +364,27 @@ class RoiDrawMixin:
         return self._zp_widget_to_image_f(pos.x(), pos.y())
 
     def _roi_mouse_press(self, event) -> bool:
-        """Start a rectangle / lasso on a left press (not in the point tool); True if consumed."""
+        """Start a rectangle / lasso on a left press (not in the point tool); True if consumed.
+
+        Polygon tool: every left press adds a vertex (a press near the first vertex closes
+        the shape) and a right press closes it.
+        """
+        d = self._roi_drag
+        if d is not None and d.kind == "polygon":
+            if event.button() == Qt.RightButton:
+                self._roi_finish_polygon()
+                return True
+            if event.button() != Qt.LeftButton:
+                return False
+            x, y = self._roi_event_image_pos(event)
+            if len(d.vertices) >= 3 and self._roi_near_first_vertex(d, event):
+                self._roi_finish_polygon()
+            elif (x, y) != d.vertices[-1]:
+                d.vertices.append((x, y))
+                d.poly.append(QPointF(x, y))
+                d.cur = (x, y)
+                self.update()
+            return True
         if self._roi_tool == "point" or event.button() != Qt.LeftButton:
             return False
         size = self._zp_image_size()
@@ -391,6 +413,8 @@ class RoiDrawMixin:
     def _roi_mouse_release(self, event) -> bool:
         """Finish the drawing on the left release and emit ``roi_drawn`` / ``roi_discarded``."""
         d = self._roi_drag
+        if d is not None and d.kind == "polygon":
+            return event.button() in (Qt.LeftButton, Qt.RightButton)   # closed by Enter / right / first vertex
         if d is None or event.button() != Qt.LeftButton:
             return False
         self._roi_drag = None
@@ -421,12 +445,66 @@ class RoiDrawMixin:
         return True
 
     def _roi_key_press(self, event) -> bool:
-        """Esc cancels a drawing in progress; True if consumed."""
-        if event.key() == Qt.Key_Escape and self._roi_drag is not None:
+        """Esc cancels a drawing; for a polygon Enter closes it and Backspace removes the last
+        vertex.  True if consumed."""
+        d = self._roi_drag
+        if d is None:
+            return False
+        if event.key() == Qt.Key_Escape:
             self.cancel_drawing()
             self.roi_discarded.emit("Drawing cancelled")
             return True
+        if d.kind != "polygon":
+            return False
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._roi_finish_polygon()
+            return True
+        if event.key() == Qt.Key_Backspace:
+            if len(d.vertices) > 1:
+                d.vertices.pop()
+                d.poly.remove(d.poly.size() - 1)
+                self.update()
+            else:
+                self.cancel_drawing()
+                self.roi_discarded.emit("Drawing cancelled")
+            return True
         return False
+
+    def _roi_mouse_double_click(self, event) -> bool:
+        """A double click closes a polygon being drawn (instead of zooming to fit); True if consumed."""
+        d = self._roi_drag
+        if d is None or d.kind != "polygon" or event.button() != Qt.LeftButton:
+            return False
+        self._roi_finish_polygon()
+        return True
+
+    def _roi_near_first_vertex(self, d, event) -> bool:
+        """True when the event is within ``POLYGON_CLOSE_PX`` widget px of the first vertex."""
+        ox, oy, sx, sy = self._zp_transform()
+        fx, fy = d.vertices[0]
+        pos = event.localPos()
+        return math.hypot(pos.x() - (ox + fx * sx), pos.y() - (oy + fy * sy)) <= POLYGON_CLOSE_PX
+
+    def _roi_finish_polygon(self) -> None:
+        """Close the polygon being drawn: emit ``roi_drawn('polygon', ...)`` or ``roi_discarded``."""
+        d = self._roi_drag
+        self._roi_drag = None
+        self.update()
+        if d is None:
+            return
+        if tuple(self._zp_image_size()) != d.image_size:
+            return
+        if len(d.vertices) < 3:
+            self.roi_discarded.emit("Polygon discarded: click at least 3 corners, then Enter")
+            return
+        xs = [v[0] for v in d.vertices]
+        ys = [v[1] for v in d.vertices]
+        w, h = d.image_size
+        c0, r0, c1, r1 = snap_rect(min(xs), min(ys), max(xs), max(ys), h, w)
+        if c1 <= c0 or r1 <= r0:
+            self.roi_discarded.emit("Polygon discarded: it encloses no pixel centre")
+            return
+        self.roi_drawn.emit("polygon", {"vertices": [[float(vx), float(vy)] for vx, vy in d.vertices]})
 
     def _roi_lasso_add(self, d: _Drag, x: float, y: float) -> None:
         """Append a lasso vertex when it is far enough from the previous one (and below the cap)."""
@@ -688,7 +766,13 @@ class _RoiPixmapLabel(CenteredPixmapLabel, RoiDrawMixin):
             self._roi_restore_cursor()
 
     def keyPressEvent(self, event):
-        """Qt handler: Esc cancels a drawing in progress."""
+        """Qt handler: Esc cancels a drawing in progress (Enter / Backspace for a polygon)."""
         if self._roi_key_press(event):
             return
         super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """Qt handler: a double click closes a polygon being drawn, else the base behaviour."""
+        if self._roi_mouse_double_click(event):
+            return
+        super().mouseDoubleClickEvent(event)

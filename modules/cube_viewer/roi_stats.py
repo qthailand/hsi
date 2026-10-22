@@ -443,13 +443,15 @@ def _freeze_empty(n_px, n_bands, exact, signed):
 # --------------------------------------------------------------------------- public statistics
 
 
-def point_stats(cube, ix, iy, *, saturation=None) -> RoiStats:
+def point_stats(cube, ix, iy, *, saturation=None, ignore_value=None) -> RoiStats:
     """Single-pixel record: ``mean == cube[iy, ix, :].astype(float64)``, std 0, ``n_px`` 1.
 
     Args:
         cube: ``(H, W, B)`` array (ndarray, memmap or view).
         ix, iy: Column (scan) and row (slit) of the pixel.
         saturation: Optional level; values ``>=`` it count in ``n_saturated``.
+        ignore_value: Optional ENVI 'data ignore value': a band holding it counts as no
+            data (``n_valid`` 0, NaN mean/std/min/max, sums 0), as in :func:`roi_stats`.
 
     Returns:
         ``RoiStats`` with method ``'point'``; ``min == max == mean``.  A non-finite value
@@ -466,6 +468,11 @@ def point_stats(cube, ix, iy, *, saturation=None) -> RoiStats:
     raw = np.asarray(cube[iy, ix, :])
     mean = raw.astype(np.float64)
     finite = np.isfinite(mean)
+    ignored = np.zeros(n_bands, dtype=bool)
+    if ignore_value is not None:
+        ignored = finite & (mean == float(ignore_value))
+        finite = finite & ~ignored
+        mean = np.where(ignored, np.nan, mean)
     sat = np.zeros(n_bands, dtype=np.int64)
     if saturation is not None:
         sat = (finite & (mean >= float(saturation))).astype(np.int64)
@@ -474,6 +481,8 @@ def point_stats(cube, ix, iy, *, saturation=None) -> RoiStats:
         sum1 = raw.astype(np.int64 if raw.dtype.kind == "i" else np.uint64)
         wide = raw.astype(np.int64)
         sum2 = (wide * wide).astype(np.uint64)
+        sum1[ignored] = 0
+        sum2[ignored] = 0
     return RoiStats(1, finite.astype(np.int64), mean, np.where(finite, 0.0, np.nan),
                     mean, mean, sat, sum1, sum2, "point")
 
@@ -772,3 +781,61 @@ def _float_stats(chunks, n_px, n_bands, dtype, ignore_value, saturation):
     has = n_valid > 0
     return RoiStats(n_px, n_valid, mean, std, np.where(has, gmin, np.nan),
                     np.where(has, gmax, np.nan), n_sat, None, None, "float64-two-pass")
+
+
+def roi_median(cube, bbox, local_mask=None, *, ignore_value=None,
+               cancel: Optional[Callable[[], bool]] = None, chunk_bytes: int = 1 << 22) -> np.ndarray:
+    """Per-band median of an ROI's pixels (NaN / ignore value excluded), as float64.
+
+    Unlike the mean and std this needs every pixel: the ROI's pixels are gathered row
+    chunk by row chunk (``n_px x B`` values in the cube's dtype; float32 when NaN or an
+    ignore value has to be masked), then ``numpy.median`` / ``nanmedian`` per band.
+
+    Args:
+        cube: ``(H, W, B)`` array, memmap or view.
+        bbox: ``(c0, r0, c1, r1)`` half-open pixel box (as for :func:`roi_stats`).
+        local_mask: Optional bool ``(r1 - r0, c1 - c0)`` mask; None = the whole box.
+        ignore_value: Optional ENVI 'data ignore value' excluded per band.
+        cancel: Optional callable polled per chunk; True stops with ``RoiCancelled``.
+        chunk_bytes: Approximate cube bytes read per chunk.
+
+    Returns:
+        numpy.ndarray: ``(B,)`` float64 medians; NaN for a band without a valid pixel.
+
+    Raises:
+        ValueError: Empty box or mask shape mismatch.
+        RoiCancelled: ``cancel()`` returned True.
+    """
+    h, w, n_bands = _check_cube(cube)
+    c0, r0, c1, r1 = (int(v) for v in bbox)
+    if not (0 <= c0 < c1 <= w and 0 <= r0 < r1 <= h):
+        raise ValueError(f"bbox {bbox} is empty or outside the {w} x {h} image")
+    if local_mask is not None and np.shape(local_mask) != (r1 - r0, c1 - c0):
+        raise ValueError(f"mask shape {np.shape(local_mask)} does not match bbox {bbox}")
+    row_bytes = max(1, (c1 - c0) * n_bands * np.dtype(cube.dtype).itemsize)
+    rows_per_chunk = max(1, int(chunk_bytes // row_bytes))
+    parts = []
+    for top in range(r0, r1, rows_per_chunk):
+        if cancel is not None and cancel():
+            raise RoiCancelled("median cancelled")
+        bottom = min(r1, top + rows_per_chunk)
+        block = np.asarray(cube[top:bottom, c0:c1, :])
+        if local_mask is not None:
+            block = block[np.asarray(local_mask[top - r0:bottom - r0], dtype=bool)]
+        parts.append(block.reshape(-1, n_bands))
+    pixels = np.concatenate(parts, axis=0) if parts else np.empty((0, n_bands), cube.dtype)
+    if pixels.shape[0] == 0:
+        return np.full(n_bands, np.nan)
+    needs_mask = pixels.dtype.kind == "f" or ignore_value is not None
+    if not needs_mask:
+        return np.median(pixels, axis=0).astype(np.float64)
+    values = pixels.astype(np.float32 if pixels.dtype.itemsize <= 4 else np.float64)
+    values[~np.isfinite(values)] = np.nan
+    if ignore_value is not None:
+        values[pixels == ignore_value] = np.nan
+    with np.errstate(all="ignore"):
+        valid = np.isfinite(values).any(axis=0)
+        out = np.full(n_bands, np.nan)
+        if valid.any():
+            out[valid] = np.nanmedian(values[:, valid], axis=0)
+    return out.astype(np.float64)

@@ -86,6 +86,9 @@ TOOL_BUTTONS = (
     ("lasso", "Lasso", "mdi6.lasso",
      "Lasso: hold the left button and draw around an area; release closes "
      "it (Esc cancels)"),
+    ("polygon", "Polygon", "mdi6.vector-polygon",
+     "Polygon: click the corners; Enter, right-click, double-click or a click on the "
+     "first corner closes it (Backspace removes the last corner, Esc cancels)"),
 )
 
 #: Joined (segmented) look of the tool buttons: one strip, outer corners rounded only.
@@ -116,6 +119,7 @@ _SWATCH_PX = 12
 _SEGMENT_TIP = ("Classify every pixel from the classes of the spectra (needs at least two "
                 "classes with computed spectra; set a row's class in the Class column)")
 _SEG_ROLE = Qt.UserRole + 1          # class index of a Segmentation child (-1: unclassified)
+_VIEW_ROLE = Qt.UserRole + 2         # 'single' / 'rgb' of a Cubes > <cube> view child
 _STALE_COLOR = QColor("#ffb74d")
 _BIG = 1 << 40           # stands in for an unknown image size when snapping a lasso bbox
 
@@ -254,6 +258,7 @@ class SpectraPanel(QWidget):
     rename_requested = pyqtSignal(int, str)
     color_requested = pyqtSignal(int, str)
     show_std_changed = pyqtSignal(int, bool)
+    show_median_changed = pyqtSignal(int, bool)
     copy_requested = pyqtSignal(list)
     delete_requested = pyqtSignal(list)
     selection_changed = pyqtSignal(object)
@@ -263,6 +268,7 @@ class SpectraPanel(QWidget):
     segmentation_overlay_requested = pyqtSignal(bool)
     clear_segmentation_requested = pyqtSignal()
     segment_ready_changed = pyqtSignal(bool)
+    view_mode_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -308,12 +314,30 @@ class SpectraPanel(QWidget):
 
         self.tree = _SpectraTree()
         self.tree.set_tooltip_provider(self._item_tooltip)
+        # Cubes > <cube> > Band / RGB (Spectronon style): a click switches the view
+        self._cubes_root = QTreeWidgetItem(self.tree, ["Cubes", ""])
+        self._cubes_root.setFlags(Qt.ItemIsEnabled)
+        self._cube_item = QTreeWidgetItem(self._cubes_root, ["cube", ""])
+        self._cube_item.setFlags(Qt.ItemIsEnabled)
+        self._cube_item.setIcon(0, qta.icon("mdi6.cube-outline", color=PLOT_FOREGROUND))
+        self._view_items = {}
+        for mode, text, icon in (("single", "Band", "mdi6.image-filter-black-white"),
+                                 ("rgb", "RGB", "mdi6.palette")):
+            item = QTreeWidgetItem(self._cube_item, [text, ""])
+            item.setFlags(Qt.ItemIsEnabled)
+            item.setIcon(0, qta.icon(icon, color=PLOT_FOREGROUND))
+            item.setData(0, _VIEW_ROLE, mode)
+            self._view_items[mode] = item
+        self._cubes_root.setExpanded(True)
+        self._cube_item.setExpanded(True)
         self._root = QTreeWidgetItem(self.tree, ["Spectra (0)", ""])
         self._root.setFlags(Qt.ItemIsEnabled)
         font = self._root.font(0)
         font.setBold(True)
         self._root.setFont(0, font)
         self._root.setExpanded(True)
+        self._cubes_root.setFont(0, font)
+        self.set_view_mode("single")
         self._seg_root = QTreeWidgetItem(self.tree, ["Segmentation", "", ""])
         self._seg_root.setFlags(Qt.ItemIsEnabled)
         self._seg_root.setFont(0, font)
@@ -321,6 +345,7 @@ class SpectraPanel(QWidget):
         self._seg_summary = None
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.tree.itemClicked.connect(self._on_item_clicked)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
         self.tree.delete_pressed.connect(self._delete_selected)
@@ -693,6 +718,10 @@ class SpectraPanel(QWidget):
         if item is self._root:
             return "Check = shown and exported.  F2 / double click: rename.  Del: delete.  " \
                    "Right click: colour, ±σ, copy."
+        if item is self._cubes_root or item is self._cube_item:
+            return "The open cube; click Band or RGB to switch the view."
+        if item.data(0, _VIEW_ROLE) is not None:
+            return f"Show the {item.text(0)} view"
         if item is self._seg_root:
             return ("Right click: show / hide the overlay or clear the segmentation.  "
                     "'(stale)': spectra or classes changed after the run.")
@@ -721,6 +750,13 @@ class SpectraPanel(QWidget):
         std.setChecked(bool(record.show_std) and record.is_area)
         std.setEnabled(record.is_area)
         std.toggled.connect(lambda checked: self._request_show_std(rid, checked))
+        median = menu.addAction("Show median")
+        median.setCheckable(True)
+        median.setChecked(bool(getattr(record, "show_median", False)) and record.is_area)
+        median.setEnabled(record.is_area)
+        median.setToolTip("Dashed curve: the per-band median of the area's pixels "
+                          "(computed once, needs every pixel)")
+        median.toggled.connect(lambda checked: self.show_median_changed.emit(int(rid), bool(checked)))
         menu.addSeparator()
         menu.addAction("Copy as text", lambda: self.copy_requested.emit(list(targets)))
         menu.addSeparator()
@@ -781,6 +817,30 @@ class SpectraPanel(QWidget):
         if item.text(0) != record.name:
             self.rename_requested.emit(int(rid), item.text(0))
         self._refresh(rid)
+
+    def set_cube_name(self, name: str) -> None:
+        """Name of the cube under the Cubes node (the file stem, or 'cube')."""
+        self._cube_item.setText(0, str(name) or "cube")
+
+    def set_view_mode(self, mode: str) -> None:
+        """Mark ``'single'`` (Band) or ``'rgb'`` as the shown view (bold); emits nothing."""
+        for key, item in self._view_items.items():
+            font = item.font(0)
+            font.setBold(key == mode)
+            item.setFont(0, font)
+
+    def view_mode(self) -> str:
+        """The view marked as shown: ``'single'`` or ``'rgb'``."""
+        for key, item in self._view_items.items():
+            if item.font(0).bold():
+                return key
+        return "single"
+
+    def _on_item_clicked(self, item, column: int) -> None:
+        """A click on Cubes > <cube> > Band / RGB asks for that view."""
+        mode = item.data(0, _VIEW_ROLE)
+        if mode is not None:
+            self.view_mode_requested.emit(mode)
 
     def _on_item_double_clicked(self, item, column: int) -> None:
         """A double click on the count column edits the name too."""

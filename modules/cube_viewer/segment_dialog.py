@@ -36,7 +36,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                              QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                             QListWidget, QListWidgetItem, QProgressBar, QPushButton, QSlider,
+                             QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QSlider,
                              QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
                              QWidget)
 
@@ -139,6 +139,7 @@ class SegmentDialog(QDialog):
         s.separability_ready.connect(self.show_separability)
         s.compare_ready.connect(self.show_compare)
         s.failed.connect(self._on_failed)
+        s.confirm_needed.connect(self._on_confirm_needed)
         self._select_method_in_combo(s.method)
         self._on_method_changed()
         self.refresh()
@@ -320,6 +321,22 @@ class SegmentDialog(QDialog):
         self.progress.setValue(0)
         self.status.setText("")
         self.session.run()
+
+    def _on_confirm_needed(self, seconds: float, detail: str):
+        """A fitted run would be slow: ask before classifying the whole image."""
+        self.estimate_label.setText(f"Estimated time (measured after fit): ~{seconds:.0f} s")
+        answer = QMessageBox.question(
+            self, "Slow classification",
+            f"{detail}.\n\nClassify the whole image anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.status.setText(f"Classifying (about {seconds:.0f} s)\u2026")
+            self.session.continue_run()
+        else:
+            self.session.discard_pending()
+            self.progress.setValue(0)
+            self.status.setText("Run cancelled before classifying (too slow); try a faster "
+                                "method or fewer training pixels / PCA components.")
 
     # ── reject slider ─────────────────────────────────────
 

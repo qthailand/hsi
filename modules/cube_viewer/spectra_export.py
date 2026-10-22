@@ -337,7 +337,7 @@ def _record_bbox(record, image_hw) -> tuple:
 def _roi_row(ws, record, image_hw) -> list:
     stats = record.stats
     c0, r0, c1, r1 = _record_bbox(record, image_hw)
-    vertices = record.geometry.get("vertices") if record.kind == "lasso" else None
+    vertices = record.geometry.get("vertices") if record.kind in ("lasso", "polygon") else None
     n_vertices = len(vertices) if vertices is not None else None
     vertices_json = None
     note = ""

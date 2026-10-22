@@ -52,28 +52,29 @@ QPushButton[segment="last"] {{ border-top-right-radius: 4px; border-bottom-right
 def _auto_rgb_bands(
     n_bands: int, wavelengths: np.ndarray | None,
 ) -> tuple[int, int, int]:
-    """Pick sensible default R/G/B band indices based on wavelength range."""
+    """Pick default R/G/B band indices.
+
+    True colour (bands nearest 645 / 555 / 465 nm) only when the cube covers 465-645 nm;
+    otherwise (SWIR, NIR-only, e.g. 854-1700 nm) a false-colour spread over the cube's own
+    wavelength span: R at 90 %, G at 50 %, B at 10 % (by wavelength, so descending band
+    order works too).  Without wavelengths the same spread is taken by band index.
+    """
     if wavelengths is None or len(wavelengths) != n_bands:
         b_idx = max(0, int(n_bands * 0.10))
         g_idx = max(0, int(n_bands * 0.50))
         r_idx = max(0, min(n_bands - 1, int(n_bands * 0.90)))
         return (r_idx, g_idx, b_idx)
 
-    wl = wavelengths
-    wl_min = float(wl[0])
-    wl_max = float(wl[-1])
+    wl = np.asarray(wavelengths, dtype=np.float64)
+    wl_min = float(np.nanmin(wl))
+    wl_max = float(np.nanmax(wl))
 
-    # SWIR range (>900nm) -> percentage
-    if wl_min > 900:
-        b_idx = max(0, int(n_bands * 0.10))
-        g_idx = max(0, int(n_bands * 0.50))
-        r_idx = max(0, min(n_bands - 1, int(n_bands * 0.90)))
-        return (r_idx, g_idx, b_idx)
-
-    # VIS/NIR -> closest band by target wavelength
-    r_idx = int(np.argmin(np.abs(wl - 645.0)))
-    g_idx = int(np.argmin(np.abs(wl - 555.0)))
-    b_idx = int(np.argmin(np.abs(wl - 465.0)))
+    if wl_min <= 465.0 and wl_max >= 645.0:
+        targets = (645.0, 555.0, 465.0)                # visible range covered: true colour
+    else:
+        span = wl_max - wl_min
+        targets = (wl_min + 0.9 * span, wl_min + 0.5 * span, wl_min + 0.1 * span)
+    r_idx, g_idx, b_idx = (int(np.nanargmin(np.abs(wl - t))) for t in targets)
     return (r_idx, g_idx, b_idx)
 
 
@@ -95,6 +96,8 @@ class RGBCompositeControls(QWidget):
     """
 
     mode_changed = pyqtSignal(str)
+    #: (r, g, b) band indices after any R / G / B spin box change (both views).
+    bands_changed = pyqtSignal(int, int, int)
     composite_updated = pyqtSignal(np.ndarray)
 
     def __init__(self, parent=None):
@@ -151,6 +154,8 @@ class RGBCompositeControls(QWidget):
         self._spin_b.setRange(0, 0)
         self._spin_b.valueChanged.connect(self._on_band_changed)
 
+        for spin in (self._spin_r, self._spin_g, self._spin_b):
+            spin.setMinimumWidth(90)        # below the ~115 px hint: the row fits the sidebar
         band_row = QHBoxLayout()
         band_row.setSpacing(4)
         band_row.addWidget(self._spin_r)
@@ -204,10 +209,24 @@ class RGBCompositeControls(QWidget):
             spin.blockSignals(False)
 
         ri, gi, bi = _auto_rgb_bands(self._n_bands, wavelengths)
-        self._spin_r.setValue(ri)
-        self._spin_g.setValue(gi)
-        self._spin_b.setValue(bi)
+        for spin, value in ((self._spin_r, ri), (self._spin_g, gi), (self._spin_b, bi)):
+            spin.blockSignals(True)         # one composite later, not one per spin box
+            spin.setValue(value)
+            spin.blockSignals(False)
         self._update_wavelength_label()
+        self._update_composite()            # only builds it when the RGB view is showing
+
+    def set_mode(self, mode: str) -> None:
+        """Show the ``'single'`` (Band) or ``'rgb'`` view, as the toggle buttons do.
+
+        Emits ``mode_changed`` (also when the mode does not change).
+
+        Raises:
+            ValueError: ``mode`` is not ``'single'`` or ``'rgb'``.
+        """
+        if mode not in ("single", "rgb"):
+            raise ValueError(f"mode must be 'single' or 'rgb', got {mode!r}")
+        self._set_mode(mode)
 
     def is_rgb_mode(self) -> bool:
         """Return ``True`` when the "RGB Composite" button is active."""
@@ -234,9 +253,14 @@ class RGBCompositeControls(QWidget):
 
     # ── band change ───────────────────────────────────────
 
+    def rgb_bands(self) -> tuple:
+        """``(r, g, b)`` band indices of the composite."""
+        return (self._spin_r.value(), self._spin_g.value(), self._spin_b.value())
+
     def _on_band_changed(self):
         self._update_wavelength_label()
         self._update_composite()
+        self.bands_changed.emit(*self.rgb_bands())
 
     def _update_wavelength_label(self):
         if self._wavelengths is None:
@@ -257,8 +281,8 @@ class RGBCompositeControls(QWidget):
     # ── composite ─────────────────────────────────────────
 
     def _update_composite(self):
-        if self._cube is None:
-            return
+        if self._cube is None or not self.is_rgb_mode():
+            return                          # Band view: built when switching to RGB
 
         ri = self._spin_r.value()
         gi = self._spin_g.value()

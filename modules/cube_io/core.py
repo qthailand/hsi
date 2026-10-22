@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from modules.cube_io.envi import parse_envi_header
 from modules.spectral_processing.wavelength import parse_envi_wavelengths
 
 logger = logging.getLogger("HSI")
@@ -118,3 +119,57 @@ def load_envi_cube_for_viewer(
     )
 
     return cube, wavelengths
+
+
+def as_analysis_cube(cube: np.ndarray) -> np.ndarray:
+    """The cube in the layout the viewer's analysis needs: C-contiguous BIP in memory.
+
+    Whatever the source - a BSQ/BIL/BIP ENVI file opened with
+    :func:`load_envi_cube_for_viewer` (whose BSQ/BIL memory maps are strided views) or a
+    scanned cube - the result is ``(slit, scan, wavelength)`` with each pixel's spectrum
+    contiguous, so ROI statistics and per-pixel classification read sequential memory
+    (measured on a real 1024x1762x185 BSQ file: SAM 0.81 s on the view, 0.20 s after).
+
+    Args:
+        cube: 3-D ``(slit, scan, wavelength)`` array or memory map.
+
+    Returns:
+        numpy.ndarray: ``cube`` itself (no copy) when it is already C-contiguous, which
+        includes BIP files and scanned cubes; otherwise a C-contiguous copy in RAM
+        (BSQ/BIL: about 1 s and the cube's size in memory for a 640 MiB file).  Values
+        and dtype are unchanged; exports still write BIP / GeoTIFF / raw BIN.
+
+    Raises:
+        ValueError: ``cube`` is not 3-D.
+    """
+    if cube.ndim != 3:
+        raise ValueError(f"cube must be 3-D (slit, scan, wavelength), got shape {cube.shape}")
+    if cube.flags.c_contiguous:
+        return cube
+    return np.ascontiguousarray(cube)
+
+
+def envi_value_fields(hdr_path) -> dict:
+    """The value fields of an ENVI header that matter for statistics.
+
+    Args:
+        hdr_path: The ``.hdr`` file (or its data file).
+
+    Returns:
+        dict: ``data_ignore_value`` ('data ignore value': a no-data value, e.g. 0 in a
+        calibrated float cube) and ``full_scale`` ('data full scale': the saturation
+        level), each only when present and a finite number.
+    """
+    path = str(hdr_path)
+    data_path = path[:-4] if path.lower().endswith(".hdr") else path
+    header = parse_envi_header(data_path)
+    out = {}
+    for key, name in (("data ignore value", "data_ignore_value"), ("data full scale", "full_scale")):
+        raw = header.get(key)
+        try:
+            value = float(str(raw).strip()) if raw is not None else None
+        except ValueError:
+            value = None
+        if value is not None and np.isfinite(value):
+            out[name] = value
+    return out
