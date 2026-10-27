@@ -36,16 +36,21 @@ from matplotlib import colormaps
 from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QRectF
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush, QFont, QPolygonF
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QHeaderView,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
 )
 
 from modules.cube_preview.render import CubeRenderWorker
-from modules.cube_preview.shape_check import detect_shape
+from modules.cube_preview.shape_check import detect_shapes, summarize_aspects
 from modules.ui_kit.range_slider import RangeSlider
 from modules.ui_kit.zoom_pan import ZoomPanMixin
 logger = logging.getLogger(__name__)
@@ -76,6 +81,8 @@ _TAB20_COUNT = 20
 _tab20_cmap = colormaps["tab20"]
 _RADIUS = 2
 SHAPE_OVERLAY_COLOR = QColor("#ffd600")
+SHAPE_OUTLIER_COLOR = QColor("#ff9100")     # target left out of the W/H summary
+SHAPE_SELECTED_COLOR = QColor("#00e5ff")    # target selected in the result table
 TAB20_HEX: list[str] = []
 TAB20_QCOLORS: list[QColor] = []
 
@@ -117,8 +124,9 @@ class CenteredPixmapLabel(QLabel, ZoomPanMixin):
 
         self._pixmap: QPixmap | None = None
         self._click_points: list[tuple[int, int]] = []
-        self._shape_outline: np.ndarray | None = None
-        self._shape_text = ""
+        self._shape_overlays: list[tuple[np.ndarray, str]] = []
+        self._shape_flagged: frozenset[int] = frozenset()
+        self._shape_selected: int | None = None
         self._background = QColor(background)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(1, 1)
@@ -171,20 +179,57 @@ class CenteredPixmapLabel(QLabel, ZoomPanMixin):
         return list(self._click_points)
 
     def set_shape_overlay(self, outline: np.ndarray, text: str = ""):
-        """Draw a closed yellow outline (e.g. a detected circle / square) with a label.
+        """Draw one closed yellow outline (e.g. a detected circle / square) with a label.
+
+        Same as ``set_shape_overlays([(outline, text)])``.
 
         Args:
             outline: ``(N, 2)`` polygon in image ``(x, y)`` pixel-centre coordinates.
             text: Label drawn above the outline (empty for none).
         """
-        self._shape_outline = np.asarray(outline, dtype=np.float64).reshape(-1, 2)
-        self._shape_text = text
+        self.set_shape_overlays([(outline, text)])
+
+    def set_shape_overlays(self, overlays, flagged=(), selected: int | None = None):
+        """Draw closed outlines (e.g. every detected circle / square), each with a label.
+
+        Replaces the outlines shown before.
+
+        Args:
+            overlays: List of ``(outline, text)``: ``(N, 2)`` polygon in image ``(x, y)``
+                pixel-centre coordinates and the label drawn above it (empty for none).
+            flagged: Indices drawn in orange instead of yellow (e.g. targets left out of
+                a summary).
+            selected: Index drawn thicker in cyan, or ``None``.
+        """
+        self._shape_overlays = [(np.asarray(o, dtype=np.float64).reshape(-1, 2), str(t))
+                                for o, t in overlays]
+        self._shape_flagged = frozenset(int(i) for i in flagged)
+        self._shape_selected = selected
         self.update()
 
+    def select_shape_overlay(self, index: int | None, text: str | None = None):
+        """Highlight one outline (cyan, drawn on top), or none.
+
+        Args:
+            index: Index into the current overlays, or ``None`` for no highlight.
+            text: New label for that outline (``None`` keeps it).
+        """
+        if index is not None and not 0 <= index < len(self._shape_overlays):
+            index = None
+        if index is not None and text is not None:
+            self._shape_overlays[index] = (self._shape_overlays[index][0], text)
+        self._shape_selected = index
+        self.update()
+
+    def shape_overlays(self) -> list[tuple[np.ndarray, str]]:
+        """The current ``(outline, text)`` overlays (a copy of the list)."""
+        return list(self._shape_overlays)
+
     def clear_shape_overlay(self):
-        """Remove the shape outline."""
-        self._shape_outline = None
-        self._shape_text = ""
+        """Remove all shape outlines."""
+        self._shape_overlays = []
+        self._shape_flagged = frozenset()
+        self._shape_selected = None
         self.update()
 
     # ── painting ──────────────────────────────────────────
@@ -256,25 +301,43 @@ class CenteredPixmapLabel(QLabel, ZoomPanMixin):
             painter.setPen(QPen(QColor(255, 255, 255, 230)))
             painter.drawText(QRectF(lx, ly, tw, th), Qt.AlignCenter, label)
 
-        if self._shape_outline is not None and len(self._shape_outline) >= 2:
-            self._paint_shape_overlay(painter)
+        if self._shape_overlays:
+            self._paint_shape_overlays(painter)
 
         painter.end()
 
-    def _paint_shape_overlay(self, painter: QPainter):
+    def _paint_shape_overlays(self, painter: QPainter):
+        # flagged on top of plain ones, the selected one last (on top of all)
+        order = sorted(range(len(self._shape_overlays)),
+                       key=lambda i: (i == self._shape_selected, i in self._shape_flagged))
+        width = 3 if len(self._shape_overlays) == 1 else 2
+        for i in order:
+            outline, text = self._shape_overlays[i]
+            if len(outline) < 2:
+                continue
+            if i == self._shape_selected:
+                color, pen_width = SHAPE_SELECTED_COLOR, 3
+            elif i in self._shape_flagged:
+                color, pen_width = SHAPE_OUTLIER_COLOR, width
+            else:
+                color, pen_width = SHAPE_OVERLAY_COLOR, width
+            self._paint_shape_overlay(painter, outline, text, color, pen_width)
+
+    def _paint_shape_overlay(self, painter: QPainter, outline: np.ndarray, text: str,
+                             color: QColor, pen_width: int):
         # outline points are pixel centres; the zoom/pan mapping gives pixel corners
         poly = QPolygonF([QPointF(*self._zp_map_image_to_widget(x + 0.5, y + 0.5))
-                          for x, y in self._shape_outline])
-        painter.setPen(QPen(SHAPE_OVERLAY_COLOR, 3))
+                          for x, y in outline])
+        painter.setPen(QPen(color, pen_width))
         painter.setBrush(Qt.NoBrush)
         painter.drawPolygon(poly)
-        if not self._shape_text:
+        if not text:
             return
         font = painter.font()
         font.setPixelSize(11)
         painter.setFont(font)
         metrics = painter.fontMetrics()
-        tw = metrics.horizontalAdvance(self._shape_text) + 10
+        tw = metrics.horizontalAdvance(text) + 10
         th = metrics.height() + 4
         bounds = poly.boundingRect()
         lx = min(max(0.0, bounds.center().x() - tw / 2), max(0.0, self.width() - tw))
@@ -284,8 +347,8 @@ class CenteredPixmapLabel(QLabel, ZoomPanMixin):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(0, 0, 0, 170)))
         painter.drawRoundedRect(QRectF(lx, ly, tw, th), 3, 3)
-        painter.setPen(QPen(SHAPE_OVERLAY_COLOR))
-        painter.drawText(QRectF(lx, ly, tw, th), Qt.AlignCenter, self._shape_text)
+        painter.setPen(QPen(color))
+        painter.drawText(QRectF(lx, ly, tw, th), Qt.AlignCenter, text)
 
     # ── coordinate mapping (zoom-aware) ───────────────────
 
@@ -349,8 +412,10 @@ class RealtimeCubePreviewWidget(QWidget):
         +-------------------------------+--------------+
         |  CenteredPixmapLabel (RGB)    | Check Circle |
         |     o (x,y) dot markers       | Check Square |
-        |     yellow shape outline      | Clear        |
-        |                               | scores       |
+        |     numbered yellow outlines  | Clear        |
+        |     (one per target)          | summary      |
+        |                               | # W/H Score  |
+        |                               | Copy         |
         +-------------------------------+--------------+
         | [fit] --o====================o--  2.0-98.0%   |   fit + percentile stretch
         +----------------------------------------------+
@@ -368,10 +433,13 @@ class RealtimeCubePreviewWidget(QWidget):
     lines in the plot to change them.  Clicking the image plots the spectrum of that
     pixel (each click adds a curve; "Clear Spectra" removes them).  The 2..98 %
     slider stretches the display per channel; the fit button left of it resets zoom/pan
-    (as a double click on the image does).  "Check Circle" / "Check Square" find a
-    round / square target on the displayed image (``shape_check.detect_shape``), outline it
-    in yellow and show circularity / squareness and the scan/slit ratio W/H used to
-    calibrate the stage speed (new speed = speed x W/H); "Clear" removes them.
+    (as a double click on the image does).  "Check Circle" / "Check Square" find every
+    round / square target in the image before the % stretch (``shape_check.detect_shapes``), outline
+    and number them in yellow and show circularity / squareness and the scan/slit ratio
+    W/H used to calibrate the stage speed (new speed = speed x W/H).  With several targets
+    W/H is their mean (``shape_check.summarize_aspects``; targets far from the others are
+    drawn orange and left out), a table lists each target (selecting a row highlights it)
+    and "Copy" puts the results on the clipboard; "Clear" removes them.
 
     Args:
         rgb_target_wavelengths: ``(R, G, B)`` target wavelengths in nm, default
@@ -381,7 +449,8 @@ class RealtimeCubePreviewWidget(QWidget):
     Attributes:
         image_label: The :class:`CenteredPixmapLabel`.
         frame_label, pixel_label: ``QLabel`` status texts.
-        shape_label: ``QLabel`` with the last shape-check result.
+        shape_label: ``QLabel`` with the last shape-check result (summary).
+        shape_table: ``QTableWidget`` with one row per target (shown for two or more).
         spec_plot: The ``pyqtgraph.PlotWidget`` with the pixel spectra.
 
     Signals:
@@ -406,6 +475,7 @@ class RealtimeCubePreviewWidget(QWidget):
         self._suppress_line_emit = False
         self._raw_rgb8: np.ndarray | None = None
         self._stretched_rgb8: np.ndarray | None = None   # what is shown, before the saturation overlay
+        self._shape_source: np.ndarray | None = None     # unstretched image the shape check runs on
         self._pending_click: tuple[int, int] | None = None
         self._fit_on_next_image = True   # the first image of a scan starts fitted to the canvas
         self._source: list | None = None              # list shown via set_frame_source
@@ -449,6 +519,26 @@ class RealtimeCubePreviewWidget(QWidget):
         self.shape_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.shape_label.setStyleSheet("font-size: 11px;")
         self.shape_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # one row per target when several are found; selecting a row highlights it
+        self.shape_table = QTableWidget(0, 3)
+        self.shape_table.setHorizontalHeaderLabels(["#", "W/H", "Score"])
+        self.shape_table.verticalHeader().setVisible(False)
+        self.shape_table.verticalHeader().setDefaultSectionSize(18)
+        self.shape_table.horizontalHeader().setStretchLastSection(True)
+        self.shape_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.shape_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.shape_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.shape_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.shape_table.setStyleSheet("font-size: 10px;")
+        self.shape_table.itemSelectionChanged.connect(self._on_shape_row_selected)
+        self.shape_table.setVisible(False)
+        self._btn_copy_shape = QPushButton("Copy")
+        self._btn_copy_shape.setToolTip("Copy the per-target results and the summary (tab separated)")
+        self._btn_copy_shape.clicked.connect(self._copy_shape_results)
+        self._btn_copy_shape.setEnabled(False)
+        self._shape_results: list = []
+        self._shape_summary = None
+        self._shape_kind = ""
 
         shape_col = QVBoxLayout()
         shape_col.setContentsMargins(0, 0, 0, 0)
@@ -457,10 +547,13 @@ class RealtimeCubePreviewWidget(QWidget):
             btn.setFixedHeight(24)
             shape_col.addWidget(btn)
         shape_col.addWidget(self.shape_label)
+        shape_col.addWidget(self.shape_table, stretch=1)
+        self._btn_copy_shape.setFixedHeight(22)
+        shape_col.addWidget(self._btn_copy_shape)
         shape_col.addStretch()
         shape_panel = QWidget()
         shape_panel.setLayout(shape_col)
-        shape_panel.setFixedWidth(120)
+        shape_panel.setFixedWidth(150)
 
         image_row = QHBoxLayout()
         image_row.setContentsMargins(0, 0, 0, 0)
@@ -567,6 +660,7 @@ class RealtimeCubePreviewWidget(QWidget):
         self._current_shape = (0, 0)
         self._raw_rgb8 = None
         self._stretched_rgb8 = None
+        self._shape_source = None
         self._pending_click = None
         self._fit_on_next_image = True
         self._source = None
@@ -876,37 +970,106 @@ class RealtimeCubePreviewWidget(QWidget):
     # ── shape check (stage-speed calibration) ─────────────
 
     def _check_shape(self, kind: str):
-        """Detect a circle / square target on the displayed image and show its scores."""
-        if self._stretched_rgb8 is None:
-            self.image_label.clear_shape_overlay()
+        """Detect every circle / square target on the displayed image and show their scores."""
+        self._clear_shape_check()
+        if self._shape_source is None:
             self.shape_label.setText("No image yet")
             return
-        result = detect_shape(self._stretched_rgb8, kind)
-        if result is None:
-            self.image_label.clear_shape_overlay()
+        QApplication.setOverrideCursor(Qt.WaitCursor)      # ~0.2 s, ~1 s on a 6000-frame scan
+        try:
+            results = detect_shapes(self._shape_source, kind)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not results:
             self.shape_label.setText(f"No {kind} found")
             return
+        self._shape_results = results
+        self._shape_kind = kind
+        self._shape_summary = summary = summarize_aspects(results)
         score_name = "Circularity" if kind == "circle" else "Squareness"
-        self.image_label.set_shape_overlay(
-            result.outline, f"{score_name} {result.score:.3f}   W/H {result.aspect:.3f}",
-        )
-        self.shape_label.setText(
-            f"<b>{kind.capitalize()}</b><br>"
-            f"{score_name}: <b>{result.score:.3f}</b><br>"
-            f"W/H (scan/slit): <b>{result.aspect:.3f}</b><br>"
-            f"Size: {result.width} \u00d7 {result.height} px<br>"
-            f"Speed \u00d7 {result.aspect:.3f}"
-        )
         self.shape_label.setToolTip(
             "1.000 = perfect shape.\n"
             "W/H > 1: target stretched along the scan axis (stage too slow).\n"
             "W/H < 1: target squeezed along the scan axis (stage too fast).\n"
-            "New speed = current speed \u00d7 W/H."
+            "New speed = current speed \u00d7 W/H.\n"
+            "With several targets W/H is the mean over them; targets far from the\n"
+            "others (orange) are left out."
         )
+        self._btn_copy_shape.setEnabled(True)
+        if len(results) == 1:
+            result = results[0]
+            self.image_label.set_shape_overlay(
+                result.outline, f"{score_name} {result.score:.3f}   W/H {result.aspect:.3f}",
+            )
+            self.shape_label.setText(
+                f"<b>{kind.capitalize()}</b><br>"
+                f"{score_name}: <b>{result.score:.3f}</b><br>"
+                f"W/H (scan/slit): <b>{result.aspect:.3f}</b><br>"
+                f"Size: {result.width} \u00d7 {result.height} px<br>"
+                f"Speed \u00d7 {result.aspect:.3f}"
+            )
+            return
+        self.image_label.set_shape_overlays(
+            [(r.outline, str(i + 1)) for i, r in enumerate(results)], flagged=summary.outliers,
+        )
+        scores = [r.score for i, r in enumerate(results) if i not in summary.outliers]
+        text = (
+            f"<b>{len(results)} {kind}s</b><br>"
+            f"W/H (scan/slit): <b>{summary.aspect:.3f}</b><br>"
+            f"\u00b1 {summary.std:.3f}, {summary.min:.3f} \u2013 {summary.max:.3f}<br>"
+            f"{score_name}: {np.mean(scores):.3f} (min {np.min(scores):.3f})<br>"
+            f"Speed \u00d7 <b>{summary.aspect:.3f}</b>"
+        )
+        if summary.outliers:
+            text += (f"<br><span style='color:{SHAPE_OUTLIER_COLOR.name()}'>"
+                     f"{len(summary.outliers)} left out (orange)</span>")
+        self.shape_label.setText(text)
+        self.shape_table.setRowCount(len(results))
+        for i, r in enumerate(results):
+            cells = (str(i + 1), f"{r.aspect:.3f}", f"{r.score:.3f}")
+            for col, value in enumerate(cells):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignCenter)
+                if i in summary.outliers:
+                    item.setForeground(QBrush(SHAPE_OUTLIER_COLOR))
+                self.shape_table.setItem(i, col, item)
+        self.shape_table.setVisible(True)
+
+    def _on_shape_row_selected(self):
+        rows = self.shape_table.selectionModel().selectedRows() if self.shape_table.selectionModel() else []
+        if not rows or not self._shape_results:
+            self.image_label.select_shape_overlay(None)
+            return
+        i = rows[0].row()
+        r = self._shape_results[i]
+        name = "Circ." if self._shape_kind == "circle" else "Sq."
+        self.image_label.select_shape_overlay(i, f"{i + 1}: {name} {r.score:.3f}  W/H {r.aspect:.3f}")
+
+    def _copy_shape_results(self):
+        """Copy the per-target results and the summary to the clipboard (tab separated)."""
+        if not self._shape_results:
+            return
+        summary = self._shape_summary
+        lines = ["#\tkind\tx\ty\twidth_px\theight_px\tscore\tW/H\tused"]
+        for i, r in enumerate(self._shape_results):
+            used = "no" if summary is not None and i in summary.outliers else "yes"
+            lines.append(f"{i + 1}\t{r.kind}\t{r.center[0]:.2f}\t{r.center[1]:.2f}\t{r.width}\t{r.height}"
+                         f"\t{r.score:.4f}\t{r.aspect:.4f}\t{used}")
+        if summary is not None:
+            lines.append(f"W/H mean of {summary.count}\t{summary.aspect:.4f}\tstd\t{summary.std:.4f}"
+                         f"\tmin\t{summary.min:.4f}\tmax\t{summary.max:.4f}")
+        QApplication.clipboard().setText("\n".join(lines))
 
     def _clear_shape_check(self):
         self.image_label.clear_shape_overlay()
         self.shape_label.setText("")
+        self._shape_results = []
+        self._shape_summary = None
+        self._shape_kind = ""
+        self.shape_table.clearSelection()
+        self.shape_table.setRowCount(0)
+        self.shape_table.setVisible(False)
+        self._btn_copy_shape.setEnabled(False)
 
     # ── slots from worker ─────────────────────────────────
 
@@ -920,6 +1083,9 @@ class RealtimeCubePreviewWidget(QWidget):
         else:
             rgb8 = np.clip(rgb, 0, 255).astype(np.uint8)
         self._raw_rgb8 = rgb8.copy()
+        # the worker sends a new array every tick, so keeping a reference is safe; the shape
+        # check runs on it unstretched (the % stretch clips small targets and biases W/H)
+        self._shape_source = rgb if np.issubdtype(rgb.dtype, np.floating) else self._raw_rgb8
         self._on_stretch_changed(
             self._stretch_slider.low, self._stretch_slider.high,
         )
