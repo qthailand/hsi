@@ -173,3 +173,25 @@ def envi_value_fields(hdr_path) -> dict:
         if value is not None and np.isfinite(value):
             out[name] = value
     return out
+
+
+def envi_scan_metadata(hdr_path) -> dict:
+    """The scan metadata of an ENVI header as writer ``config`` keys, so a re-export keeps it.
+
+    Args:
+        hdr_path: The ``.hdr`` file (or its data file).
+
+    Returns:
+        dict: Acquisition time (``started_at``), temperatures, bit depths, exposure, gain,
+        corrections, ... that the header has (see
+        :func:`modules.cube_io.writers.metadata_from_header`); fields it lacks stay unknown.
+        ``{}`` (logged) when the header cannot be parsed - never raises.
+    """
+    from modules.cube_io.writers import metadata_from_header
+    path = str(hdr_path)
+    data_path = path[:-4] if path.lower().endswith(".hdr") else path
+    try:
+        return metadata_from_header(parse_envi_header(data_path))
+    except Exception:
+        logger.warning("Cannot read the scan metadata of %s", path, exc_info=True)
+        return {}

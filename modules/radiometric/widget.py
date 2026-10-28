@@ -34,6 +34,7 @@ Example:
 from .workers import Worker
 from .core import _apply_spatial_binning, rowwise_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, fluo_calculation_heavy_logic, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles, check_factor_bands, save_factor_profile, load_factor_profile
 from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, release_band_maps
+from modules.cube_io.writers import acquisition_time_utc, metadata_header_lines
 # -*- coding: utf-8 -*-
 import numpy as np
 from scipy.signal import savgol_filter   # used by RoiDialog.update_spectrum_plot
@@ -433,7 +434,7 @@ class CalibrationWindow(QWidget):
         self._source_mode = 'scan_file'
         self._load_file_internal(filepath, meta=meta, source_label="Loaded from Scan")
 
-    def load_from_memory(self, cube_array, wavelengths=None, name="ScanData"):
+    def load_from_memory(self, cube_array, wavelengths=None, name="ScanData", metadata=None):
         """Load an in-memory cube by writing it as a temporary float32 BIP ENVI file.
 
         Args:
@@ -442,6 +443,9 @@ class CalibrationWindow(QWidget):
                 (a copy).
             wavelengths: Optional sequence of band centres in nm, one per band.
             name: Label used for the temp file ``<tmpdir>/scan_<name>.bip`` and the title.
+            metadata: Optional scan metadata (``ScanController.last_scan_header`` plus
+                ``camera_bit_info``) written to the temporary header, so the cubes made
+                from it keep the acquisition time, temperatures, exposure, gain and corrections.
 
         Raises:
             ValueError: ``cube_array`` is not 3-D.
@@ -475,6 +479,11 @@ class CalibrationWindow(QWidget):
             h.write('data type = 4\n')
             h.write('interleave = bip\n')    # ★ BIP
             h.write('byte order = 0\n')
+            if metadata:
+                if metadata.get('started_at'):
+                    h.write(f'acquisition time = {acquisition_time_utc(metadata)}\n')
+                for line in metadata_header_lines(metadata):
+                    h.write(line + '\n')
             if wavelengths is not None:
                 wl_str = ','.join(f"{float(v):.2f}" for v in wavelengths)
                 h.write(f'wavelength = {{{wl_str}}}\n')

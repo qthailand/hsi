@@ -86,6 +86,7 @@ class ScanController:
     _settings_timer = None
     _dirty_settings = frozenset()       # setting keys edited since the last save
     _scan_temps = ()
+    last_scan_header: dict = {}
     dark_reference = None
     _range_requested = None             # range last sent to the worker (or applied), (lo, hi) nm or None
     _range_applied = None               # range the worker reported in use
@@ -205,6 +206,7 @@ class ScanController:
         self._temp_interval: float = 3.0
         self._scan_temps: list[float] = []         # readings during the current scan
         self.last_scan_temperatures: dict = {}     # temperature metadata of the last cube
+        self.last_scan_header: dict = {}           # everything the last cube's export header records
 
         # Settings the user changes are saved once edits pause (see _save_settings).
         if persist_settings:
@@ -699,6 +701,24 @@ class ScanController:
         target = controls.target_temperature() if controls is not None else None
         if target is not None:
             meta["target_temperature_c"] = float(target)
+        return meta
+
+    #: Raw-metadata keys of a scan that also go into its cube's export header.
+    _HEADER_SCAN_KEYS = ("started_at", "exposure_ms", "gain", "camera_bin", "stage_type",
+                         "speed_um_s", "speed_um_s_achieved", "degree_per_second",
+                         "degree_per_second_achieved")
+
+    def _scan_header_metadata(self) -> dict:
+        """Export-header metadata of the scan that just ended (see ``HypercubeWriter``):
+        start time, exposure, gain, bin, stage speeds, temperatures, the corrections the
+        frames went through and the frame rate. Missing values are left out."""
+        raw = getattr(self, '_raw_metadata', None) or {}
+        meta = {key: raw[key] for key in self._HEADER_SCAN_KEYS if raw.get(key) is not None}
+        meta.update(self.last_scan_temperatures)
+        try:
+            meta.update(self.preview_thread.correction_info())
+        except Exception:
+            logger.debug("Correction state unavailable for the export header", exc_info=True)
         return meta
 
     # ══════════════════════════════════════════════════════════════
@@ -1317,6 +1337,7 @@ class ScanController:
         if isinstance(getattr(self, '_raw_metadata', None), dict):
             self._raw_metadata.update(self.last_scan_temperatures)
             self._raw_metadata.update(range_metadata)
+        self.last_scan_header = self._scan_header_metadata()
 
         # ── state transition ──────────────────────────────────
         self._set_state(self.PREVIEW)

@@ -91,12 +91,14 @@ class RadiometricIntegration(Integration):
         from modules.radiometric import CalibrationWindow
         self.host.open_widget(CalibrationWindow(), "BSQ Generation (ENVI Input Mode)", None)
 
-    def open_cube(self, cube, wavelengths=None):
-        """Open the calibration window on a scanned cube (Scan window's *Open Calibration*)."""
+    def open_cube(self, cube, wavelengths=None, metadata=None):
+        """Open the calibration window on a scanned cube (Scan window's *Open Calibration*);
+        ``metadata`` (the scan's export-header metadata) is kept in the cubes made from it."""
         try:
             from modules.radiometric import CalibrationWindow
             widget = CalibrationWindow()
-            widget.load_from_memory(cube_array=cube, wavelengths=wavelengths, name="ScanResult")
+            widget.load_from_memory(cube_array=cube, wavelengths=wavelengths, name="ScanResult",
+                                    metadata=metadata)
             self.host.open_widget(widget, "BSQ Generation (Scan Result)", None)
         except Exception as exc:
             logger.exception("Cannot open calibration on the scanned cube")

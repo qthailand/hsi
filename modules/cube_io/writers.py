@@ -53,14 +53,127 @@ TEMPERATURE_HEADER_FIELDS = (
     ('target_temperature_c', 'target temperature'),
 )
 
-def _acquisition_time_utc(config):
+#: Fields describing the raw counts (``camera_bit_info``); dropped once a cube is calibrated.
+#: ``(config key, header field, kind)``.
+COUNT_HEADER_FIELDS = (
+    ('bit_depth', 'data bit depth', int),
+    ('sensor_bit_depth', 'sensor bit depth', int),
+    ('full_scale', 'data full scale', int),
+)
+
+#: Scan settings and the corrections the frames went through (``ScanController.last_scan_header``),
+#: written when present in ``config``: ``(config key, header field, kind)``.  ``bool`` fields are
+#: written ``1``/``0``; a missing key means unknown (e.g. a cube opened from a file without it).
+SCAN_HEADER_FIELDS = (
+    ('exposure_ms', 'exposure time (ms)', float),
+    ('gain', 'sensor gain', float),
+    ('frame_rate_hz', 'frame rate (Hz)', float),
+    ('camera_bin', 'camera bin', int),
+    ('dark_corrected', 'dark corrected', bool),
+    ('hot_pixel_corrected', 'hot pixel corrected', bool),
+    ('hot_pixel_count', 'hot pixel count', int),
+    ('smile_corrected', 'smile corrected', bool),
+    ('smile_model', 'smile model', str),
+    ('stage_type', 'stage type', str),
+    ('speed_um_s', 'linear speed (um/s)', float),
+    ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
+    ('degree_per_second', 'rotation speed (deg/s)', float),
+    ('degree_per_second_achieved', 'rotation speed achieved (deg/s)', float),
+)
+
+
+def _header_fields(counts=True):
+    """Every metadata field in header order: ``(config key, header field, kind)``."""
+    return ((COUNT_HEADER_FIELDS if counts else ())
+            + tuple((key, name, 'temperature') for key, name in TEMPERATURE_HEADER_FIELDS)
+            + SCAN_HEADER_FIELDS)
+
+
+def _format_header_value(value, kind):
+    if kind == 'temperature':
+        return f'{float(value):.2f}'
+    if kind is bool:
+        return '1' if value else '0'
+    if kind is int:
+        return str(int(value))
+    if kind is float:
+        return f'{float(value):.10g}'
+    return str(value).replace('\n', ' ').replace('{', '(').replace('}', ')')
+
+
+def metadata_header_lines(config, counts=True):
+    """``'field = value'`` header lines of the metadata in ``config`` (see :data:`SCAN_HEADER_FIELDS`).
+
+    Args:
+        config: Dict with any of the keys of :data:`COUNT_HEADER_FIELDS`,
+            :data:`TEMPERATURE_HEADER_FIELDS` and :data:`SCAN_HEADER_FIELDS`; ``None`` values
+            and values that do not convert are left out.
+        counts: Include the raw-count fields (bit depths, full scale); ``False`` for a
+            calibrated (reflectance) cube.
+    """
+    lines = []
+    for key, name, kind in _header_fields(counts):
+        value = config.get(key)
+        if value is None:
+            continue
+        try:
+            lines.append(f'{name} = {_format_header_value(value, kind)}')
+        except (TypeError, ValueError):
+            continue
+    return lines
+
+
+def metadata_from_header(meta):
+    """The inverse of :func:`metadata_header_lines`: ``config`` keys from a parsed ENVI header.
+
+    Args:
+        meta: Dict from :func:`modules.cube_io.envi.parse_envi_header` (lower-case keys).
+
+    Returns:
+        dict: The metadata keys present in the header (typed), plus ``started_at`` from
+        ``acquisition time``; unparsable values are left out.
+    """
+    out = {}
+    for key, name, kind in _header_fields():
+        raw = meta.get(name.lower())
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        try:
+            if kind is bool:
+                out[key] = text.lower() in ('1', 'true', 'yes')
+            elif kind is int:
+                out[key] = int(float(text))
+            elif kind in (float, 'temperature'):
+                out[key] = float(text)
+            else:
+                out[key] = text
+        except ValueError:
+            continue
+    if meta.get('acquisition time'):
+        out['started_at'] = str(meta['acquisition time']).strip()
+    return out
+
+
+def carried_header_lines(meta, calibrated):
+    """Header lines that a cube derived from the file of ``meta`` keeps (acquisition time,
+    temperatures, scan settings, corrections; raw-count fields only when not ``calibrated``)."""
+    config = metadata_from_header(meta)
+    lines = [f"acquisition time = {config['started_at']}"] if 'started_at' in config else []
+    return lines + metadata_header_lines(config, counts=not calibrated)
+
+
+def acquisition_time_utc(config):
     """The ENVI ``acquisition time`` (ISO 8601, UTC, ``Z``): the scan's ``started_at``
     from ``config`` when present (an offset-less time is taken as local), else now."""
     when = None
     started = config.get('started_at')
     if started:
         try:
-            when = started if isinstance(started, datetime) else datetime.fromisoformat(str(started))
+            text = str(started).strip()
+            if text.endswith('Z'):                  # Python 3.10 fromisoformat has no 'Z'
+                text = text[:-1] + '+00:00'
+            when = started if isinstance(started, datetime) else datetime.fromisoformat(text)
         except ValueError:
             when = None
     if when is None:
@@ -164,7 +277,9 @@ class HypercubeWriter:
                 :func:`modules.acquisition.camera_bit_info`) are written to the header as
                 ``data bit depth``, ``sensor bit depth`` and ``data full scale``; optional scan
                 temperatures (°C, see :data:`TEMPERATURE_HEADER_FIELDS`) as ``sensor temperature
-                start/end/min/max``, ``dark temperature`` and ``target temperature``.
+                start/end/min/max``, ``dark temperature`` and ``target temperature``; optional
+                scan settings and corrections (:data:`SCAN_HEADER_FIELDS`: exposure, gain, frame
+                rate, bin, dark / hot-pixel / smile corrected, smile model, stage speeds).
             fsync: Accepted for API symmetry; currently unused.
             hypercube: Band-first ``(wavelength, slit, scan)`` array, kept by
                 reference.  The header's ``data type`` and ``byte order`` follow its dtype.
@@ -208,7 +323,7 @@ class HypercubeWriter:
                     percents = int(((i + 1) / bip.shape[0]) * 100)
                     self.progress(percents)
 
-            acquisition = _acquisition_time_utc(self.config)
+            acquisition = acquisition_time_utc(self.config)
 
             with open(f'{self.save_path}.hdr', "w", encoding='utf-8', newline='\n') as file:
                 file.write('ENVI\n')
@@ -220,13 +335,8 @@ class HypercubeWriter:
                 file.write(f'lines = {lines}\n')
                 file.write(f'samples = {samples}\n')
                 file.write(f'bands = {bands}\n')
-                for key, name in (('bit_depth', 'data bit depth'), ('sensor_bit_depth', 'sensor bit depth'),
-                                  ('full_scale', 'data full scale')):
-                    if self.config.get(key) is not None:
-                        file.write(f'{name} = {int(self.config[key])}\n')
-                for key, name in TEMPERATURE_HEADER_FIELDS:
-                    if self.config.get(key) is not None:
-                        file.write(f'{name} = {float(self.config[key]):.2f}\n')
+                for line in metadata_header_lines(self.config):
+                    file.write(line + '\n')
                 file.write('wavelength units = Nanometers\n')
                 file.write('wavelength = {%s}\n' % ', '.join(np.asarray(self.linear_spectrum).astype('str').tolist()))
             return float(np.round(time.time() - t0, 2))

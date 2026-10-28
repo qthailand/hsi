@@ -506,6 +506,32 @@ class AcquisitionEngine:
         with self._lock:
             self._pending_resolution_reload = True
 
+    def correction_info(self) -> dict:
+        """Corrections applied to the last processed frame, and the camera frame rate.
+
+        Read at the end of a scan for the cube's export header (any thread; plain reads).
+
+        Returns:
+            dict: ``dark_corrected``, ``hot_pixel_corrected``, ``smile_corrected`` (bools),
+            ``hot_pixel_count`` and ``smile_model`` (file name) when they apply, and
+            ``frame_rate_hz``.  The correction keys are left out when no frame was processed
+            yet or the frame was a dark-capture frame (unknown).
+        """
+        info = {} if self._camera_hz is None else {"frame_rate_hz": self._camera_hz}
+        status = self._last_correction_status
+        if status is None or status[0]:
+            return info
+        _, enabled, _, matches, model_id, smile_path, _, smile_error = status
+        hot = getattr(self.backend, '_hot_coords', None)
+        info["dark_corrected"] = bool(enabled and matches)
+        info["hot_pixel_corrected"] = bool(enabled and hot is not None)
+        if info["hot_pixel_corrected"]:
+            info["hot_pixel_count"] = int(len(hot))
+        info["smile_corrected"] = bool(model_id != id(None) and not smile_error)
+        if info["smile_corrected"] and smile_path:
+            info["smile_model"] = Path(smile_path).name
+        return info
+
     def binning_info(self) -> dict:
         """Bin width the binner uses at the current setting, and where it comes from.
 

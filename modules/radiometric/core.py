@@ -20,7 +20,9 @@ Data conventions:
     * Cubes written by ``create_datacube_logic`` / ``create_datacube_resampled_logic``
       are ENVI BIP files, ``(lines, samples, bands)`` little-endian, float32 when a
       calibration is applied, otherwise the input's dtype (integers rounded and
-      clipped to its range), with a ``<save_path>.hdr`` text header (wavelengths in nm).
+      clipped to its range), with a ``<save_path>.hdr`` text header (wavelengths in nm)
+      that keeps the source's acquisition time, temperatures, scan settings and
+      corrections (``carried_header_lines``; bit depth / full scale only uncalibrated).
     * The temporary cubes of ``build_raw_cube_tmp`` / ``build_cal_cube_tmp`` are
       header-less band-stacked memmaps of shape ``(lines * bands, samples)``:
       element ``[y + b * lines, x]`` is pixel ``(y, x)`` of band ``b``.
@@ -50,6 +52,7 @@ import pandas as pd
 from scipy.interpolate import CubicSpline
 from scipy.signal import savgol_filter
 from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, envi_dtype
+from modules.cube_io.writers import carried_header_lines
 
 #: Reflectance tables of the reference targets (Spectralon, PVC, ...): Excel sheets without
 #: header, column 0 wavelength (nm), column 1 reflectance. Drop a new file here to offer it.
@@ -292,6 +295,8 @@ def create_datacube_logic(params, progress_callback=None):
         hopen.write(f'data type = {out_dt}\n')
         hopen.write('interleave = bip\n')
         hopen.write('byte order = 0\n')
+        for line in carried_header_lines(raw_meta, calibrated=is_cal):
+            hopen.write(line + '\n')
         hopen.write('wavelength units = Nanometers\n')
         if is_wavelength and raw_meta.get('wavelength') is not None:
             wl_str = ','.join([str(item) for item in raw_meta['wavelength']])
@@ -354,6 +359,8 @@ def create_datacube_resampled_logic(params, progress_callback=None):
         hopen.write(f'data type = {out_dt}\n')
         hopen.write('interleave = bip\n')
         hopen.write('byte order = 0\n')
+        for line in carried_header_lines(raw_meta, calibrated=is_cal):
+            hopen.write(line + '\n')
         hopen.write('wavelength units = Nanometers\n')
         if is_wavelength:
             wl_str = ','.join(f"{float(v):.2f}" for v in lam_target)

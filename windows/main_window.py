@@ -34,7 +34,7 @@ from PyQt5.QtGui import QPixmap, QColor, QIcon, QBrush
 import qtawesome as qta
 
 from config import load_app_config
-from modules.cube_io import as_analysis_cube, envi_value_fields, load_envi_cube_for_viewer
+from modules.cube_io import as_analysis_cube, envi_scan_metadata, envi_value_fields, load_envi_cube_for_viewer
 from modules.ui_kit.title_bar import IOSTitleBar
 from modules.ui_kit import theme
 from windows.scan_window import ScanWindow
@@ -275,7 +275,9 @@ class MainWindow(QMainWindow):
         from windows.integrations import RadiometricIntegration
         for integration in self.integrations:
             if isinstance(integration, RadiometricIntegration):
-                scan.calibration_requested.connect(integration.open_cube)
+                scan.calibration_requested.connect(
+                    lambda cube, wl, integration=integration: integration.open_cube(
+                        cube, wl, metadata=self._scan_export_metadata()))
         try:
             scan.controller = ScanController(scan, config=self.config,
                                              persist_settings=self.persist_settings)
@@ -324,26 +326,28 @@ class MainWindow(QMainWindow):
                 title=f"ENVI Cube {Path(path).name}",
                 source_path=path,
                 header_values=envi_value_fields(path),
+                camera_bits=envi_scan_metadata(path),     # kept by a re-export
             )
         except Exception as e:
             logger.exception("Failed to open ENVI cube: %s", e)
             QMessageBox.critical(self, "Open ENVI Failed", str(e))
 
-    def _create_scan_cube_viewer(self, cube, wavelengths=None):
-        """Open a viewer for the cube just scanned, carrying the camera's bit depth and the scan's
-        temperatures (``ScanController.last_scan_temperatures``) and start time to its export header."""
+    def _scan_export_metadata(self):
+        """The camera's bit depth and the last scan's metadata (``ScanController.last_scan_header``:
+        start time, exposure, gain, temperatures, corrections, ...) for export headers, or None."""
+        if self.scan_controller is None:
+            return None
         camera_bits = None
-        if self.scan_controller is not None:
-            try:
-                from modules.acquisition import camera_bit_info
-                camera_bits = camera_bit_info(self.scan_controller.backend)
-            except Exception:
-                logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
-            camera_bits = {**(camera_bits or {}), **self.scan_controller.last_scan_temperatures}
-            started_at = (getattr(self.scan_controller, '_raw_metadata', None) or {}).get('started_at')
-            if started_at:
-                camera_bits['started_at'] = started_at     # the header's acquisition time
-        self.create_cube_viewer(cube, wavelengths, camera_bits=camera_bits)
+        try:
+            from modules.acquisition import camera_bit_info
+            camera_bits = camera_bit_info(self.scan_controller.backend)
+        except Exception:
+            logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
+        return {**(camera_bits or {}), **self.scan_controller.last_scan_header}
+
+    def _create_scan_cube_viewer(self, cube, wavelengths=None):
+        """Open a viewer for the cube just scanned, carrying the scan's metadata to its export header."""
+        self.create_cube_viewer(cube, wavelengths, camera_bits=self._scan_export_metadata())
 
     def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None,
                            header_values=None):
