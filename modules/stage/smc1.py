@@ -10,6 +10,11 @@ Data conventions:
     (50 steps per mm), distances in mm, speed in mm/s. After every move ``Position`` and
     ``uPosition`` hold the controller's reported position.
 
+    A speed is written as whole steps/s (``Speed``) plus the fraction in microsteps/s of
+    the engine's microstep mode (``uSpeed``), see :mod:`modules.stage.speed`. Every speed
+    setter reads the move settings back and returns the speed the controller runs (also
+    ``speed_steps_s``, full steps/s).
+
 Threading:
     A driver is not thread-safe. Motion calls block until the stage stops; to interrupt
     from another thread, call ``_axis.command_stop()`` (as ``StageSequence.request_stop``
@@ -27,9 +32,14 @@ Example:
 import libximc.highlevel as ximc
 from ctypes import *
 import glob
+import logging
 import os
 import time
 import math
+
+from .speed import MAX_SPEED_STEPS_S, decode_speed, encode_speed, microsteps_per_step
+
+logger = logging.getLogger(__name__)
 
 #: Stable links to USB serial devices on Linux; an XIMC controller's link names it.
 _SERIAL_BY_ID = "/dev/serial/by-id"
@@ -65,6 +75,43 @@ def _find_device_uri(device: str = "") -> str:
     raise RuntimeError("No XIMC stage detected; check stage power and USB connection, or set "
                        f"stage_device in config/scan.json (e.g. a {_SERIAL_BY_ID}/... path).{found}")
 
+
+def _rpm_limit_steps_s(engine) -> float:
+    """The engine's nominal speed (full steps/s) if the controller holds the motor below it
+    (``ENGINE_LIMIT_RPM``), else infinity."""
+    if not int(engine.EngineFlags) & int(ximc.EngineFlags.ENGINE_LIMIT_RPM):
+        return math.inf
+    return decode_speed(engine.NomSpeed, getattr(engine, "uNomSpeed", 0),
+                        microsteps_per_step(engine.MicrostepMode))
+
+
+def _put_speed(engine, move_settings, steps_s):
+    """Write ``steps_s`` (full steps/s) into ``move_settings.Speed``/``uSpeed`` for the
+    engine's microstep mode, clamped to ``MAX_SPEED_STEPS_S`` and the engine's speed limit."""
+    move_settings.Speed, move_settings.uSpeed = encode_speed(
+        steps_s, microsteps_per_step(engine.MicrostepMode),
+        min(MAX_SPEED_STEPS_S, _rpm_limit_steps_s(engine)))
+
+
+def _send_move_settings(stage, steps_s) -> float:
+    """Send ``stage._mvst``, read the settings back and return the full steps/s they run.
+
+    Sets ``stage.speed_steps_s``; ``steps_s`` is the requested speed (for the log). A
+    controller that stores other ``Speed``/``uSpeed`` values than sent is logged as a
+    warning; the returned speed is always the read-back one.
+    """
+    sent = (stage._mvst.Speed, stage._mvst.uSpeed)
+    stage._axis.set_move_settings(stage._mvst)
+    stage.sync_speed()
+    read = (stage._mvst.Speed, stage._mvst.uSpeed)
+    if read != sent:
+        logger.warning("Controller stored Speed %d, uSpeed %d instead of %d, %d", *read, *sent)
+    microsteps = microsteps_per_step(stage._engine.MicrostepMode)
+    stage.speed_steps_s = min(decode_speed(*read, microsteps), _rpm_limit_steps_s(stage._engine))
+    logger.info("Stage speed: requested %.6g steps/s, runs %.6g steps/s (Speed %d, uSpeed %d/%d)",
+                steps_s, stage.speed_steps_s, *read, microsteps)
+    return stage.speed_steps_s
+
 # FULL STEP 0.02°
 # MIN 1/8 STEP 0.0025°
 
@@ -96,6 +143,8 @@ class Stage8SMC1:
         self.device_id = None
         self._opened = False
         self._enum = None
+        self._engine = None
+        self.speed_steps_s = None   # full steps/s the controller runs (read back), set by speed setters
 
         self.degree_per_step = 0.02
 
@@ -201,6 +250,7 @@ class Stage8SMC1:
         self._ensure_open()
         if self._engine is None:
             raise RuntimeError(f"get_engine_settings failed")
+        # speed.ROTATION_MICROSTEPS (the 0.01 deg/s speed resolution) assumes this mode.
         self._engine.MicrostepMode = ximc.MicrostepMode.MICROSTEP_MODE_FRAC_2
         self._axis.set_engine_settings(self._engine)
         self._engine = self._axis.get_engine_settings()
@@ -232,18 +282,23 @@ class Stage8SMC1:
             raise RuntimeError(f"get_move_settings failed")
 
     def set_speed(self, speed):
-        """Set the move speed in raw controller units (steps per second).
+        """Set the move speed in raw controller units (full steps per second).
 
         Args:
-            speed: Steps per second; truncated to int and capped at 1000.
+            speed: Full steps per second, written as ``Speed`` plus ``uSpeed`` to the nearest
+                microstep per second; clamped to one microstep/s .. ``MAX_SPEED_STEPS_S``
+                with a logged warning (see :func:`modules.stage.speed.encode_speed`).
+
+        Returns:
+            float: Full steps per second the controller runs (read back; ``speed_steps_s``).
 
         Raises:
-            RuntimeError: not open (or move settings were never read).
+            RuntimeError: not open (or engine/move settings were never read).
+            ValueError: ``speed`` is negative.
         """
         self._ensure_open()
-        speed = min(int(speed), 1000)
-        self._mvst.Speed = speed
-        self._axis.set_move_settings(self._mvst)
+        _put_speed(self._engine, self._mvst, speed)
+        return _send_move_settings(self, speed)
 
     def set_position(self, position, uPosition=0, wait_timeout_ms=10):
         """Move to an absolute position and block until the stage stops.
@@ -283,31 +338,33 @@ class Stage8SMC1:
 
         Args:
             degree: Target angle in degrees from the zero position (converted with
-                ``DEGREEPERSTEP``; the step count is truncated to an integer).
+                ``DEGREEPERSTEP`` and rounded to the nearest step: 2.3 deg is 115 steps).
 
         Raises:
             RuntimeError: not open.
         """
-        steps = degree/self.DEGREEPERSTEP
-        self.set_position(steps)
+        self.set_position(round(degree / self.DEGREEPERSTEP))
 
     def set_speed_dps(self, degree_per_second: float,
                       accel_dps2: float | None = None,
-                      decel_dps2: float | None = None) -> None:
+                      decel_dps2: float | None = None) -> float:
 
         """Set the rotation speed and optionally the acceleration/deceleration.
 
         Args:
-            degree_per_second: Speed in degrees per second, 0 to 20 inclusive. The
-                whole-step part is written to ``Speed``; the microstep fraction is not
-                applied (``uSpeed`` is set to 0).
+            degree_per_second: Speed in degrees per second, 0 to 20 inclusive. Written as
+                whole steps/s (``Speed``) plus half steps (``uSpeed``; the engine runs at
+                1/2 microsteps), so the stage runs the nearest multiple of 0.01 deg/s; a
+                positive speed below that runs at 0.01 deg/s (logged warning).
             accel_dps2: Acceleration in degrees per second squared, or ``None`` to keep it.
             decel_dps2: Deceleration in degrees per second squared, or ``None`` to keep it.
 
+        Returns:
+            float: Degrees per second the controller runs (read back).
+
         Raises:
             RuntimeError: not open, or engine/move settings were never read.
-            ValueError: a value is negative, or ``degree_per_second`` exceeds 20 (the
-                message wording says "higher than 20" but the check rejects values above 20).
+            ValueError: a value is negative, or ``degree_per_second`` exceeds 20.
         """
         self._ensure_open()
         if self._engine is None:
@@ -317,24 +374,15 @@ class Stage8SMC1:
         if degree_per_second < 0:
             raise ValueError("degree_per_second must be non-negative")
         if degree_per_second > 20:
-            raise ValueError("degree_per_second must be higher than 20")
+            raise ValueError("degree_per_second must not exceed 20")
 
         steps_per_rev = self.STEPPERSTAGE
         if steps_per_rev <= 0:
             raise RuntimeError("Invalid StepsPerRev from controller")
 
-        # 2) แปลง deg/s -> steps/s
+        # 2) แปลง deg/s -> steps/s; Speed = full steps/s, uSpeed = เศษในหน่วย microstep
         speed_steps_per_s = degree_per_second / 360.0 * steps_per_rev
-
-        fullSpeed = math.floor(speed_steps_per_s)
-        micrSpeed = round((speed_steps_per_s - fullSpeed) * 256)
-
-        print("Fraction Speed", speed_steps_per_s)
-        print("Speed", fullSpeed)
-        print("Micro Speed", micrSpeed)
-        # Speed ใช้หน่วย full-steps/s
-        self._mvst.Speed = fullSpeed
-        self._mvst.uSpeed = 0
+        _put_speed(self._engine, self._mvst, speed_steps_per_s)
 
         if accel_dps2 is not None:
             if accel_dps2 < 0:
@@ -348,9 +396,7 @@ class Stage8SMC1:
             # Decel ใน libximc ใช้หน่วย steps/s^2
             self._mvst.Decel = int(round(decel_dps2 / 360.0 * steps_per_rev))
 
-        self._axis.set_move_settings(self._mvst)
-        print("moving Speed")
-        print(self._mvst)
+        return _send_move_settings(self, speed_steps_per_s) * 360.0 / steps_per_rev
 
     def ramp_times_s(self):
         """Seconds to reach the set speed and to stop from it; see :func:`_ramp_times_s`."""
@@ -389,6 +435,8 @@ class Stage8SMC1Linear:
         self.device_id = None
         self._opened = False
         self._enum = None
+        self._engine = None
+        self.speed_steps_s = None   # full steps/s the controller runs (read back), set by speed setters
 
         # conversion
         self.steps_per_mm = self.STEPS_PER_MM
@@ -410,9 +458,9 @@ class Stage8SMC1Linear:
     def open(self):
         """Connect to ``device`` (or the XIMC device found) and read its settings (no-op if open).
 
-        Reads move settings and position; the engine settings are left as configured on
-        the controller. Prints progress. If any step fails the device is closed again
-        before the error propagates.
+        Reads engine settings (microstep mode, for the speed fraction), move settings and
+        position; the engine settings are left as configured on the controller. Prints
+        progress. If any step fails the device is closed again before the error propagates.
 
         Raises:
             RuntimeError: no XIMC stage detected, or a settings/position read failed.
@@ -433,6 +481,7 @@ class Stage8SMC1Linear:
             self.close()
             raise
         try:
+            self.sync_engine()
             self.sync_speed()
             self.sync_position()
         except Exception:
@@ -502,10 +551,19 @@ class Stage8SMC1Linear:
 
         print(self._positions)
 
+    def sync_engine(self):
+        """Read the engine settings (microstep mode, speed limit) into the driver.
+
+        Raises:
+            RuntimeError: not open, or the controller returned no engine settings.
+        """
+        self._ensure_open()
+        self._engine = self._axis.get_engine_settings()
+        if self._engine is None:
+            raise RuntimeError(f"get_engine_settings failed")
+
     def sync_speed(self):
         """Read the controller's move settings (speed, acceleration) into the driver.
-
-        Prints the settings.
 
         Raises:
             RuntimeError: not open, or the controller returned no move settings.
@@ -514,24 +572,27 @@ class Stage8SMC1Linear:
         self._mvst = self._axis.get_move_settings()
         if self._mvst is None:
             raise RuntimeError(f"get_move_settings failed")
-        print("Origial Move Settings")
-        print(self._mvst)
+        logger.debug("Move settings: %s", self._mvst)
 
     def set_speed(self, speed):
-        """Set the move speed in raw controller units (steps per second).
+        """Set the move speed in raw controller units (full steps per second).
 
         Args:
-            speed: Steps per second; truncated to int and capped at 1000.
+            speed: Full steps per second, written as ``Speed`` plus ``uSpeed`` to the nearest
+                microstep per second of the engine's microstep mode; clamped to one
+                microstep/s .. ``MAX_SPEED_STEPS_S`` (20 mm/s) with a logged warning (see
+                :func:`modules.stage.speed.encode_speed`).
+
+        Returns:
+            float: Full steps per second the controller runs (read back; ``speed_steps_s``).
 
         Raises:
-            RuntimeError: not open (or move settings were never read).
+            RuntimeError: not open (or engine/move settings were never read).
+            ValueError: ``speed`` is negative.
         """
         self._ensure_open()
-        speed = min(int(speed), 1000)
-        self._mvst.Speed = speed
-        self._axis.set_move_settings(self._mvst)
-        print("Current Move Settings")
-        print(self._mvst)
+        _put_speed(self._engine, self._mvst, speed)
+        return _send_move_settings(self, speed)
 
     def get_position_mm(self) -> float:
         """Return current position in mm (based on Position only)."""
@@ -590,13 +651,13 @@ class Stage8SMC1Linear:
         """Your reverse direction wrapper."""
         return self.move_by_mm(-mm, wait_timeout_ms=wait_timeout_ms)
 
-    def set_speed_mm_s(self, mm_s: float):
+    def set_speed_mm_s(self, mm_s: float) -> float:
+        """Set the speed in mm/s (50 steps/mm: steps/s = mm/s * 50; see :meth:`set_speed`).
+
+        Returns:
+            float: Millimetres per second the controller runs (read back).
         """
-        Convenience: set speed in mm/s assuming Speed unit is steps/s.
-        With your calibration: 50 steps/mm => steps/s = mm/s * 50.
-        """
-        steps_s = mm_s * self.steps_per_mm
-        self.set_speed(steps_s)
+        return self.set_speed(mm_s * self.steps_per_mm) / self.steps_per_mm
 
     def ramp_times_s(self):
         """Seconds to reach the set speed and to stop from it; see :func:`_ramp_times_s`."""
@@ -615,9 +676,8 @@ def _ramp_times_s(axis, move_settings):
     engine = axis.get_engine_settings()
     if not int(engine.EngineFlags) & int(ximc.EngineFlags.ENGINE_ACCEL_ON):
         return 0.0, 0.0
-    # MicrostepMode 1 = full step, 2 = 1/2, 3 = 1/4 ... 9 = 1/256
-    microsteps = 2 ** max(int(engine.MicrostepMode) - 1, 0)
-    speed = move_settings.Speed + move_settings.uSpeed / microsteps
+    speed = decode_speed(move_settings.Speed, move_settings.uSpeed,
+                         microsteps_per_step(engine.MicrostepMode))
     accel, decel = move_settings.Accel, move_settings.Decel
     return (speed / accel if accel > 0 else 0.0), (speed / decel if decel > 0 else 0.0)
 

@@ -1198,7 +1198,20 @@ class ScanController:
             # it accelerates are not recorded at all (nor shown in the live preview).
             start_ns = self.stage.steady_window()[0] if self.stage is not None else None
             self._set_recording(True, start_ns)
-            self.win.start_scan_clock()         # status line: elapsed / expected move time
+            # status line: elapsed / expected move time, at the speed the stage runs
+            self.win.start_scan_clock(self._note_achieved_speed())
+
+    def _note_achieved_speed(self):
+        """Store the scan speed the stage runs (read back from the controller once it set the
+        scan speed) in the scan metadata next to the requested one, and return it (µm/s for
+        the linear stage, deg/s for rotation), or ``None`` if the stage did not report it."""
+        if self.stage is None:
+            return None
+        key = "speed_um_s_achieved" if self.stage.stage_type == "linear" else "degree_per_second_achieved"
+        achieved = getattr(self.stage, key, None)
+        if achieved is not None and isinstance(getattr(self, '_raw_metadata', None), dict):
+            self._raw_metadata[key] = achieved
+        return achieved
 
     def on_stage_finished(self):
         # v1 behavior: build the cube as soon as the scan move ends (endpoint or

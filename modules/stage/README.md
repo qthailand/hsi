@@ -8,6 +8,8 @@ Motorised stage for pushbroom scanning: Standa/XIMC **8SMC1** rotation and linea
   with callbacks. Usable from scripts and any GUI toolkit.
 * `StageThread` (`thread.py`) - the same sequence on a `QThread` with signals.
 * `Stage8SMC1` / `Stage8SMC1Linear` (`smc1.py`) - the drivers over `libximc`.
+* `speed.py` - how a speed is encoded for the controller (no SDK needed; used by the
+  drivers and the scan window).
 
 Importing `modules.stage` does not import PyQt5 or `libximc`; both are loaded lazily.
 
@@ -78,6 +80,39 @@ unopened driver with `open/close/set_position/set_speed...`).
 * `on_after` fires as soon as the scan move ends (or is stopped), so the cube can be
   built before the stage has returned home. A return-home failure does not invalidate
   that data.
+* Rotation moves (`set_degree`) round to the nearest full step (2.3 deg = 115 steps).
+
+## Speed resolution
+
+The controller takes a speed as whole full steps/s (`Speed`) plus a fraction in
+microsteps/s of the engine's microstep mode (`uSpeed`). The drivers write the nearest
+microstep (`speed.encode_speed`; a fraction that rounds up to a whole step carries into
+`Speed`), read the move settings back, and return the speed the controller runs.
+
+| Stage | 1 full step | Microstep mode | Speed resolution |
+|-------|-------------|----------------|------------------|
+| Linear | 20 µm | as configured on the controller, read when the driver opens | 20 µm/s ÷ microsteps per step: 0.078 µm/s at 1/256, 10 µm/s at 1/2 |
+| Rotation | 0.02 deg | 1/2, set by the driver | 0.01 deg/s |
+
+* Limits: at most `MAX_SPEED_STEPS_S` = 1000 full steps/s (linear 20 mm/s, rotation
+  20 deg/s), or the engine's nominal speed if the controller limits to it
+  (`ENGINE_LIMIT_RPM`). A faster request is clamped and a positive speed below one
+  microstep/s is raised to one microstep, both with a logged warning. `set_speed_dps`
+  rejects more than 20 deg/s (`ValueError`).
+* Before this, the fraction was dropped: the linear stage ran 150 µm/s at 140 (-6.7 %),
+  250 at 240, and anything below 20 µm/s at 0; rotation ran 0.03 deg/s at 0.02.
+* The speed actually run: `set_speed` returns full steps/s (also `speed_steps_s`),
+  `set_speed_mm_s` mm/s, `set_speed_dps` deg/s, all from the controller's read-back.
+  `StageSequence.speed_um_s_achieved` / `degree_per_second_achieved` hold it for the scan
+  move (`None` with a driver that returns nothing, e.g. a test fake).
+* The scan window stores it in the raw spectrogram metadata as `speed_um_s_achieved` /
+  `degree_per_second_achieved` next to the requested `speed_um_s` / `degree_per_second`,
+  times the expected scan duration with it, and shows `(stage runs ...)` in the cube
+  preview title when it differs from the entered speed. Its rotation speed box takes
+  0.01..20 deg/s with two decimals (what the stage runs); the linear box takes up to
+  20000 µm/s.
+* Speed calibration (scan/slit stretch W/H from Check Circle / Check Square): correct the
+  achieved speed, `new speed = achieved speed × W/H`.
 
 ## API summary
 
@@ -88,8 +123,10 @@ unopened driver with `open/close/set_position/set_speed...`).
 | `.run()` | execute (blocking, never raises; failures go to `on_error`) |
 | `.request_stop(return_home=True)` | interrupt; `False` aborts without homing (shutdown only) |
 | `StageThread` signals | `stagebefore`, `stageafter`, `returned_home`, `error(str)` |
-| `Stage8SMC1` | `open/close`, `set_speed_dps`, `set_degree`, `set_position[_r]`, `zero` |
-| `Stage8SMC1Linear` | `open/close`, `move_to_mm`, `move_by_mm`, `set_speed_mm_s`, `get_position_mm`, `set_position[_r]` |
+| `.speed_um_s_achieved`, `.degree_per_second_achieved` | scan speed the controller runs (read back) |
+| `Stage8SMC1` | `open/close`, `set_speed[_dps]`, `set_degree`, `set_position[_r]`, `zero`, `speed_steps_s` |
+| `Stage8SMC1Linear` | `open/close`, `move_to_mm`, `move_by_mm`, `set_speed[_mm_s]`, `get_position_mm`, `set_position[_r]`, `speed_steps_s` |
+| `speed.encode_speed` / `decode_speed` | steps/s <-> `(Speed, uSpeed)` for a microstep mode |
 
 ## Threading
 
@@ -104,4 +141,6 @@ worker thread and delivered queued to GUI receivers.
 PYTHONUTF8=1 python -m pytest -q tests/test_stage_failures.py
 ```
 
-The tests use a fake stage through `stage_factory`, so no hardware is needed.
+The tests use a fake stage through `stage_factory`, and the speed tests import the real
+drivers over a fake `libximc` that records the `Speed`/`uSpeed` written, so no hardware
+or SDK is needed.

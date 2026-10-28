@@ -40,6 +40,10 @@ class StageSequence:
         degree: Rotation angle of the scan move (rotation stage).
         distance_mm: Travel of the scan move (linear stage).
         speed_um_s: Speed during the scan (linear stage, micrometres per second).
+        degree_per_second_achieved: Rotation speed the stage runs, as read back from the
+            controller when the scan speed is set (deg/s); ``None`` until then or if the
+            driver does not report it.
+        speed_um_s_achieved: The same for the linear stage (micrometres per second).
         phase: One of ``IDLE, OPENING, HOMING, SCANNING, RETURNING, CLOSING``.
         failed: A hardware or Python error occurred (see ``failed_phase``).
         failed_phase: Phase in which the first failure happened, else ``None``.
@@ -81,6 +85,8 @@ class StageSequence:
         self.degree = 10
         self.distance_mm = 10.0
         self.speed_um_s = 1000.0
+        self.degree_per_second_achieved = None
+        self.speed_um_s_achieved = None
         self._factory = stage_factory
         self._callbacks = (on_before, on_after, on_home, on_error)
         self._stage_ref = None
@@ -176,10 +182,18 @@ class StageSequence:
     # ── motion helpers (worker thread) ───────────────────
 
     def _set_scan_speed(self, stage):
+        # The drivers return the speed the controller runs (read back); fakes return None.
         if self.stage_type == 'linear':
-            stage.set_speed_mm_s(self.speed_um_s / 1000.0)
+            mm_s = stage.set_speed_mm_s(self.speed_um_s / 1000.0)
+            self.speed_um_s_achieved = None if mm_s is None else float(mm_s) * 1000.0
+            requested, achieved, unit = self.speed_um_s, self.speed_um_s_achieved, 'um/s'
         else:
-            stage.set_speed_dps(self.degree_per_second)
+            dps = stage.set_speed_dps(self.degree_per_second)
+            self.degree_per_second_achieved = None if dps is None else float(dps)
+            requested, achieved, unit = self.degree_per_second, self.degree_per_second_achieved, 'deg/s'
+        if achieved is not None:
+            logger.info('Scan speed: requested %.6g %s, stage runs %.6g %s',
+                        requested, unit, achieved, unit)
 
     def _read_ramp_times(self, stage):
         ramp_times = getattr(stage, 'ramp_times_s', None)

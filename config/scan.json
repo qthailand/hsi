@@ -1,6 +1,6 @@
 {
   "stage_type": "rotation",
-  "rotation_speed_dps": 0.2,
+  "rotation_speed_dps": 2.0,
   "rotation_degree": 5.0,
   "linear_distance_mm": 10.0,
   "linear_speed_um_s": 1000.0,

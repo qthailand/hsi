@@ -3,7 +3,12 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import ast
+import copy
+import importlib
+import logging
+import sys
 import threading
+import types
 from PyQt5.QtWidgets import QApplication
 import pytest
 
@@ -204,3 +209,163 @@ def test_controller_return_home_error_keeps_cube(monkeypatch):
     c = _controller(state='PREVIEW'); c.on_stage_error('return failed')
     assert c.state == 'PREVIEW' and 'kept' in c.statuses[-1]
     assert dialogs == [('Stage Error', 'Scan data kept:\nreturn failed')]
+
+
+# ── speed resolution of the XIMC drivers (fake libximc, no hardware) ──
+
+class FakeAxis:
+    """libximc ``Axis`` double: engine/move settings in memory; logs the speeds written
+    (``(Speed, uSpeed)``) and the moves."""
+    engine = dict(MicrostepMode=9, EngineFlags=0, NomSpeed=0, uNomSpeed=0)   # 1/256 microsteps
+    drop_u_speed = False          # a controller that ignores uSpeed
+    created = []
+    def __init__(self, uri):
+        self.written, self.moves = [], []
+        self._engine = SimpleNamespace(**type(self).engine)
+        self._move = SimpleNamespace(Speed=100, uSpeed=0, Accel=500, Decel=500)
+        FakeAxis.created.append(self)
+    def open_device(self): pass
+    def close_device(self): pass
+    def get_engine_settings(self): return copy.copy(self._engine)
+    def set_engine_settings(self, engine): self._engine = copy.copy(engine)
+    def get_move_settings(self): return copy.copy(self._move)
+    def set_move_settings(self, move):
+        self.written.append((move.Speed, move.uSpeed))
+        self._move = copy.copy(move)
+        if self.drop_u_speed: self._move.uSpeed = 0
+    def get_position(self): return SimpleNamespace(Position=0, uPosition=0)
+    def command_move(self, position, u_position): self.moves.append((position, u_position))
+    def command_movr(self, position, u_position): self.moves.append(('r', position, u_position))
+    def command_wait_for_stop(self, ms): pass
+    def command_zero(self): pass
+    def command_stop(self): pass
+
+@pytest.fixture
+def smc1(monkeypatch):
+    """``modules.stage.smc1`` imported over a fake ``libximc.highlevel`` (undone afterwards)."""
+    import modules.stage as stage_package
+    highlevel = types.ModuleType('libximc.highlevel')
+    highlevel.Axis, highlevel.ximc_version = FakeAxis, lambda: 'fake'
+    highlevel.MicrostepMode = SimpleNamespace(MICROSTEP_MODE_FULL=1, MICROSTEP_MODE_FRAC_2=2, MICROSTEP_MODE_FRAC_256=9)
+    highlevel.EngineFlags = SimpleNamespace(ENGINE_ACCEL_ON=0x10, ENGINE_LIMIT_RPM=0x80)
+    highlevel.EnumerateFlags = SimpleNamespace(ENUMERATE_PROBE=1)
+    highlevel.enumerate_devices = lambda flags: []
+    package = types.ModuleType('libximc'); package.highlevel = highlevel
+    monkeypatch.setitem(sys.modules, 'libximc', package)
+    monkeypatch.setitem(sys.modules, 'libximc.highlevel', highlevel)
+    monkeypatch.delitem(sys.modules, 'modules.stage.smc1', raising=False)
+    monkeypatch.delattr(stage_package, 'smc1', raising=False)
+    monkeypatch.setattr(FakeAxis, 'created', [])
+    module = importlib.import_module('modules.stage.smc1')
+    yield module
+    sys.modules.pop('modules.stage.smc1', None)
+    if getattr(stage_package, 'smc1', None) is module: delattr(stage_package, 'smc1')
+
+def _opened(driver):
+    driver = driver(device='xi-emu:///fake'); driver.open(); return driver
+
+def test_speed_encoding_rounds_to_the_nearest_microstep_and_carries():
+    from modules.stage.speed import decode_speed, encode_speed, microsteps_per_step
+    assert [microsteps_per_step(mode) for mode in (1, 2, 4, 9)] == [1, 2, 8, 256]
+    assert encode_speed(7.5, 256) == (7, 128) and encode_speed(7.5, 1) == (8, 0)
+    assert encode_speed(7.999, 256) == (8, 0) and encode_speed(7.8, 2) == (8, 0)      # carry into Speed
+    assert encode_speed(0, 256) == (0, 0) and decode_speed(7, 128, 256) == 7.5
+    with pytest.raises(ValueError): encode_speed(-1, 256)
+
+@pytest.mark.parametrize('mode, microsteps', [(9, 256), (4, 8), (2, 2)])
+def test_linear_speed_keeps_the_fraction_of_a_step(smc1, monkeypatch, mode, microsteps):
+    monkeypatch.setattr(FakeAxis, 'engine', {**FakeAxis.engine, 'MicrostepMode': mode})
+    stage = _opened(smc1.Stage8SMC1Linear)
+    assert stage.set_speed_mm_s(0.150) == pytest.approx(0.150)       # 7.5 steps/s; ran at 140 um/s
+    assert stage._axis.written[-1] == (7, microsteps // 2) and stage.speed_steps_s == 7.5
+    assert stage.set_speed_mm_s(0.250) == pytest.approx(0.250)       # ran at 240 um/s
+    assert stage._axis.written[-1] == (12, microsteps // 2)
+
+def test_rotation_speed_keeps_its_half_step(smc1):
+    from modules.stage.speed import ROTATION_MICROSTEPS, microsteps_per_step
+    stage = _opened(smc1.Stage8SMC1)
+    assert microsteps_per_step(stage._axis.get_engine_settings().MicrostepMode) == ROTATION_MICROSTEPS
+    assert stage.set_speed_dps(0.03) == pytest.approx(0.03)          # 1.5 steps/s; ran at 0.02 deg/s
+    assert stage._axis.written[-1] == (1, 1)
+    assert stage.set_speed(7.8) == 8.0 and stage._axis.written[-1] == (8, 0)   # rounds up into Speed
+
+def test_speed_limits_are_clamped_with_a_warning(smc1, monkeypatch, caplog):
+    stage = _opened(smc1.Stage8SMC1Linear)
+    with caplog.at_level(logging.WARNING):
+        assert stage.set_speed_mm_s(30.0) == 20.0                    # 1000 steps/s
+    assert stage._axis.written[-1] == (1000, 0) and 'clamped' in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        stage.set_speed_mm_s(1e-6)                                   # below one microstep per second
+    assert stage._axis.written[-1] == (0, 1) and 'raised' in caplog.text
+    rotation = _opened(smc1.Stage8SMC1)
+    assert rotation.set_speed_dps(0.001) == pytest.approx(0.01) and rotation._axis.written[-1] == (0, 1)
+    with pytest.raises(ValueError): rotation.set_speed_dps(20.5)
+    monkeypatch.setattr(FakeAxis, 'engine', {**FakeAxis.engine, 'EngineFlags': 0x80, 'NomSpeed': 400})
+    limited = _opened(smc1.Stage8SMC1Linear)                         # controller holds the motor below NomSpeed
+    assert limited.set_speed(500) == 400 and limited._axis.written[-1] == (400, 0)
+
+def test_the_speed_reported_is_the_controllers_read_back(smc1, monkeypatch, caplog):
+    monkeypatch.setattr(FakeAxis, 'drop_u_speed', True)
+    stage = _opened(smc1.Stage8SMC1Linear)
+    with caplog.at_level(logging.WARNING):
+        assert stage.set_speed_mm_s(0.150) == pytest.approx(0.140)
+    assert stage._axis.written[-1] == (7, 128) and 'instead of' in caplog.text
+
+def test_set_degree_rounds_to_the_nearest_step(smc1):
+    stage = _opened(smc1.Stage8SMC1)
+    stage.set_degree(2.3)                                            # 114.99999999999999 steps
+    assert stage._axis.moves[-1] == (115, 0)
+
+@pytest.mark.parametrize('stage_type', ['linear', 'rotation'])
+def test_sequence_reports_the_speed_the_driver_runs(smc1, stage_type):
+    from modules.stage.sequence import StageSequence
+    driver = smc1.Stage8SMC1Linear if stage_type == 'linear' else smc1.Stage8SMC1
+    seq = StageSequence(stage_type, stage_factory=lambda: driver(device='xi-emu:///fake'))
+    seq.distance_mm, seq.speed_um_s, seq.degree, seq.degree_per_second = 5.0, 150.0, 30, 0.03
+    seq.run()
+    axis = FakeAxis.created[-1]
+    assert seq.completed
+    if stage_type == 'linear':
+        assert seq.speed_um_s_achieved == pytest.approx(150.0) and seq.degree_per_second_achieved is None
+        assert axis.written == [(500, 0), (7, 128), (7, 128)]        # homing, scan, return at scan speed
+        assert axis.moves == [(0, 0), ('r', -250, 0), (0, 0)]
+    else:
+        assert seq.degree_per_second_achieved == pytest.approx(0.03) and seq.speed_um_s_achieved is None
+        assert axis.written == [(500, 0), (1, 1), (1, 1)]
+        assert axis.moves == [(0, 0), (1500, 0), (0, 0)]
+
+def test_scan_metadata_and_clock_carry_the_speed_the_stage_runs():
+    from modules.stage.sequence import StageSequence
+    c = controller_methods()(); c.SCANNING = 'SCANNING'; c.state = 'SCANNING'; c.enable_cube_preview = False
+    c.preview_thread = SimpleNamespace(set_recording=lambda *a, **kw: None, live_recorded_frames=lambda: [])
+    clocks = []; c.win = SimpleNamespace(start_scan_clock=clocks.append)
+    c._raw_metadata = {'stage_type': 'linear', 'speed_um_s': 150.0}
+    c.stage = StageSequence('linear'); c.stage.speed_um_s_achieved = 140.0
+    c.on_stage_started()
+    assert c._raw_metadata == {'stage_type': 'linear', 'speed_um_s': 150.0, 'speed_um_s_achieved': 140.0}
+    c._raw_metadata = {'stage_type': 'rotation', 'degree_per_second': 0.03}
+    c.stage = StageSequence('rotation'); c.stage.degree_per_second_achieved = 0.03
+    c.on_stage_started()
+    assert c._raw_metadata['degree_per_second_achieved'] == 0.03
+    c.stage = StageSequence('rotation'); c._raw_metadata = {}       # driver without a read-back
+    c.on_stage_started()
+    assert c._raw_metadata == {} and clocks == [140.0, 0.03, None]
+
+def test_scan_window_runs_the_stage_speed_steps_and_times_the_achieved_speed(monkeypatch):
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    rotation = win.degree_per_second_spin
+    assert (rotation.minimum(), rotation.maximum(), rotation.decimals()) == (0.01, 20.0, 2)
+    rotation.setValue(0.033); assert rotation.value() == 0.03       # what the stage can run
+    assert win.speed_um_s_spin.maximum() == 20000.0
+    monkeypatch.setattr(win, 'stage_type', lambda: 'linear')
+    win.distance_mm_spin.setValue(15.0); win.speed_um_s_spin.setValue(150.0)
+    win.set_scanning(True); win.start_scan_clock(140.0)             # the stage reported 140 um/s
+    assert win._scan_clock[1] == pytest.approx(15.0 / 0.140)
+    assert win.cube_preview_group.title().endswith('15.000 mm @ 150 µm/s (stage runs 140.000 µm/s)')
+    win.start_scan_clock(150.0)
+    assert win.cube_preview_group.title().endswith('15.000 mm @ 150 µm/s')
+    win.set_scanning(False); win.close()

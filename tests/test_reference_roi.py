@@ -65,7 +65,7 @@ def controller():
     c.preview_thread=SimpleNamespace(set_scanning=lambda _:None,set_keep_spectrogram=lambda _:None,set_recording=lambda *a, **kw:None,take_recorded_frames=lambda *window, **kw:[],take_recorded_raw=lambda:[],live_recorded_frames=lambda:[])
     c._set_state=lambda state:setattr(c,'state',state)
     c.config=SimpleNamespace(**{k:v for k,v in CONTEXT.items() if k not in ('spatial_height','camera_bin')})
-    c.backend=SimpleNamespace(current_bin=1);c.win=SimpleNamespace(set_status=lambda _:None,start_scan_clock=lambda:None,set_recorded_count=lambda _:None)
+    c.backend=SimpleNamespace(current_bin=1);c.win=SimpleNamespace(set_status=lambda _:None,start_scan_clock=lambda *speed:None,set_recorded_count=lambda _:None)
     c.ready=[];c.failed=[];c.reference_preview_ready=lambda *args:c.ready.append(args);c.reference_preview_failed=lambda *args:c.failed.append(args)
     return c
 

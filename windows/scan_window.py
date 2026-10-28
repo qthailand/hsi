@@ -36,6 +36,7 @@ from modules.camera.widget import CameraControls
 from modules.live_view.spectrum import LiveLineSpectrumWidget
 from modules.cube_preview.widget import RealtimeCubePreviewWidget
 from modules.dark.widget import DarkFramePanel
+from modules.stage.speed import LINEAR_MAX_UM_S, ROTATION_MAX_DPS, ROTATION_SPEED_RESOLUTION_DPS
 from modules.acquisition.widget import CorrectionStatusDisplay
 from modules.live_view.display_controls import DisplayControls
 from widgets.sharpness_panel import SharpnessPanel
@@ -134,11 +135,16 @@ class ScanWindow(QWidget):
         self.correction_status.smile.setFixedWidth(180)
 
         # ── Stage — rotation ─────────────────────────────────────
+        # The rotation stage runs multiples of 0.01 deg/s (half steps of 0.02 deg), so the
+        # value entered is the value it runs.
         self.degree_per_second_spin = QDoubleSpinBox()
-        self.degree_per_second_spin.setDecimals(3)
-        self.degree_per_second_spin.setRange(0.001, 100.0)
+        self.degree_per_second_spin.setDecimals(2)
+        self.degree_per_second_spin.setRange(ROTATION_SPEED_RESOLUTION_DPS, ROTATION_MAX_DPS)
         self.degree_per_second_spin.setValue(float(getattr(config, "rotation_speed_dps", 1.0)))
         self.degree_per_second_spin.setSuffix(" deg/s")
+        self.degree_per_second_spin.setToolTip(
+            f"The stage runs multiples of {ROTATION_SPEED_RESOLUTION_DPS:g} deg/s, "
+            f"up to {ROTATION_MAX_DPS:g} deg/s")
 
         self.degree_spin = QDoubleSpinBox()
         self.degree_spin.setDecimals(3)
@@ -162,9 +168,13 @@ class ScanWindow(QWidget):
 
         self.speed_um_s_spin = QDoubleSpinBox()
         self.speed_um_s_spin.setDecimals(3)
-        self.speed_um_s_spin.setRange(0.001, 1000000.0)
+        self.speed_um_s_spin.setRange(0.001, LINEAR_MAX_UM_S)
         self.speed_um_s_spin.setValue(float(getattr(config, "linear_speed_um_s", 1000.0)))
         self.speed_um_s_spin.setSuffix(" um/s")
+        self.speed_um_s_spin.setToolTip(
+            f"Up to {LINEAR_MAX_UM_S:g} um/s. The stage runs the nearest microstep speed "
+            "(1 step = 20 um; 0.078 um/s at 1/256 microsteps); the speed it runs is shown in "
+            "the cube preview title if different and stored in the scan metadata")
 
         linear_layout = QFormLayout()
         linear_layout.addRow("Linear Distance", self.distance_mm_spin)
@@ -384,6 +394,8 @@ class ScanWindow(QWidget):
         self.settings_splitter = right_panel
         self._settings_sizes_before_scan = None
         self._scan_clock = None             # (monotonic start, expected s) while the stage moves
+        self._scanning = False
+        self._stage_speed = None            # speed the stage reported it runs, this scan
 
         # ── SPLITTER ─────────────────────────────────────────────
         splitter = QSplitter(Qt.Horizontal)
@@ -553,33 +565,69 @@ class ScanWindow(QWidget):
         elif not active and self._settings_sizes_before_scan is not None:
             splitter.setSizes(self._settings_sizes_before_scan)
             self._settings_sizes_before_scan = None
+        self._scanning = bool(active)
         if not active:
             self._scan_clock = None
+            self._stage_speed = None
+        self._update_scan_title()
+
+    def _update_scan_title(self):
         self.cube_preview_group.setTitle(
-            f"{CUBE_PREVIEW_TITLE}  —  {self.scan_settings_summary()}" if active else CUBE_PREVIEW_TITLE)
+            f"{CUBE_PREVIEW_TITLE}  —  {self.scan_settings_summary()}" if self._scanning else CUBE_PREVIEW_TITLE)
 
     def scan_settings_summary(self) -> str:
-        """The settings a scan uses in one line: bin, exposure, gain, recorded bands, stage move."""
+        """The settings a scan uses in one line: bin, exposure, gain, recorded bands, stage move.
+
+        Once the stage reported a speed different from the entered one
+        (:meth:`start_scan_clock`), the move adds ``(stage runs ...)``.
+        """
         controls = self.camera_controls
         parts = [f"Bin {controls.selected_bin()}", f"{controls.exposure_ms():.3f} ms", f"Gain {controls.gain()}"]
         if self._recorded_bands is not None:
             parts.append(self._recorded_bands)
         if self.stage_type() == "linear":
-            parts.append(f"{self.linear_distance_mm():.3f} mm @ {self.linear_speed_um_s():g} µm/s")
+            speed = self.linear_speed_um_s()
+            parts.append(f"{self.linear_distance_mm():.3f} mm @ {speed:g} µm/s"
+                         f"{self._stage_runs(speed, '{:.3f} µm/s')}")
         else:
-            parts.append(f"{self.rotation_degree():.3f}° @ {self.rotation_speed_dps():.3f}°/s")
+            speed = self.rotation_speed_dps()
+            parts.append(f"{self.rotation_degree():.3f}° @ {speed:.3f}°/s"
+                         f"{self._stage_runs(speed, '{:.3f}°/s')}")
         return "  ·  ".join(parts)
 
-    def expected_scan_seconds(self) -> float:
-        """Duration of the scan move from the stage settings, in s (stage acceleration ignored)."""
-        if self.stage_type() == "linear":
-            return self.linear_distance_mm() / (self.linear_speed_um_s() / 1000.0)
-        return self.rotation_degree() / self.rotation_speed_dps()
+    def _stage_runs(self, entered: float, form: str) -> str:
+        """`` (stage runs <speed>)`` when the stage reported a speed other than ``entered``."""
+        speed = self._stage_speed
+        if speed is None or math.isclose(speed, entered, rel_tol=1e-9, abs_tol=1e-9):
+            return ""
+        return f" (stage runs {form.format(speed)})"
 
-    def start_scan_clock(self):
+    def expected_scan_seconds(self, speed=None) -> float:
+        """Duration of the scan move in s (stage acceleration ignored).
+
+        Args:
+            speed: Speed the stage runs (µm/s linear, deg/s rotation), or ``None`` for the
+                entered speed.
+        """
+        if self.stage_type() == "linear":
+            speed = self.linear_speed_um_s() if speed is None else speed
+            return self.linear_distance_mm() / (speed / 1000.0)
+        speed = self.rotation_speed_dps() if speed is None else speed
+        return self.rotation_degree() / speed
+
+    def start_scan_clock(self, speed=None):
         """Show ``Scan elapsed / ~expected`` in the status line from now (the stage move start)
-        until the scan ends (:meth:`set_scanning` ``False``)."""
-        self._scan_clock = (time.monotonic(), self.expected_scan_seconds())
+        until the scan ends (:meth:`set_scanning` ``False``).
+
+        Args:
+            speed: Speed the stage reported it runs, read back from its controller (µm/s
+                linear, deg/s rotation), or ``None`` for the entered speed. The expected time
+                uses it, and the preview title shows it when it differs from the entered one.
+        """
+        self._stage_speed = speed
+        self._scan_clock = (time.monotonic(), self.expected_scan_seconds(speed))
+        if self._scanning:
+            self._update_scan_title()
 
     # ── wavelength range ─────────────────────────────────────────
 
