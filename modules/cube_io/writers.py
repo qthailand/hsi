@@ -2,16 +2,18 @@
 
 Data conventions:
     * ``HypercubeWriter`` / ``GeoTIFFWriter``: ``hypercube`` is band-first
-      ``(wavelength, slit, scan)`` uint16; ``linear_spectrum`` is the 1-D band
-      wavelengths in nm.  The ENVI output is BIP (``lines = slit``,
-      ``samples = scan``, ``bands = wavelength``), little-endian, data type 12.
+      ``(wavelength, slit, scan)`` of any ENVI data type (uint8, int16, uint16,
+      int32, uint32, int64, uint64, float32, float64); ``linear_spectrum`` is the 1-D
+      band wavelengths in nm.  The ENVI output is BIP (``lines = slit``,
+      ``samples = scan``, ``bands = wavelength``) whose ``data type`` and
+      ``byte order`` follow the array's dtype; the GeoTIFF keeps the dtype too.
     * ``SpectrogramWriter``: ``spectrogram`` is ``(frames, height, width)``.  The
       binary file is a 16-byte little-endian header ``<fffHH`` =
       ``(m * camera_bin, c, pixel_size, height, width)`` followed by the raw
       frames (C order, array dtype, not recorded in the header).  There is no
       ``format_version`` field.
-    * ``config`` is a dict with calibration ``m`` (nm/pixel at bin 1) and ``c`` (nm);
-      ``camera_bin`` is the hardware binning factor.
+    * ``config`` is a dict with calibration ``m`` (nm/pixel at bin 1) and ``c`` (nm),
+      required by ``SpectrogramWriter`` only; ``camera_bin`` is the hardware binning factor.
 
 Threading:
     Each writer's ``run()`` is blocking and meant for a worker thread; ``progress``
@@ -24,7 +26,7 @@ Example:
     >>> from modules.cube_io.envi import parse_envi_header
     >>> path = os.path.join(tempfile.mkdtemp(), "cube.img")
     >>> cube = np.zeros((4, 2, 3), np.uint16)                 # (wavelength, slit, scan)
-    >>> seconds = HypercubeWriter(save_path=path, config={"m": 0.29, "c": 400.0},
+    >>> seconds = HypercubeWriter(save_path=path, config={},
     ...                           hypercube=cube,
     ...                           linear_spectrum=np.linspace(400, 410, 4)).run()
     >>> meta = parse_envi_header(path)
@@ -35,8 +37,10 @@ import os
 import struct
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 import numpy as np
+
+from modules.cube_io.envi import envi_data_type
 
 #: Scan temperatures (°C) written to the ENVI header when present in ``config``
 #: (``ScanController.last_scan_temperatures``): ``(config key, header field)``.
@@ -49,12 +53,28 @@ TEMPERATURE_HEADER_FIELDS = (
     ('target_temperature_c', 'target temperature'),
 )
 
+def _acquisition_time_utc(config):
+    """The ENVI ``acquisition time`` (ISO 8601, UTC, ``Z``): the scan's ``started_at``
+    from ``config`` when present (an offset-less time is taken as local), else now."""
+    when = None
+    started = config.get('started_at')
+    if started:
+        try:
+            when = started if isinstance(started, datetime) else datetime.fromisoformat(str(started))
+        except ValueError:
+            when = None
+    if when is None:
+        when = datetime.now(timezone.utc)
+    elif when.tzinfo is None:
+        when = when.astimezone()
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 class GeoTIFFWriter:
     """Write a band-first cube as a tiled, LZW-compressed multi-band GeoTIFF.
 
-    The georeferencing is a fixed placeholder (origin lat/lon 7.007027, 100.499458,
-    EPSG:32647, 0.1 m pixels); it does not use the ``config``/pixel size.
-    Requires ``pyproj`` and ``rasterio`` (imported when constructing).
+    The file carries no georeference (the pushbroom scan has none); the cube's dtype is
+    kept.  Requires ``rasterio`` (imported when constructing).
     """
 
     def __init__(self, *, save_path: str, config: dict, hypercube: np.ndarray, linear_spectrum: np.ndarray, camera_bin: int = 1, progress=None):
@@ -62,61 +82,35 @@ class GeoTIFFWriter:
 
         Args:
             save_path: Output ``.tif`` path.
-            config: Calibration dict with ``m`` and ``c`` (nm); validated in ``run``.
-            hypercube: Band-first ``(wavelength, slit, scan)`` uint16 array; kept
-                by reference, not copied.
+            config: Export settings (unused; accepted for API symmetry).
+            hypercube: Band-first ``(wavelength, slit, scan)`` array; kept
+                by reference, not copied.  Written in its own dtype (native byte order).
             linear_spectrum: 1-D band wavelengths (nm), one per band.
             camera_bin: Camera hardware bin (``0``/``None`` mean 1).
             progress: Optional ``callable(int percent)``.
 
         Raises:
             ValueError: ``hypercube`` is not 3-D (tuple unpacking of its shape).
-            ImportError: ``pyproj``/``rasterio`` missing.
+            ImportError: ``rasterio`` missing.
         """
         self.progress = progress or (lambda value: None)
-        from pyproj import Transformer
-        from rasterio.control import GroundControlPoint
-        from rasterio.crs import CRS
-        from rasterio.transform import Affine, from_gcps
+        import rasterio  # noqa: F401  (fail early when missing)
         self.save_path = save_path
         self.config = config
         self.camera_bin = int(camera_bin or 1)
         self.hypercube = hypercube
         self.linear_spectrum = linear_spectrum
         self.count, self.hight, self.width = self.hypercube.shape
-
-        lat_tl = 7.007027108462115
-        lon_tl = 100.49945822505273
-        px = 0.1
-        py = 0.1
-
-        t = Transformer.from_crs("EPSG:4326", "EPSG:32647", always_xy=True)
-        X_left, Y_top = t.transform(lon_tl, lat_tl)
-        transform = Affine(px, 0.0, X_left, 0.0, -py, Y_top)
-
-        right = X_left + self.width * px
-        bottom = Y_top - self.hight * py
-
-        gcps = [
-            GroundControlPoint(row=0, col=0, x=X_left, y=Y_top),
-            GroundControlPoint(row=0, col=self.width - 1, x=X_left + (self.width - 1) * px, y=Y_top),
-            GroundControlPoint(row=self.hight - 1, col=self.width - 1, x=X_left + (self.width - 1) * px, y=Y_top - (self.hight - 1) * py),
-            GroundControlPoint(row=self.hight - 1, col=0, x=X_left, y=Y_top - (self.hight - 1) * py),
-        ]
-
-        transform = from_gcps(gcps)
+        self.dtype = self.hypercube.dtype.newbyteorder('=')
         self.geo_meta = {
-            'tiled': True,
             'driver': 'GTiff',
-            'transform': transform,
-            'crs': CRS.from_epsg(32647),
             'width': self.width,
             'height': self.hight,
             'count': self.count,
-            'dtype': np.uint16,
+            'dtype': self.dtype.name,
             'tiled': True,
             'compress': 'LZW',
-            'predictor': 2,
+            'predictor': 3 if self.dtype.kind == 'f' else 2,   # floating-point / horizontal differencing
         }
 
 
@@ -128,23 +122,22 @@ class GeoTIFFWriter:
 
         Raises:
             ValueError: ``hypercube`` is ``None`` or has no shape.
-            TypeError: ``config['m']`` is missing/non-numeric.
             Exception: rasterio/IO errors propagate.  Not cancellable; the file
                 is written in place (no temporary file).
         """
+        import warnings
         import rasterio
+        from rasterio.errors import NotGeoreferencedWarning
         t0 = time.time()
         try:
             if self.hypercube is None or not hasattr(self.hypercube, "shape"):
                 raise ValueError("spectrogram is None or not a numpy array")
-            bin_factor = int(getattr(self, 'camera_bin', 1) or 1)
-            m = float(self.config.get('m')) * bin_factor
-            c = float(self.config.get('c'))
             percents = 0
 
-            with rasterio.open(self.save_path, "w", **self.geo_meta) as dst:
+            with warnings.catch_warnings(), rasterio.open(self.save_path, "w", **self.geo_meta) as dst:
+                warnings.simplefilter('ignore', NotGeoreferencedWarning)   # no georeference on purpose
                 for i in range(self.count):
-                    data = np.ascontiguousarray(self.hypercube[i])   # views welcome (no-op if contiguous)
+                    data = np.ascontiguousarray(self.hypercube[i], dtype=self.dtype)   # views welcome (no-op if contiguous)
                     wl = self.linear_spectrum[i]
                     dst.update_tags(bidx=i + 1, WAVELENGTH=f"{wl:.3f}", WAVELENGTH_UNIT="nm")
                     dst.set_band_description(i + 1, f"Band {i + 1} (λ={wl:.3f} nm)")
@@ -164,15 +157,17 @@ class HypercubeWriter:
 
         Args:
             save_path: Data file path; the header goes to ``save_path + '.hdr'``.
-            config: Calibration dict with ``m`` and ``c`` (nm); validated in ``run``.
-                Optional ``bit_depth``, ``sensor_bit_depth`` and ``full_scale`` (from
+            config: Export metadata dict (``m``/``c`` are not needed).
+                Optional ``started_at`` (ISO 8601 scan start, see
+                :func:`modules.acquisition.build_raw_metadata`) becomes the UTC
+                ``acquisition time`` (default: the export time).  Optional ``bit_depth``, ``sensor_bit_depth`` and ``full_scale`` (from
                 :func:`modules.acquisition.camera_bit_info`) are written to the header as
                 ``data bit depth``, ``sensor bit depth`` and ``data full scale``; optional scan
                 temperatures (°C, see :data:`TEMPERATURE_HEADER_FIELDS`) as ``sensor temperature
                 start/end/min/max``, ``dark temperature`` and ``target temperature``.
             fsync: Accepted for API symmetry; currently unused.
             hypercube: Band-first ``(wavelength, slit, scan)`` array, kept by
-                reference.  The header always declares data type 12 (uint16).
+                reference.  The header's ``data type`` and ``byte order`` follow its dtype.
             linear_spectrum: 1-D band wavelengths in nm (written to the header).
             camera_bin: Camera hardware bin (``0``/``None`` mean 1).
             progress: Optional ``callable(int percent)``.
@@ -193,8 +188,8 @@ class HypercubeWriter:
             float: Elapsed seconds (rounded to 0.01).
 
         Raises:
-            ValueError: ``hypercube`` is ``None``/not an array, or not 3-D.
-            TypeError: ``config['m']`` is missing/non-numeric.
+            ValueError: ``hypercube`` is ``None``/not an array, not 3-D, or of a
+                dtype ENVI cannot store (checked before any file is written).
             OSError: file errors propagate.  Not cancellable, not atomic.
         """
         t0 = time.time()
@@ -203,10 +198,7 @@ class HypercubeWriter:
                 raise ValueError("spectrogram is None or not a numpy array")
 
             bands, lines, samples = self.hypercube.shape
-
-            bin_factor = int(getattr(self, 'camera_bin', 1) or 1)
-            m = float(self.config.get('m')) * bin_factor
-            c = float(self.config.get('c'))
+            data_type, byte_order = envi_data_type(self.hypercube.dtype)
             percents = 0
 
             bip = self.hypercube.transpose(1,2,0)
@@ -216,27 +208,27 @@ class HypercubeWriter:
                     percents = int(((i + 1) / bip.shape[0]) * 100)
                     self.progress(percents)
 
-            acquisition = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            acquisition = _acquisition_time_utc(self.config)
 
-            with open(f'{self.save_path}.hdr', "w") as file:
-                file.write('ENVI' + os.linesep)
-                file.write('description = {Truth image generated by NARIT Feat. PSU}' + os.linesep)
-                file.write('data type = 12' + os.linesep)
-                file.write('byte order = 0' + os.linesep)
-                file.write('interleave = BIP' + os.linesep)
-                file.write(f'acquisition time={acquisition}' + os.linesep)
-                file.write(f'lines = {lines}' + os.linesep)
-                file.write(f'samples = {samples}' + os.linesep)
-                file.write(f'bands = {bands}' + os.linesep)
+            with open(f'{self.save_path}.hdr', "w", encoding='utf-8', newline='\n') as file:
+                file.write('ENVI\n')
+                file.write('description = {Truth image generated by NARIT Feat. PSU}\n')
+                file.write(f'data type = {data_type}\n')
+                file.write(f'byte order = {byte_order}\n')
+                file.write('interleave = BIP\n')
+                file.write(f'acquisition time = {acquisition}\n')
+                file.write(f'lines = {lines}\n')
+                file.write(f'samples = {samples}\n')
+                file.write(f'bands = {bands}\n')
                 for key, name in (('bit_depth', 'data bit depth'), ('sensor_bit_depth', 'sensor bit depth'),
                                   ('full_scale', 'data full scale')):
                     if self.config.get(key) is not None:
-                        file.write(f'{name} = {int(self.config[key])}' + os.linesep)
+                        file.write(f'{name} = {int(self.config[key])}\n')
                 for key, name in TEMPERATURE_HEADER_FIELDS:
                     if self.config.get(key) is not None:
-                        file.write(f'{name} = {float(self.config[key]):.2f}' + os.linesep)
-                file.write('wavelength units = Nanometers' + os.linesep)
-                file.write('wavelength = {%s}' % ', '.join(self.linear_spectrum.astype('str').tolist()) + os.linesep)
+                        file.write(f'{name} = {float(self.config[key]):.2f}\n')
+                file.write('wavelength units = Nanometers\n')
+                file.write('wavelength = {%s}\n' % ', '.join(np.asarray(self.linear_spectrum).astype('str').tolist()))
             return float(np.round(time.time() - t0, 2))
 
         except Exception:

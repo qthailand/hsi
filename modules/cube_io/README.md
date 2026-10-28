@@ -12,7 +12,7 @@ Cube assembly and file export/import. The core is Qt-free; thin Qt adapters (bel
 
 ## Requirements
 
-* NumPy. Optional, imported only when used: `spectral` (loading ENVI), `h5py` (HDF5), `rasterio` + `pyproj` (GeoTIFF).
+* NumPy. Optional, imported only when used: `spectral` (loading ENVI), `h5py` (HDF5), `rasterio` (GeoTIFF).
 * Other modules: `spectral_processing` (`__requires__ = ("spectral_processing",)`, for `parse_envi_wavelengths`).
 * No PyQt5 for the core; the Qt adapters need PyQt5. `import modules.cube_io` never imports it.
 
@@ -70,12 +70,12 @@ saver.start()
 ## Data formats / conventions
 
 * In memory: corrected frame `(slit, wavelength)`; cube `(slit, scan, wavelength)`. ENVI BIP on disk: `lines = slit`, `samples = scan`, `bands = wavelength`.
-* `HypercubeWriter` / `GeoTIFFWriter` take a band-first `(wavelength, slit, scan)` uint16 array and `linear_spectrum` in nm. `HypercubeWriter` writes `save_path` (raw BIP, little-endian) and `save_path + '.hdr'` (`data type = 12`, `interleave = BIP`, `wavelength units = Nanometers`, wavelength list).
-* `GeoTIFFWriter`: LZW, tiled, one band per wavelength with `WAVELENGTH` / `WAVELENGTH_UNIT` tags; the georeference is a fixed placeholder (EPSG:32647, 0.1 m pixels, fixed origin).
+* `HypercubeWriter` / `GeoTIFFWriter` take a band-first `(wavelength, slit, scan)` array (uint8, int16, uint16, int32, uint32, int64, uint64, float32 or float64) and `linear_spectrum` in nm. `HypercubeWriter` writes `save_path` (raw BIP in the array's dtype) and `save_path + '.hdr'` (LF line endings; `data type` and `byte order` from the dtype, `interleave = BIP`, `acquisition time` in UTC - the scan's `config['started_at']` when given, else the export time - `wavelength units = Nanometers`, wavelength list). Other dtypes raise `ValueError` before anything is written.
+* `GeoTIFFWriter`: LZW, tiled, one band per wavelength with `WAVELENGTH` / `WAVELENGTH_UNIT` tags, in the cube's dtype; no georeference (a pushbroom scan has none).
 * `SpectrogramWriter`: 16-byte little-endian header `<fffHH` = `(m * camera_bin, c, pixel_size, height, width)` followed by raw frames (`(frames, height, width)`, array dtype, not recorded). Written to `<path>.tmp` and renamed atomically; cancellable. This file has no `format_version` field.
 * `save_hdf5`: dataset `"spectrogram"` (gzip 4, one-frame chunks), attributes `shape`, `dtype`.
-* `config` dict: `m` (nm per pixel at hardware bin 1) and `c` (nm). `camera_bin` is the hardware bin factor.
-* `parse_envi_header` returns lower-cased string fields, int `lines` / `samples` / `bands` and a float32 `wavelength` array (or `None`); `read_envi_band` reads BSQ, BIL and BIP through a memory map (only the requested band), honours `byte order` and `header offset`, and keeps the maps of the last two files open: call `release_band_maps(path)` before overwriting or deleting such a file (Windows cannot replace a mapped file).
+* `config` dict: `m` (nm per pixel at hardware bin 1) and `c` (nm), required by `SpectrogramWriter` only. `camera_bin` is the hardware bin factor.
+* `parse_envi_header` returns lower-cased string fields, int `lines` / `samples` / `bands` and a float32 `wavelength` array in nm (`wavelength units` of micrometres are converted) or `None`; `read_envi_band` decodes ENVI data types 1, 2, 3, 4, 5, 12, 13, 14 and 15 (others raise `ValueError`), reads BSQ, BIL and BIP through a memory map (only the requested band), honours `byte order` and `header offset`, and keeps the maps of the last two files open: call `release_band_maps(path)` before overwriting or deleting such a file (Windows cannot replace a mapped file).
 
 ## API summary
 

@@ -19,8 +19,8 @@ Data conventions:
       ``samples`` and ``y`` along ``lines``.
     * Cubes written by ``create_datacube_logic`` / ``create_datacube_resampled_logic``
       are ENVI BIP files, ``(lines, samples, bands)`` little-endian, float32 when a
-      calibration is applied, otherwise the input dtype (uint16 unless the input is
-      float32), with a ``<save_path>.hdr`` text header (wavelengths in nm).
+      calibration is applied, otherwise the input's dtype (integers rounded and
+      clipped to its range), with a ``<save_path>.hdr`` text header (wavelengths in nm).
     * The temporary cubes of ``build_raw_cube_tmp`` / ``build_cal_cube_tmp`` are
       header-less band-stacked memmaps of shape ``(lines * bands, samples)``:
       element ``[y + b * lines, x]`` is pixel ``(y, x)`` of band ``b``.
@@ -49,7 +49,7 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 from scipy.signal import savgol_filter
-from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32
+from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, envi_dtype
 
 #: Reflectance tables of the reference targets (Spectralon, PVC, ...): Excel sheets without
 #: header, column 0 wavelength (nm), column 1 reflectance. Drop a new file here to offer it.
@@ -196,6 +196,22 @@ def _apply_spatial_binning(img, n, to_uint16=False):
     return binned.astype(np.float32)
 
 
+def _output_type(raw_meta, is_cal):
+    """``(ENVI data type, numpy dtype)`` of a crop export: float32 when calibrated, else the input's."""
+    if is_cal:
+        return 4, np.dtype(np.float32)
+    in_dt = int(raw_meta.get('data type', 12))
+    return in_dt, envi_dtype(in_dt)
+
+
+def _cast_band(img, dtype):
+    """``img`` as ``dtype``; for integer types rounded and clipped to the type's range."""
+    if dtype.kind == 'f':
+        return img.astype(dtype, copy=False)
+    info = np.iinfo(dtype)
+    return np.clip(np.round(img), info.min, info.max).astype(dtype)
+
+
 def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
                                     avg_window_size, mask,
                                     progress_callback=None):
@@ -262,11 +278,7 @@ def create_datacube_logic(params, progress_callback=None):
 
     cubheight, cubwidth = (y1 - y0) // n_bin, (x1 - x0) // n_bin
     is_cal = (rowwise_factors is not None) or (factors is not None)
-    in_dt = int(raw_meta.get('data type', 12))
-    if is_cal:
-        out_dt, out_dtype = 4, np.float32
-    else:
-        out_dt, out_dtype = in_dt, (np.float32 if in_dt == 4 else np.uint16)
+    out_dt, out_dtype = _output_type(raw_meta, is_cal)
 
     hdr_path = save_path + '.hdr'
     with open(hdr_path, 'w') as hopen:
@@ -297,7 +309,7 @@ def create_datacube_logic(params, progress_callback=None):
             roi_img *= float(factors[i])
         out = _apply_spatial_binning(
             roi_img, n_bin, to_uint16=(out_dtype == np.uint16))
-        c[cubheight * i: cubheight * (i + 1)] = out
+        c[cubheight * i: cubheight * (i + 1)] = _cast_band(out, out_dtype)
         progress_callback(i + 1)
 
     bip = c.reshape((band_count, cubheight, cubwidth)).transpose(1, 2, 0)  # HWC
@@ -328,13 +340,7 @@ def create_datacube_resampled_logic(params, progress_callback=None):
 
     cubheight, cubwidth = (y1 - y0) // n_bin, (x1 - x0) // n_bin
     is_cal = (rowwise_factors is not None) or (factors is not None)
-    in_dt = int(raw_meta.get('data type', 12))
-    if is_cal:
-        out_dt, out_dtype_str, out_dtype_np = 4, 'float32', np.float32
-    else:
-        out_dt = in_dt
-        out_dtype_str = 'float32' if in_dt == 4 else 'uint16'
-        out_dtype_np = np.float32 if in_dt == 4 else np.uint16
+    out_dt, out_dtype_np = _output_type(raw_meta, is_cal)
 
     hdr_path = save_path + '.hdr'
     with open(hdr_path, 'w') as hopen:
@@ -353,7 +359,7 @@ def create_datacube_resampled_logic(params, progress_callback=None):
             wl_str = ','.join(f"{float(v):.2f}" for v in lam_target)
             hopen.write(f'wavelength = {{{wl_str}}}\n')
 
-    c = np.zeros((cubheight * len(lam_target), cubwidth), dtype=out_dtype_str)
+    c = np.zeros((cubheight * len(lam_target), cubwidth), dtype=out_dtype_np)
     progress_callback(0)
 
     for j in range(len(lam_target)):
@@ -375,7 +381,7 @@ def create_datacube_resampled_logic(params, progress_callback=None):
         roiJ = (1.0 - a) * roiL + a * roiR
         out = _apply_spatial_binning(
             roiJ, n_bin, to_uint16=(out_dtype_np == np.uint16))
-        c[cubheight * j: cubheight * (j + 1)] = out
+        c[cubheight * j: cubheight * (j + 1)] = _cast_band(out, out_dtype_np)
         progress_callback(j + 1)
 
     bip = c.reshape((len(lam_target), cubheight, cubwidth)).transpose(1, 2, 0)  # HWC

@@ -19,12 +19,12 @@ Data conventions:
       ENVI BIP file with ``lines = slit``, ``samples = scan``, ``bands = wavelength``.
     * Writers (``HypercubeWriter``, ``GeoTIFFWriter``) take a *band-first*
       cube ``(wavelength, slit, scan)`` plus a 1-D ``linear_spectrum`` of band
-      wavelengths in nm; they write uint16 data.
+      wavelengths in nm; they keep the cube's dtype (ENVI ``data type`` follows it).
     * ``SpectrogramWriter`` / ``save_hdf5`` take a raw spectrogram
       ``(frames, spatial, spectral)``.
     * Wavelengths are nm.  ``config`` dicts carry the calibration ``m``
-      (nm/pixel at hardware bin 1) and ``c`` (nm); ``camera_bin`` is the camera's
-      hardware binning factor.
+      (nm/pixel at hardware bin 1) and ``c`` (nm), needed by ``SpectrogramWriter``
+      only; ``camera_bin`` is the camera's hardware binning factor.
 
 Threading:
     The writers, loaders and parsers are Qt-free; importing this package never imports

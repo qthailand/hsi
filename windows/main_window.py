@@ -331,7 +331,7 @@ class MainWindow(QMainWindow):
 
     def _create_scan_cube_viewer(self, cube, wavelengths=None):
         """Open a viewer for the cube just scanned, carrying the camera's bit depth and the scan's
-        temperatures (``ScanController.last_scan_temperatures``) to its export header."""
+        temperatures (``ScanController.last_scan_temperatures``) and start time to its export header."""
         camera_bits = None
         if self.scan_controller is not None:
             try:
@@ -340,6 +340,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
             camera_bits = {**(camera_bits or {}), **self.scan_controller.last_scan_temperatures}
+            started_at = (getattr(self.scan_controller, '_raw_metadata', None) or {}).get('started_at')
+            if started_at:
+                camera_bits['started_at'] = started_at     # the header's acquisition time
         self.create_cube_viewer(cube, wavelengths, camera_bits=camera_bits)
 
     def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None,
