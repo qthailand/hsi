@@ -18,6 +18,7 @@ class FakeCamera(AbstractCameraBackend):
         self.bin = 1
         self.refuse = set()
         self.no_stream_bins = set()      # bins the camera accepts but cannot start streaming at
+        self.failing_reads = 0           # the next reads that raise (a non-fatal read error each)
         self.closed = False
         self.exposure_ms = 1.0
 
@@ -30,6 +31,9 @@ class FakeCamera(AbstractCameraBackend):
 
     def _fetch_raw_frame(self, timeout_ms=1000):
         time.sleep(0.001)
+        if self.failing_reads:
+            self.failing_reads -= 1
+            raise RuntimeError('GC_ERR_IO while reading a frame')
         self.index += 1
         return np.full((H, W // self.bin), self.index % 60000, np.uint16)
 

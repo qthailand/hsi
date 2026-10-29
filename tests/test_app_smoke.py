@@ -39,7 +39,41 @@ class FakeStage:
 
 
 @pytest.fixture
-def main_window(monkeypatch):
+def isolated_config(monkeypatch, tmp_path):
+    """MainWindow reads a fresh default config, never the developer's live ``config/``, nor the
+    project's smile models or darks (a real sensor's model does not fit the fake frames)."""
+    from dataclasses import asdict
+    import config as app_config
+    import windows.main_window as main_window_module
+    from modules.configuration import ConfigStore
+    data = asdict(app_config.AppConfig())
+    data.update(m=.29, c=400, smile_map_folder=str(tmp_path / 'smile_maps'),
+                dark_frame_folder=str(tmp_path / 'dark_frames'))
+    directory = tmp_path / 'config'
+    ConfigStore(directory).initialize(data)
+    monkeypatch.setattr(main_window_module, 'load_app_config', lambda: app_config.load_app_config(str(directory)))
+    return directory
+
+
+@pytest.fixture
+def unsaved_answers(monkeypatch):
+    """Answers to the Save / Discard / Cancel and the scan-running questions (Discard and Yes
+    once the list is used up); ``asked`` collects the titles."""
+    from PyQt5.QtWidgets import QMessageBox
+    import windows.scan_window as scan_window_module
+    answers, asked = [], []
+    def ask(default):
+        def box(parent, title, text, *args):
+            asked.append(title)
+            return answers.pop(0) if answers else default
+        return box
+    monkeypatch.setattr(scan_window_module.QMessageBox, 'warning', ask(QMessageBox.Discard))
+    monkeypatch.setattr(scan_window_module.QMessageBox, 'question', ask(QMessageBox.Yes))
+    return answers, asked
+
+
+@pytest.fixture
+def main_window(monkeypatch, isolated_config, unsaved_answers):
     from PyQt5.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
     import modules.camera.factory as factory
@@ -196,6 +230,101 @@ def test_cube_viewer_opens_on_the_result(main_window):
     assert len(window.mdi.subWindowList()) >= 2
 
 
+def _statuses(scan, monkeypatch):
+    """Record every status line the controller sets."""
+    seen = []
+    original = scan.set_status
+    monkeypatch.setattr(scan, 'set_status', lambda text: seen.append(text) or original(text))
+    return seen
+
+
+def test_a_camera_read_error_does_not_block_the_next_scan(main_window, monkeypatch):
+    """Regression: any worker error used to set ERROR for good, and Start did nothing until a restart."""
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    statuses = _statuses(scan, monkeypatch)
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    controller.backend.failing_reads = 1
+    assert pump(app, lambda: any('Camera error' in s for s in statuses))
+    assert controller.state == controller.PREVIEW
+    shown = controller.preview_frame_index
+    assert pump(app, lambda: controller.preview_frame_index > shown + 3)        # the live preview goes on
+    controller.start_scan()
+    assert controller.state == controller.SCANNING
+    assert pump(app, lambda: scan._pending_cube is not None)
+
+
+def test_a_read_error_mid_scan_disarms_the_recorder_and_keeps_the_frames(main_window, monkeypatch):
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    statuses = _statuses(scan, monkeypatch)
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    controller.start_scan()
+    assert pump(app, lambda: controller.recording and controller.preview_thread.recorded_count() > 5)
+    controller.backend.failing_reads = 1
+    assert pump(app, lambda: controller.state == controller.PREVIEW)
+    assert not controller.recording and not controller.preview_thread._scanning
+    assert scan._pending_cube is not None and scan._pending_cube.shape[1] > 5
+    assert any('scan stopped, frames so far kept' in s for s in statuses)
+    assert pump(app, lambda: controller.stage is None)          # let the stage return home
+    assert 'scan stopped' in statuses[-1] and 'stage returned home' in statuses[-1]   # the reason stays
+    controller.start_scan()                                     # and a new scan can start
+    assert controller.state == controller.SCANNING
+
+
+def test_the_worker_ending_on_its_own_is_an_error_state(main_window, monkeypatch):
+    """A fatal error ends the acquisition loop: ERROR, and Start says why instead of doing nothing."""
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    statuses = _statuses(scan, monkeypatch)
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    controller.on_preview_error('preprocessing failed')
+    controller.preview_thread.request_stop()                    # the loop ends as after a fatal error
+    assert pump(app, lambda: controller.state == controller.ERROR)
+    assert 'preprocessing failed' in statuses[-1]
+    controller.start_scan()
+    assert controller.state == controller.ERROR and 'reopen the Scan window' in statuses[-1]
+
+
+def test_an_unsaved_scan_is_not_dropped_without_asking(main_window, monkeypatch, unsaved_answers):
+    from PyQt5.QtWidgets import QMessageBox
+    app, window = main_window
+    answers, asked = unsaved_answers
+    scan = window.scan_window
+    controller = scan.controller
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    controller.start_scan()
+    assert pump(app, lambda: scan._pending_cube is not None)
+    cube = scan._pending_cube
+    assert pump(app, lambda: controller.stage is None)
+    scan.open_cube_viewer_btn.click()
+    viewers_before = len(window.mdi.subWindowList())
+
+    answers.append(QMessageBox.Cancel)                          # Start: Cancel keeps the result
+    controller.start_scan()
+    assert asked == ['Unsaved Scan'] and controller.state == controller.PREVIEW and scan._pending_cube is cube
+
+    answers.append(QMessageBox.Cancel)                          # closing the app: asked before any window closes
+    assert not window.close()
+    assert asked[-1] == 'Unsaved Scan' and len(window.mdi.subWindowList()) == viewers_before
+    assert window.scan_window is scan
+
+    answers.append(QMessageBox.Save)                            # Save: the cube opens with its export dialog
+    controller.start_scan()
+    assert controller.state == controller.PREVIEW and len(window.mdi.subWindowList()) == viewers_before + 1
+    viewer = window.mdi.subWindowList()[-1].widget()
+    assert viewer._export_dlg is not None and viewer._export_dlg.isVisible()
+    viewer._export_dlg.close()
+
+    viewer.cube_exported.emit('scan.bip')                       # exported: no more questions
+    asked.clear()
+    controller.start_scan()
+    assert asked == [] and controller.state == controller.SCANNING
+
+
 def test_every_registered_module_opens_inside_the_shell(main_window, tmp_path, monkeypatch):
     """The menu is built from the registry and each entry opens a working sub-window."""
     import windows.integrations as integrations
@@ -246,7 +375,7 @@ def test_scan_with_keep_spectrogram_hands_metadata_to_the_viewer_and_file(main_w
         assert f.attrs['camera_bin'] == controller.camera_bin
 
 
-def test_missing_camera_shows_an_error_and_keeps_the_main_window(monkeypatch):
+def test_missing_camera_shows_an_error_and_keeps_the_main_window(monkeypatch, isolated_config):
     from PyQt5.QtWidgets import QApplication
     app = QApplication.instance() or QApplication([])
 

@@ -88,6 +88,9 @@ class ScanController:
     _scan_temps = ()
     last_scan_header: dict = {}
     dark_reference = None
+    _closing = False                    # cleanup started: the worker's end is not a failure
+    _last_preview_error = ""            # the worker's last error message, shown if it stops
+    _scan_end_reason = ""               # why the last scan ended early; kept in "Stage returned home"
     _range_requested = None             # range last sent to the worker (or applied), (lo, hi) nm or None
     _range_applied = None               # range the worker reported in use
     _range_dirty = False                # a user edit is waiting for the worker's answer
@@ -145,6 +148,7 @@ class ScanController:
         self.preview_thread.frame_rate_ready.connect(self.win.set_camera_frame_rate)
         self.preview_thread.sharpness_ready.connect(self._on_sharpness_ready)
         self.preview_thread.error.connect(self.on_preview_error)
+        self.preview_thread.finished.connect(self._on_preview_thread_finished)
         self.preview_thread.correction_status.connect(self.win.correction_status.update_status)
         self.preview_thread.saturation_ready.connect(self._on_saturation)
         self.preview_thread.set_raw_inverted(self.config.raw_inverted)
@@ -1076,8 +1080,36 @@ class ScanController:
             logger.warning("Histogram update failed: %s", e)
 
     def on_preview_error(self, msg: str):
+        """A failure reported by the acquisition worker.
+
+        Most are not fatal (one frame could not be read, a Smile model did not load): the
+        live preview goes on, so the state is kept and the message goes to the status line.
+        A scan running at that moment has lost a frame, so it is stopped like Stop does:
+        the recorder is disarmed and the frames recorded so far become the cube. A fatal
+        error also ends the worker thread; ``_on_preview_thread_finished`` handles that.
+        """
         logger.error("Preview error: %s", msg)
+        self._last_preview_error = msg
+        if self.state == self.SCANNING:
+            self.stop_scan_manually()
+            self._scan_end_reason = f"Camera error - scan stopped, frames so far kept: {msg}"
+            self.win.set_status(self._scan_end_reason)
+        else:
+            self.win.set_status(f"Camera error: {msg}")
+
+    def _on_preview_thread_finished(self):
+        """The acquisition worker ended without ``cleanup``: a fatal error stopped the camera.
+
+        A running scan keeps the frames recorded before the failure; the state becomes
+        ``ERROR`` (no new scan) until the Scan window is reopened.
+        """
+        if self._closing:
+            return
+        if self.state == self.SCANNING:
+            self.stop_scan_manually()
         self._set_state(self.ERROR)
+        reason = self._last_preview_error or "acquisition stopped"
+        self.win.set_status(f"Camera stopped: {reason} - reopen the Scan window")
 
     # ══════════════════════════════════════════════════════════════
     #  Scan control
@@ -1089,12 +1121,15 @@ class ScanController:
         Lifecycle:
             1. Guard — reject if dark capture is in progress
             2. Guard — reject unless currently in PREVIEW state, and while a
-            wavelength range or bin change is still being applied (status message)
-            3. Clear previous recording buffers (binned frames, saturation,
+            wavelength range or bin change is still being applied (status message;
+            also after a fatal camera error, state ERROR)
+            3. Ask Save / Discard / Cancel if the last result was never exported
+            (``ScanWindow.confirm_discard_result``)
+            4. Clear previous recording buffers (binned frames, saturation,
             full-res spectrograms)
-            4. Arm preview thread for scan mode — full-res spectrogram capture
+            5. Arm preview thread for scan mode — full-res spectrogram capture
             is gated by the user checkbox (keep_spectrogram)
-            5. Transition to SCANNING and start the motion stage
+            6. Transition to SCANNING and start the motion stage
 
         The recording flag stays *False* until ``on_stage_started`` fires;
         this prevents the first frames from being captured before the stage
@@ -1102,6 +1137,9 @@ class ScanController:
         """
         if self.dark_lib.is_collecting:
             self.win.dark_panel.set_error("Finish dark capture first")
+            return
+        if self.state == self.ERROR:
+            self.win.set_status("Camera stopped - reopen the Scan window to scan again")
             return
         if self.state != self.PREVIEW:
             return
@@ -1116,11 +1154,16 @@ class ScanController:
             # Started now, the bin would be applied mid-scan (two frame widths in one cube).
             self.win.set_status("Bin change is being applied - press Start again")
             return
+        # A new scan replaces the last result; ask first if it was never exported.
+        confirm = getattr(self.win, "confirm_discard_result", None)   # absent on test windows
+        if confirm is not None and not confirm("Starting a new scan"):
+            return
 
         # ── reset buffers ─────────────────────────────────────
         self._raw_metadata = self._collect_raw_metadata()
         start_temp = valid_temperature(self._last_temp)
         self._scan_temps = [] if start_temp is None else [start_temp]
+        self._scan_end_reason = ""
         self.session.begin()
         gc.collect()
         self.win.set_recorded_count(0)
@@ -1242,7 +1285,8 @@ class ScanController:
             self.win.set_status("Cube ready — stage returning home")
 
     def on_stage_returned_home(self):
-        self.win.set_status("Stage returned home")
+        reason, self._scan_end_reason = self._scan_end_reason, ""
+        self.win.set_status(f"{reason} - stage returned home" if reason else "Stage returned home")
 
     def on_stage_error(self, message):
         logger.error("Stage failure: %s", message)
@@ -1385,8 +1429,9 @@ class ScanController:
                 )
 
         except Exception as e:
+            # The camera is fine: stay in PREVIEW so the next scan can start.
             logger.exception("Failed to create cube: %s", e)
-            self._set_state(self.ERROR)
+            self.win.set_status(f"Cube could not be built: {e}")
 
     def _publish_reference_outcome(self, outcome):
         """Deliver a visual-selection scan result to the host callbacks."""
@@ -1426,6 +1471,7 @@ class ScanController:
 
     def cleanup(self):
         logger.info("ScanController cleanup started")
+        self._closing = True
         self.session.recording = False
 
         if self._settings_timer is not None and self._settings_timer.isActive():   # edits in the last second
@@ -1468,4 +1514,4 @@ class ScanController:
             logger.warning("Backend close error: %s", e)
 
         logger.info("ScanController cleanup done")
-        return True
+        return True

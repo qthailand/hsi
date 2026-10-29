@@ -272,6 +272,7 @@ class MainWindow(QMainWindow):
 
         scan = ScanWindow(config=self.config)
         scan.cube_ready.connect(self._create_scan_cube_viewer)
+        scan.save_result_requested.connect(self._save_scan_result)
         from windows.integrations import RadiometricIntegration
         for integration in self.integrations:
             if isinstance(integration, RadiometricIntegration):
@@ -346,15 +347,30 @@ class MainWindow(QMainWindow):
         return {**(camera_bits or {}), **self.scan_controller.last_scan_header}
 
     def _create_scan_cube_viewer(self, cube, wavelengths=None):
-        """Open a viewer for the cube just scanned, carrying the scan's metadata to its export header."""
-        self.create_cube_viewer(cube, wavelengths, camera_bits=self._scan_export_metadata())
+        """Open a viewer for the cube just scanned, carrying the scan's metadata to its export header.
+
+        An export from this viewer marks the scan result saved (no Save / Discard question).
+        Returns the viewer, or None if it could not be opened.
+        """
+        viewer = self.create_cube_viewer(cube, wavelengths, camera_bits=self._scan_export_metadata())
+        if viewer is not None:
+            viewer.cube_exported.connect(
+                lambda _path, cube=cube: self.scan_window is not None and self.scan_window.mark_result_saved(cube))
+        return viewer
+
+    def _save_scan_result(self, cube, wavelengths=None):
+        """Save on the unsaved-scan question: open the cube with its export dialog."""
+        viewer = self._create_scan_cube_viewer(cube, wavelengths)
+        if viewer is not None:
+            viewer.open_export_dialog()
 
     def create_cube_viewer(self, cube, wavelengths=None, title=None, camera_bits=None, source_path=None,
                            header_values=None):
         """Open a Cube Viewer; ``camera_bits`` (``camera_bit_info``) goes into the ENVI export header.
 
         ``source_path`` (the opened ENVI header) names the viewer's area spectra and its
-        default spectra export file; None for a cube that has no file yet.
+        default spectra export file; None for a cube that has no file yet.  Returns the
+        viewer, or None if it could not be opened.
         """
         from modules.cube_viewer.window import CubeViewerWindow
 
@@ -404,7 +420,7 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Viewer Error", str(e))
-            return
+            return None
 
         sub = QMdiSubWindow()
         sub.setWidget(viewer)
@@ -416,6 +432,7 @@ class MainWindow(QMainWindow):
         sub.show()
         sub.raise_()
         sub.activateWindow()
+        return viewer
 
     def make_icon(self, color: str) -> QIcon:
         px = QPixmap(16, 16)
@@ -429,6 +446,11 @@ class MainWindow(QMainWindow):
             self.scan_window.request_snapshot(request_id)
 
     def closeEvent(self, event):
+        # Ask about a running scan and an unsaved result before anything closes: a cube
+        # viewer closed here could hold the only copy the user still wanted to export.
+        if self.scan_window is not None and not self.scan_window.confirm_close("Closing the application"):
+            event.ignore()
+            return
         self.mdi.closeAllSubWindows()
         for sub in self.mdi.subWindowList():
             controller = getattr(sub.widget(), 'controller', None)

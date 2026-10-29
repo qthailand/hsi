@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import qtawesome as qta
-from PyQt5.QtCore import QSize, Qt, QThread, QTimer
+from PyQt5.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QKeySequence, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -198,10 +198,16 @@ class ExportDialog(QDialog):
             ``pixel_size``); ``None`` is treated as ``{}``.
         camera_bin: Hardware bin factor of the camera (``None``/0 mean 1).
 
+    One export runs at a time: Start is disabled while it runs, the worker's thread
+    quits as soon as the worker reports, and it is joined before the next export and on
+    close, so a running ``QThread`` is never destroyed (that aborts the application).
+
     Signals:
-        None of its own; it reacts to the worker's ``progressed``, ``finished``
-        (seconds) and ``error`` (traceback text) signals.
+        exported(str): path of a file written successfully.  The dialog also reacts to
+        the worker's ``progressed``, ``finished`` (seconds) and ``error`` (traceback text).
     """
+
+    exported = pyqtSignal(str)
 
     def __init__(self, parent, cube, wavelengths, config, camera_bin):
         super().__init__(parent)
@@ -215,6 +221,7 @@ class ExportDialog(QDialog):
         self.camera_bin = int(camera_bin or 1)
         self._thread = None
         self._worker = None
+        self._busy = False                      # an export is writing
         self._save_path = ""
 
         self._build()
@@ -293,6 +300,8 @@ class ExportDialog(QDialog):
             self.path_label.setText(path)
 
     def _export(self):
+        if self._busy:
+            return                              # one export at a time
         if not self._save_path:
             QMessageBox.warning(self, "Error", "Select an output path first.")
             return
@@ -332,21 +341,36 @@ class ExportDialog(QDialog):
                 camera_bin=self.camera_bin,
             )
 
+        self._join_thread()                     # the previous export's thread, already quitting
         self._worker = w
+        self._busy = True
         self._thread = QThread()
         w.moveToThread(self._thread)
         self._thread.started.connect(w.run)
         w.progressed.connect(self.progress.setValue)
         w.finished.connect(self._on_done)
         w.error.connect(self._on_error)
+        # The worker is done once it reports: end the thread's event loop then.
+        w.finished.connect(self._thread.quit)
+        w.error.connect(self._thread.quit)
         self._thread.start()
 
+    def _join_thread(self):
+        """Quit and wait for the export thread (blocks while an export is still writing)."""
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread = None
+
     def _on_done(self, elapsed):
+        self._busy = False
+        self.exported.emit(self._save_path)
         self.lbl_status.setText(f"Completed in {elapsed:.2f}s")
         self.btn_export.setEnabled(True)
         QMessageBox.information(self, "Done", f"Saved:\n{self._save_path}")
 
     def _on_error(self, msg):
+        self._busy = False
         self.lbl_status.setText("Export failed")
         self.btn_export.setEnabled(True)
         QMessageBox.critical(self, "Error", msg)
@@ -356,9 +380,7 @@ class ExportDialog(QDialog):
 
         Blocks until a running export finishes, because the thread is joined.
         """
-        if self._thread:
-            self._thread.quit()
-            self._thread.wait()
+        self._join_thread()
         self.cube = None
         self._worker = None
         super().closeEvent(event)
@@ -392,9 +414,10 @@ class CubeViewerWindow(QWidget):
     shows the current band (during the sweep and a slider drag it follows every 250 ms).
 
     Unlike the widgets listed in the package ``__widgets__`` this one needs a cube,
-    so it is not constructible without arguments.  The widget emits no custom
-    signals; query it with ``status_info()``, ``spectrum_set`` and the ``current_band``
-    attribute.  On ``closeEvent`` the background jobs are stopped, the spectra cleared and
+    so it is not constructible without arguments.  Its one signal, ``cube_exported(str)``,
+    gives the path of each datacube the export dialog wrote; otherwise query it with
+    ``status_info()``, ``spectrum_set`` and the ``current_band`` attribute.  On
+    ``closeEvent`` the background jobs are stopped, the spectra cleared and
     the cube, wavelengths, canvas and plot references dropped; the export dialog is closed.
 
     Args:
@@ -440,6 +463,7 @@ class CubeViewerWindow(QWidget):
     """
 
     inline_bytes = INLINE_BYTES
+    cube_exported = pyqtSignal(str)
 
     def __init__(
         self,
@@ -1744,6 +1768,10 @@ class CubeViewerWindow(QWidget):
     #  EXPORT
     # ──────────────────────────────────────────────────────
 
+    def open_export_dialog(self):
+        """Show the "Export Datacube" dialog (the one already open is raised)."""
+        self._open_export()
+
     def _open_export(self):
         if self._export_dlg is not None and self._export_dlg.isVisible():
             self._export_dlg.raise_()
@@ -1754,6 +1782,7 @@ class CubeViewerWindow(QWidget):
             self, self.cube, self.wavelengths,
             self.config, self.camera_bin,
         )
+        self._export_dlg.exported.connect(self.cube_exported)
         self._export_dlg.show()
 
     # ──────────────────────────────────────────────────────

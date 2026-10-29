@@ -80,6 +80,8 @@ class ScanWindow(QWidget):
     snapshot_failed = pyqtSignal(int, str)
     cube_ready = pyqtSignal(object, object)
     calibration_requested = pyqtSignal(object, object)
+    #: Save on the unsaved-result prompt: open (cube, wavelengths) with the export dialog.
+    save_result_requested = pyqtSignal(object, object)
     #: The user finished a wavelength range edit: Enter, or focus leaving the Start/End pair.
     wavelength_range_committed = pyqtSignal()
 
@@ -329,6 +331,8 @@ class ScanWindow(QWidget):
         self._pending_wavelengths = None
         self._pending_spectrogram = None
         self._pending_spectrogram_metadata = None
+        self._result_at_risk = False        # the pending cube was never exported nor knowingly discarded
+        self._close_confirmed = False       # confirm_close() already asked for the close under way
         self._cal_win = None  # ★ keep reference
         self._spectro_viewer = None
 
@@ -459,6 +463,7 @@ class ScanWindow(QWidget):
     def set_cube_ready(self, cube, wavelengths):
         self._pending_cube = cube
         self._pending_wavelengths = wavelengths
+        self._result_at_risk = True                 # in RAM only until it is exported
 
         shape_str = f"{cube.shape[0]}x{cube.shape[1]}x{cube.shape[2]}"
 
@@ -472,6 +477,61 @@ class ScanWindow(QWidget):
         if self._pending_cube is None:
             return
         self.cube_ready.emit(self._pending_cube, self._pending_wavelengths)
+
+    def has_unsaved_result(self) -> bool:
+        """True while the last scan's cube exists only in RAM (never exported, not discarded)."""
+        return self._pending_cube is not None and self._result_at_risk
+
+    def mark_result_saved(self, cube):
+        """``cube`` was exported; if it is the pending result, losing it needs no question."""
+        if cube is not None and cube is self._pending_cube:
+            self._result_at_risk = False
+
+    def confirm_discard_result(self, action: str) -> bool:
+        """Ask before ``action`` drops a never-exported result: Save / Discard / Cancel.
+
+        Returns True to go on (nothing unsaved, or Discard).  Save opens the cube with its
+        export dialog (``save_result_requested``) and returns False like Cancel: the action
+        waits until the user has exported and tries again.
+        """
+        if not self.has_unsaved_result():
+            return True
+        shape = "x".join(str(n) for n in self._pending_cube.shape)
+        what = (f"cube ({shape}) and its raw spectrogram have" if self._pending_spectrogram is not None
+                else f"cube ({shape}) has")
+        answer = QMessageBox.warning(
+            self, "Unsaved Scan",
+            f"The last scan's {what} not been saved.\n"
+            f"{action} discards it.\n\n"
+            "Save opens the export dialog; try again once the export has finished.",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+        if answer == QMessageBox.Discard:
+            self._result_at_risk = False
+            return True
+        if answer == QMessageBox.Save:
+            self.save_result_requested.emit(self._pending_cube, self._pending_wavelengths)
+        return False
+
+    def confirm_close(self, action: str = "Closing the scan window") -> bool:
+        """Ask what happens to the scan data before the window closes; True to close.
+
+        A running scan is stopped first (Yes): its frames so far become the cube, which is
+        then covered by :meth:`confirm_discard_result`.  The next ``closeEvent`` does not ask again.
+        """
+        controller = self.controller
+        # After controller.cleanup() the camera is stopped: nothing can be built any more.
+        if (controller is not None and controller.state == controller.SCANNING
+                and controller.preview_thread is not None):
+            answer = QMessageBox.question(
+                self, "Scan Running",
+                f"A scan is running. Stop it?\n{action} needs the scan stopped; the frames "
+                "recorded so far are kept as a cube you can save.",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if answer != QMessageBox.Yes:
+                return False
+            controller.stop_scan_manually()
+        self._close_confirmed = self.confirm_discard_result(action)
+        return self._close_confirmed
 
     # ── spectrogram ─────────────────────────────────────────────
 
@@ -759,6 +819,10 @@ class ScanWindow(QWidget):
     # ── lifecycle ────────────────────────────────────────────────
 
     def closeEvent(self, event):
+        confirmed, self._close_confirmed = self._close_confirmed, False
+        if not confirmed and not self.confirm_close():
+            event.ignore()
+            return
         if self.controller is not None and self.controller.cleanup() is False:
             event.ignore()
             return
@@ -767,4 +831,4 @@ class ScanWindow(QWidget):
             self._cal_win.close()
         if self._spectro_viewer is not None:                    
             self._spectro_viewer.close()
-        super().closeEvent(event)
+        super().closeEvent(event)

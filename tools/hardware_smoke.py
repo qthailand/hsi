@@ -33,8 +33,18 @@ def main(argv=None) -> int:
     parser.add_argument("--exposure-ms", type=float, default=1.0)
     args = parser.parse_args(argv)
 
-    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtWidgets import QApplication, QMessageBox
     app = QApplication.instance() or QApplication([])
+    # Unattended and offscreen (where a message box cannot be shown): the check keeps no data,
+    # so the Save / Discard question at close is answered Discard and a running scan is stopped;
+    # errors and notes are printed.
+    def answer(choice):
+        def box(parent, title, text, *rest):
+            print(f"[dialog] {title}: {text}")
+            return choice
+        return staticmethod(box)
+    QMessageBox.warning, QMessageBox.question = answer(QMessageBox.Discard), answer(QMessageBox.Yes)
+    QMessageBox.critical = QMessageBox.information = answer(QMessageBox.Ok)
 
     import config as app_config
     import windows.main_window as main_window_module
@@ -98,9 +108,9 @@ def main(argv=None) -> int:
                 marks["start"] = fetched["n"]          # camera frames fetched when recording is armed
             original_arm(active)
 
-        def take():
+        def take(*args, **kwargs):
             marks.setdefault("end", fetched["n"])      # ... and when it is disarmed (cube is built after)
-            return original_take()
+            return original_take(*args, **kwargs)
 
         recorder.set_recording, recorder.take_frames = arm, take
 
