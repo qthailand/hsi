@@ -14,8 +14,11 @@ asking the user:
   over the measured lamp lines, written by ``modules.spectral_resolution``; the acquisition
   engine can use it as the wavelength bin width).
 
-The host chooses one folder pair per camera backend (``.../<backend>/``); files inside are
-keyed by hardware bin. Before a file is replaced, the old one is copied to
+The host chooses one folder pair per physical camera (its camera profile,
+:class:`~modules.contracts.CameraProfile`: ``.../wavelength`` and ``.../smile``); files inside
+are keyed by hardware bin. Optional fallback folders (the older per-backend folders) are only
+read, when the camera's own folder has no file for that bin; everything is saved to the
+camera's folders. Before a file is replaced, the old one is copied to
 ``<folder>/history/<name>.<timestamp><ext>``.
 
 Data conventions:
@@ -164,26 +167,68 @@ class CalibrationStore:
 
     Args:
         wavelength_folder: Folder for ``wavelength_bin<N>.json`` and ``resolution_bin<N>.json``
-            (one camera backend).
-        smile_folder: Folder for ``smile_model_bin<N>.npz`` (one camera backend).
+            (one camera).
+        smile_folder: Folder for ``smile_model_bin<N>.npz`` (one camera).
+        fallback_wavelength_folder: Read-only folder searched when ``wavelength_folder`` has no
+            file for the bin (older per-backend layout), or ``None``.
+        fallback_smile_folder: Same for ``smile_folder``.
+
+    The ``*_path`` methods give where a calibration is saved; the ``find_*`` methods and the
+    loaders use that file, or else the fallback folder's (see :meth:`is_fallback`).
     """
 
-    def __init__(self, wavelength_folder, smile_folder):
+    def __init__(self, wavelength_folder, smile_folder, fallback_wavelength_folder=None,
+                 fallback_smile_folder=None):
         self.wavelength_folder = Path(wavelength_folder)
         self.smile_folder = Path(smile_folder)
+        self.fallback_wavelength_folder = self._other(fallback_wavelength_folder, self.wavelength_folder)
+        self.fallback_smile_folder = self._other(fallback_smile_folder, self.smile_folder)
+
+    @staticmethod
+    def _other(folder, own: Path) -> Optional[Path]:
+        if folder is None:
+            return None
+        folder = Path(folder)
+        return None if folder.resolve() == own.resolve() else folder
 
     # ── paths ──────────────────────────────────────────────
     def wavelength_path(self, setting: CameraSetting) -> Path:
-        """Path of the wavelength profile for ``setting``'s bin."""
+        """Path the wavelength profile for ``setting``'s bin is saved to."""
         return self.wavelength_folder / f"wavelength_bin{int(setting.camera_bin)}.json"
 
     def smile_path(self, setting: CameraSetting) -> Path:
-        """Path of the smile model for ``setting``'s bin (the HSI runtime's file name)."""
+        """Path the smile model for ``setting``'s bin is saved to (the HSI runtime's file name)."""
         return self.smile_folder / f"smile_model_bin{int(setting.camera_bin)}.npz"
 
     def resolution_path(self, setting: CameraSetting) -> Path:
-        """Path of the spectral-resolution (FWHM) measurement for ``setting``'s bin."""
+        """Path the spectral-resolution (FWHM) measurement for ``setting``'s bin is saved to."""
         return self.wavelength_folder / f"resolution_bin{int(setting.camera_bin)}.json"
+
+    @staticmethod
+    def _existing(path: Path, fallback: Optional[Path]) -> Optional[Path]:
+        if path.exists():
+            return path
+        if fallback is not None and (fallback / path.name).exists():
+            return fallback / path.name
+        return None
+
+    def find_wavelength(self, setting: CameraSetting) -> Optional[Path]:
+        """Stored wavelength profile for ``setting``'s bin (own folder first), or ``None``."""
+        return self._existing(self.wavelength_path(setting), self.fallback_wavelength_folder)
+
+    def find_smile(self, setting: CameraSetting) -> Optional[Path]:
+        """Stored smile model for ``setting``'s bin (own folder first), or ``None``."""
+        return self._existing(self.smile_path(setting), self.fallback_smile_folder)
+
+    def find_resolution(self, setting: CameraSetting) -> Optional[Path]:
+        """Stored FWHM measurement for ``setting``'s bin (own folder first), or ``None``."""
+        return self._existing(self.resolution_path(setting), self.fallback_wavelength_folder)
+
+    def is_fallback(self, path) -> bool:
+        """True when ``path`` lies in a fallback folder (an older file of unknown camera)."""
+        parent = Path(path).parent.resolve()
+        return any(folder is not None and parent == folder.resolve()
+                   for folder in (self.fallback_wavelength_folder, self.fallback_smile_folder))
 
     @staticmethod
     def backup(path) -> Optional[Path]:
@@ -237,8 +282,8 @@ class CalibrationStore:
             ValueError, KeyError, OSError: the file exists but is not a valid profile.
         """
         from .wavelength import WavelengthCalibration
-        path = self.wavelength_path(setting)
-        if not path.exists():
+        path = self.find_wavelength(setting)
+        if path is None:
             return None
         profile = WavelengthCalibration.load(path)
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -284,8 +329,8 @@ class CalibrationStore:
         Raises:
             ValueError, KeyError, OSError: the file exists but is not a valid measurement.
         """
-        path = self.resolution_path(setting)
-        if not path.exists():
+        path = self.find_resolution(setting)
+        if path is None:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("units") != "nm":

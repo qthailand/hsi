@@ -227,11 +227,14 @@ class SmileCorrector:
 
     # ─── Persistence ───
 
-    def save(self, path: str) -> None:
+    def save(self, path: str, camera_setting: Optional[dict] = None) -> None:
         """Save the fitted model to a compressed ``.npz`` file.
 
         Args:
             path: Destination file path.
+            camera_setting: Camera configuration the model belongs to
+                (``CameraSetting.to_dict()``), stored in the file so a model of another
+                camera setting can be refused; ``None`` stores none.
         """
         self._check_fitted()
         if self._analysis is not None:
@@ -258,6 +261,8 @@ class SmileCorrector:
                 notes="re-saved from loaded model",
                 y_ref=self.y_ref,
             )
+        if camera_setting is not None:
+            cal.camera_setting = dict(camera_setting)
         save_calibration(path, cal)
 
     @classmethod

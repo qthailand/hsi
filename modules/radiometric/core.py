@@ -218,10 +218,22 @@ def _cast_band(img, dtype):
 def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
                                     avg_window_size, mask,
                                     progress_callback=None):
-    """Fit reference-spectrum factors per image row using the selected ROI."""
+    """Fit reference-spectrum factors per image row using the selected ROI.
+
+    Returns:
+        dict: ``factors`` ``(lines, bands)`` float32, ``span`` (first, last ROI row),
+        ``out_of_range_bands`` (bands outside the reference table: factor NaN, so their
+        reflectance is NaN instead of an extrapolated guess), ``table_range_nm`` and
+        ``reference`` (header metadata: ``reflectance_reference`` table file,
+        ``reflectance_reference_cube``, ``reflectance_reference_rows``, plus
+        ``calibration_warnings`` when bands fall outside the table).
+    """
     progress_callback = progress_callback or (lambda value: None)
     data_ref = pd.read_excel(ref_excel, header=None).to_numpy()
-    f_ref = CubicSpline(data_ref[:, 0], data_ref[:, 1])
+    # no extrapolation: a cubic spline outside the table goes wild (PVC 400-999.5 nm gives
+    # -885 at 1200 nm); bands outside it get NaN factors and are reported
+    f_ref = CubicSpline(data_ref[:, 0], data_ref[:, 1], extrapolate=False)
+    table_range = (float(np.min(data_ref[:, 0])), float(np.max(data_ref[:, 0])))
     wl = ref_meta['wavelength']
 
     H, W = ref_meta['lines'], ref_meta['samples']
@@ -243,7 +255,8 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
         return rows_has_roi[left:right]
 
     rowwise_factors = np.zeros((H, len(wl)), dtype=np.float32)
-    R_ref_per_band = f_ref(wl).astype(np.float32)
+    R_ref_per_band = f_ref(np.asarray(wl, dtype=np.float64)).astype(np.float32)
+    out_of_range = int(np.count_nonzero(~np.isfinite(R_ref_per_band)))
 
     progress_callback(0)
     for i in range(ref_meta['bands']):
@@ -262,7 +275,17 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
             rowwise_factors[y, i] = R_ref_per_band[i] / mean_val
 
         progress_callback(i + 1)
-    return {'factors': rowwise_factors, 'span': (top_roi, bot_roi)}
+    reference = {
+        'reflectance_reference': os.path.basename(str(ref_excel)),
+        'reflectance_reference_cube': os.path.basename(str(ref_filepath)),
+        'reflectance_reference_rows': f'{top_roi}-{bot_roi}',
+    }
+    if out_of_range:
+        reference['calibration_warnings'] = (
+            f'{out_of_range} bands outside the reference table '
+            f'({table_range[0]:g}-{table_range[1]:g} nm) have no reflectance (NaN)')
+    return {'factors': rowwise_factors, 'span': (top_roi, bot_roi), 'out_of_range_bands': out_of_range,
+            'table_range_nm': table_range, 'reference': reference}
 
 
 def create_datacube_logic(params, progress_callback=None):
@@ -284,7 +307,7 @@ def create_datacube_logic(params, progress_callback=None):
     out_dt, out_dtype = _output_type(raw_meta, is_cal)
 
     hdr_path = save_path + '.hdr'
-    with open(hdr_path, 'w') as hopen:
+    with open(hdr_path, 'w', encoding='utf-8', newline='\n') as hopen:
         hopen.write('ENVI\n')
         old_desc = raw_meta.get('description', 'Processed Data')
         bin_text = f"Spatial Binning = {n_bin}x{n_bin}" if n_bin > 1 else "Original Spatial Res"
@@ -295,7 +318,8 @@ def create_datacube_logic(params, progress_callback=None):
         hopen.write(f'data type = {out_dt}\n')
         hopen.write('interleave = bip\n')
         hopen.write('byte order = 0\n')
-        for line in carried_header_lines(raw_meta, calibrated=is_cal):
+        for line in carried_header_lines(raw_meta, calibrated=is_cal,
+                                         extra=params.get('reference_info') if is_cal else None):
             hopen.write(line + '\n')
         hopen.write('wavelength units = Nanometers\n')
         if is_wavelength and raw_meta.get('wavelength') is not None:
@@ -348,7 +372,7 @@ def create_datacube_resampled_logic(params, progress_callback=None):
     out_dt, out_dtype_np = _output_type(raw_meta, is_cal)
 
     hdr_path = save_path + '.hdr'
-    with open(hdr_path, 'w') as hopen:
+    with open(hdr_path, 'w', encoding='utf-8', newline='\n') as hopen:
         hopen.write('ENVI\n')
         old_desc = raw_meta.get('description', 'Processed Data')
         bin_text = f"Spatial Binning = {n_bin}x{n_bin}" if n_bin > 1 else "Original Spatial Res"
@@ -359,7 +383,8 @@ def create_datacube_resampled_logic(params, progress_callback=None):
         hopen.write(f'data type = {out_dt}\n')
         hopen.write('interleave = bip\n')
         hopen.write('byte order = 0\n')
-        for line in carried_header_lines(raw_meta, calibrated=is_cal):
+        for line in carried_header_lines(raw_meta, calibrated=is_cal,
+                                         extra=params.get('reference_info') if is_cal else None):
             hopen.write(line + '\n')
         hopen.write('wavelength units = Nanometers\n')
         if is_wavelength:

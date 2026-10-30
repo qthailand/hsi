@@ -30,7 +30,7 @@ import threading
 import numpy as np
 
 from .ximea import xiapi
-from .base import AbstractCameraBackend, CameraBackendInfo
+from .base import AbstractCameraBackend, CameraBackendInfo, device_text
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,8 @@ class XIMEACameraBackend(AbstractCameraBackend):
         self._last_temperature: float = _TEMPERATURE_UNAVAILABLE
         self._cooled: bool = False
         self._target_temp_range: tuple | None = None
+        self._model_name: str | None = None
+        self._serial_number: str | None = None
         self._stop_event: threading.Event | None = None
         # Serialises SDK calls; fetch holds it for at most its timeout.
         self._lock = threading.RLock()
@@ -120,6 +122,14 @@ class XIMEACameraBackend(AbstractCameraBackend):
     def info(self) -> CameraBackendInfo:
         """CameraBackendInfo: sensor bit depth, pixel size and current width/height."""
         return self._info
+
+    def model_name(self) -> str | None:
+        """xiAPI ``device_name`` read at ``open`` (``None`` before, or if unavailable)."""
+        return self._model_name
+
+    def serial_number(self) -> str | None:
+        """xiAPI ``device_sn`` read at ``open`` (``None`` before, or if unavailable)."""
+        return self._serial_number
 
     # ══════════════════════════════════════════════════════
     #  Internal helpers (call with self._lock held)
@@ -283,6 +293,14 @@ class XIMEACameraBackend(AbstractCameraBackend):
             try:
                 camera.set_imgdataformat("XI_MONO16")
                 self._image = xiapi.Image()
+                try:
+                    self._model_name = device_text(camera.get_device_name())
+                except Exception as e:
+                    logger.debug("XIMEA device_name unavailable: %s", e)
+                try:
+                    self._serial_number = device_text(camera.get_device_sn())
+                except Exception as e:
+                    logger.debug("XIMEA device_sn unavailable: %s", e)
 
                 self._exposure_range_us = (
                     int(camera.get_exposure_minimum()),

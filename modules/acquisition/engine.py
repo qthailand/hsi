@@ -153,7 +153,9 @@ class AcquisitionEngine:
     Args:
         backend: A started-on-demand camera backend (see :mod:`modules.camera`); the
             engine opens it, streams it and closes it when the loop ends.
-        config: Object with ``smile_map_folder``, ``preprocessing_backend`` (optional),
+        config: Object with ``smile_map_folder``, optional ``camera_profile`` (a
+            :class:`modules.contracts.CameraProfile`: Smile models then come from its ``smile``
+            folder, ``smile_map_folder`` being only a fallback), ``preprocessing_backend`` (optional),
             ``m``, ``c`` (nm/pixel at bin 1, nm) and ``resolution`` (nm per output bin).
             A wavelength calibration (applied, or found by :meth:`set_wavelength_lookup`)
             updates ``config.m`` and ``config.c``. With ``resolution_source = "fwhm"`` the
@@ -195,10 +197,16 @@ class AcquisitionEngine:
         self._pending_smile_model = None
         self._last_correction_status = None
         self._wavelength_lookup = None
+        self._smile_setting_check = None
+        # where config.m/c came from ('wavelength_*' header keys; see correction_info)
+        self._wavelength_provenance = {"wavelength_source": "config"}
+        self._calibration_warnings: dict[str, str] = {}   # 'wavelength' / 'smile' -> message
         self._resolution_lookup = None
         self._fwhm_nm = None                      # FWHM stored for the current setting (nm), or None
         self._pending_resolution_reload = False
-        self._smile = SmileRuntime(config.smile_map_folder)
+        camera_profile = getattr(config, 'camera_profile', None)   # the open camera's folders (host sets it)
+        self._smile = (SmileRuntime(camera_profile.smile_folder, fallback_folder=config.smile_map_folder)
+                       if camera_profile is not None else SmileRuntime(config.smile_map_folder))
         self._preprocessor = PreprocessingRuntime(getattr(config, 'preprocessing_backend', 'auto'))
         self._shared_preprocessing = getattr(getattr(type(backend), 'read_frame', None), '__qualname__', '') == 'AbstractCameraBackend.read_frame'
         self._passthrough_dark = DarkProcessor()
@@ -484,11 +492,40 @@ class AcquisitionEngine:
 
         Call before the loop starts. ``lookup()`` runs on the worker thread when streaming
         starts and after every bin change, once the camera is at the new bin. It returns the
-        ``WavelengthCalibration`` of the current setting, or raises ``LookupError`` saying
-        why there is none; ``config.m``/``config.c`` are then kept (with a warning).
-        ``None`` disables the lookup.
+        ``WavelengthCalibration`` of the current setting (or an object with ``profile``,
+        ``path`` and optionally ``saved_at``, such as a ``StoredWavelength``, so the file is
+        recorded), or raises ``LookupError`` saying why there is none; ``config.m``/
+        ``config.c`` are then kept, and the Wavelength status card and
+        :meth:`correction_info` say so. ``None`` disables the lookup.
         """
         self._wavelength_lookup = lookup
+
+    def record_wavelength_file(self, profile, path):
+        """The profile applied from the calibration window was stored as ``path`` (any thread).
+
+        From then on the cubes name that file (``wavelength_source`` ``"stored"``), as they do for
+        a profile found by the lookup. Ignored unless ``profile`` is the one now in use.
+        """
+        if (self._wavelength_provenance.get("wavelength_source") != "applied"
+                or float(self.config.m) != float(profile.base_m) or float(self.config.c) != float(profile.c)):
+            return
+        self._wavelength_provenance = {
+            "wavelength_source": "stored", "wavelength_rms_nm": float(profile.rms_nm),
+            "wavelength_profile": Path(path).name,
+            "wavelength_profile_saved": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+    def set_smile_setting_check(self, check):
+        """Check each loaded Smile model against the camera setting with ``check(setting)``.
+
+        Call before the loop starts. ``check`` runs on the worker thread after a model is
+        loaded; it gets the camera setting dict stored in the model (``camera_setting``,
+        see :func:`modules.smile.save_calibration`) and returns the list of mismatches
+        (empty = the model belongs to the current camera, index, bin, orientation and frame
+        size). A model with mismatches is not applied; a model without a stored setting is
+        applied with a warning. ``None`` disables the check.
+        """
+        self._smile_setting_check = check
 
     def set_resolution_lookup(self, lookup):
         """Find the FWHM stored for each camera setting with ``lookup()``.
@@ -513,15 +550,17 @@ class AcquisitionEngine:
 
         Returns:
             dict: ``dark_corrected``, ``hot_pixel_corrected``, ``smile_corrected`` (bools),
-            ``hot_pixel_count`` and ``smile_model`` (file name) when they apply, and
-            ``frame_rate_hz``.  The correction keys are left out when no frame was processed
-            yet or the frame was a dark-capture frame (unknown).
+            ``hot_pixel_count``, ``smile_model`` (file name) and ``smile_model_created`` when
+            they apply, ``frame_rate_hz``, and the wavelength provenance and calibration
+            warnings of :meth:`calibration_provenance`.  The correction keys are left out when
+            no frame was processed yet or the frame was a dark-capture frame (unknown).
         """
         info = {} if self._camera_hz is None else {"frame_rate_hz": self._camera_hz}
+        info.update(self.calibration_provenance())
         status = self._last_correction_status
         if status is None or status[0]:
             return info
-        _, enabled, _, matches, model_id, smile_path, _, smile_error = status
+        _, enabled, _, matches, model_id, smile_path, _, smile_error = status[:8]
         hot = getattr(self.backend, '_hot_coords', None)
         info["dark_corrected"] = bool(enabled and matches)
         info["hot_pixel_corrected"] = bool(enabled and hot is not None)
@@ -530,6 +569,33 @@ class AcquisitionEngine:
         info["smile_corrected"] = bool(model_id != id(None) and not smile_error)
         if info["smile_corrected"] and smile_path:
             info["smile_model"] = Path(smile_path).name
+            created = getattr(getattr(getattr(self, "_smile", None), "calibration", None), "created", None)
+            if created:
+                info["smile_model_created"] = str(created)
+        return info
+
+    def calibration_provenance(self) -> dict:
+        """Where the wavelength axis came from and the calibration warnings now in effect.
+
+        Any thread (plain reads). Returns:
+            dict: ``wavelength_source`` (``"stored"`` = the file stored for this camera
+            setting, ``"applied"`` = from the calibration window, ``"fallback"`` = none for
+            this setting, so the previous m/c is kept, ``"config"`` = config m/c only),
+            ``wavelength_profile`` / ``wavelength_profile_saved`` / ``wavelength_rms_nm``
+            when known, ``wavelength_m_nm_per_px`` and ``wavelength_c_nm`` (bin 1) actually
+            used, and ``calibration_warnings`` (``"; "``-joined) when there are any.
+        """
+        provenance = getattr(self, "_wavelength_provenance", None)
+        if provenance is None:                   # engine not initialised (test doubles)
+            return {}
+        info = dict(provenance)
+        info.pop("wavelength_kept_from", None)
+        m, c = getattr(self.config, "m", None), getattr(self.config, "c", None)
+        if m is not None and c is not None:
+            info["wavelength_m_nm_per_px"] = float(m)
+            info["wavelength_c_nm"] = float(c)
+        if self._calibration_warnings:
+            info["calibration_warnings"] = "; ".join(self._calibration_warnings.values())
         return info
 
     def binning_info(self) -> dict:
@@ -586,6 +652,10 @@ class AcquisitionEngine:
         with self._binner_lock:
             self._binner = None
             self._binner_fitted = False
+        # applied from the calibration window: not (yet) a stored file
+        self._wavelength_provenance = {"wavelength_source": "applied",
+                                       "wavelength_rms_nm": float(profile.rms_nm)}
+        self._calibration_warnings.pop("wavelength", None)
         self.sink.wavelength_applied(profile)
 
     def _apply_pending_wavelength_range(self):
@@ -774,8 +844,11 @@ class AcquisitionEngine:
         model = self._smile.calibration
         bin_value = int(self.backend.current_bin)
         matches = reference is not None and reference.shape == frame.shape
+        warnings = dict(getattr(self, '_calibration_warnings', {}))
+        wavelength = dict(getattr(self, '_wavelength_provenance', {}))
         key = (dark_capture, enabled, id(reference), matches, id(model),
-               self._smile.path, bin_value, smile_error)
+               self._smile.path, bin_value, smile_error,
+               tuple(sorted(warnings.items())), tuple(sorted(wavelength.items())))
         if key == self._last_correction_status:
             return
         self._last_correction_status = key
@@ -793,17 +866,60 @@ class AcquisitionEngine:
                 dark = ('Applied', f'Reference matched · bin {bin_value}')
             if smile_error:
                 smile = ('Missing', 'Model could not process frame')
+            elif model is None and 'smile' in warnings:
+                smile = ('Missing', 'Model for another setting')
             elif model is None:
                 smile = ('Missing', f'No model · bin {bin_value}')
+            elif 'smile' in warnings:
+                smile = ('Applied', f'{Path(self._smile.path).name} · setting unverified')
             else:
                 smile = ('Applied', Path(self._smile.path).name)
-        self.sink.correction_status({'dark': dark, 'smile': smile})
+        source = wavelength.get('wavelength_source', 'config')
+        if source == 'stored':
+            wl = ('Applied', wavelength.get('wavelength_profile', f'Stored · bin {bin_value}'))
+        elif source == 'applied':
+            wl = ('Applied', 'Applied from calibration window')
+        elif source == 'fallback':
+            wl = ('Missing', f"bin {bin_value}: using {wavelength.get('wavelength_kept_from', 'old m/c')}")
+        else:
+            wl = ('Off', 'Config m/c (no stored calibration)')
+        status = {'dark': dark, 'smile': smile, 'wavelength': wl}
+        if warnings:
+            status['warnings'] = tuple(warnings.values())
+        self.sink.correction_status(status)
 
     def _select_smile_bin(self):
         try:
             self._smile.set_bin(self.backend.current_bin)
         except Exception as exc:
             self.sink.error(f"Smile model load failed: {exc}")
+        self._check_smile_setting()
+
+    def _check_smile_setting(self):
+        """Refuse a loaded Smile model of another camera setting; warn when it records none."""
+        self._calibration_warnings.pop("smile", None)
+        cal = self._smile.calibration
+        if cal is None:
+            return
+        name = Path(self._smile.path).name if self._smile.path else "Smile model"
+        saved = getattr(cal, "camera_setting", None)
+        if not saved:
+            self._calibration_warnings["smile"] = (
+                f"{name} records no camera setting: camera / orientation not verified")
+            logger.warning("Smile model %s records no camera setting; applied unverified", name)
+            return
+        check = self._smile_setting_check
+        if check is None:
+            return
+        try:
+            problems = list(check(saved))
+        except Exception as exc:                  # a broken check must not drop the model silently
+            problems = [f"setting check failed: {exc}"]
+        if problems:
+            self._smile.calibration = None        # not applied: it would remap the wrong pixels
+            self._calibration_warnings["smile"] = (
+                f"{name} is for another camera setting ({'; '.join(problems)}); Smile correction off")
+            logger.warning("Smile model %s not applied: %s", name, "; ".join(problems))
 
     def _select_resolution(self):
         """Use the FWHM stored for the current camera setting, if ``resolution_source`` asks for it."""
@@ -841,15 +957,32 @@ class AcquisitionEngine:
             return
         bin_value = int(self.backend.current_bin)
         try:
-            profile = lookup()
+            found = lookup()
+            profile = getattr(found, "profile", found)
             if int(profile.camera_bin) != bin_value:
                 raise LookupError(f"stored profile is for bin {profile.camera_bin}")
         except Exception as exc:
             logger.warning("Bin %d: no usable wavelength calibration (%s); keeping m=%.8g nm/px (bin 1), c=%.8g nm",
                            bin_value, exc, float(self.config.m), float(self.config.c))
+            kept = self._wavelength_provenance
+            source = kept.get("wavelength_profile") or kept.get("wavelength_source", "config")
+            if kept.get("wavelength_source") == "fallback":
+                source = kept.get("wavelength_kept_from", source)
+            self._wavelength_provenance = {"wavelength_source": "fallback", "wavelength_kept_from": source}
+            self._calibration_warnings["wavelength"] = (
+                f"No wavelength calibration for bin {bin_value} ({exc}); still using m/c from {source}")
             return
         self.config.m = profile.base_m
         self.config.c = profile.c
+        provenance = {"wavelength_source": "stored", "wavelength_rms_nm": float(profile.rms_nm)}
+        path = getattr(found, "path", None)
+        if path is not None:
+            provenance["wavelength_profile"] = Path(path).name
+        saved_at = getattr(found, "saved_at", None)
+        if saved_at is not None:
+            provenance["wavelength_profile_saved"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(saved_at))
+        self._wavelength_provenance = provenance
+        self._calibration_warnings.pop("wavelength", None)
         with self._binner_lock:
             self._binner = None
             self._binner_fitted = False
@@ -866,6 +999,7 @@ class AcquisitionEngine:
                 logger.info("Smile model selected: %s", path)
             except Exception as exc:
                 self.sink.error(f"Smile model load failed: {exc}")
+            self._check_smile_setting()
 
     def _apply_pending_params_if_needed(self):
         with self._lock:

@@ -741,8 +741,8 @@ class SpectralResolutionWidget(QWidget):
                 self.profile, self.profile_source = stored.profile, str(stored.path)
         except Exception as exc:  # noqa: BLE001
             self.lbl_wavelength.setText(f"✗ cannot read stored profile: {exc}")
-        path = self._store.smile_path(self.setting)
-        if path.exists():
+        path = self._store.find_smile(self.setting)
+        if path is not None:
             try:
                 self._set_smile(path)
             except Exception as exc:  # noqa: BLE001

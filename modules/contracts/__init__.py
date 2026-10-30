@@ -4,7 +4,8 @@ Modules depend on ``modules.contracts`` instead of on each other for anything th
 exchange: the cube container (:class:`CubeData`), the reference-row rule
 (:func:`default_reference_row`), the wavelength-calibration file layouts
 (:func:`normalize_wavelength_config`) and where the calibration of a camera setting is
-stored (:class:`CameraSetting`, :class:`CalibrationStore`).
+stored (:class:`CameraSetting`, :class:`CalibrationStore`, and the per-camera folder
+:class:`CameraProfile`).
 
 Data conventions:
     Cubes are ``(slit, scan, wavelength)``; spectral images are ``(slit, wavelength)``.
@@ -70,7 +71,9 @@ class CubeData:
 from .geometry import default_reference_row
 from .wavelength import WavelengthCalibration, normalize_wavelength_config
 from .calibration_set import CalibrationStore, CameraSetting, StoredResolution, StoredWavelength
+from .camera_profile import CameraProfile, profile_name
 
 __all__ = ["CubeData", "default_reference_row", "normalize_wavelength_config", "WavelengthCalibration",
-           "CameraSetting", "CalibrationStore", "StoredWavelength", "StoredResolution"]
+           "CameraSetting", "CalibrationStore", "StoredWavelength", "StoredResolution",
+           "CameraProfile", "profile_name"]
 __requires__ = ()

@@ -71,14 +71,27 @@ standards = normalize_wavelength_config(json.load(open("profile.json")))
   median FWHM in nm (`fwhm_nm`, plus `camera_setting`, `saved_at` and free-form details such as
   the per-line values): `save_resolution(fwhm_nm, setting, details=None)` (refuses a non-positive
   or non-finite FWHM; previous file to `history/`), `load_resolution(setting)` returns
-  `StoredResolution` (`fwhm_nm`, `ok`/`problems`, `details`). The HSI app uses
-  `config/calibration/wavelength/<backend>/` and `smile_maps/<backend>/`.
+  `StoredResolution` (`fwhm_nm`, `ok`/`problems`, `details`). Optional
+  `fallback_wavelength_folder` / `fallback_smile_folder` are read only: `find_wavelength`,
+  `find_smile`, `find_resolution` (and the loaders) return the camera's own file, else the
+  fallback folder's, else `None`; `is_fallback(path)` says which. The `*_path` methods are
+  where a calibration is saved (always the camera's folders).
+* **Camera profile** (`camera_profile.py`): `CameraProfile.for_camera(profiles_folder, backend,
+  model, serial)` is `<profiles_folder>/<backend>/<model>_<serial>/` (`profile_name`: characters
+  outside `A-Z a-z 0-9 . _ -` become `_`; `<model>` or `SN<serial>` when only one is known;
+  `unknown` when neither) with `dark_folder` (`dark/`), `smile_folder` (`smile/`),
+  `wavelength_folder` (`wavelength/`) and `info_path` (`profile.json`: `format_version`,
+  `backend`, `model`, `serial`, `created_at`, `last_opened_at`, plus what `write_info(**extra)`
+  adds; the HSI app stores `frame_width`/`frame_height`/`camera_bin` at open). The HSI app saves every calibration of the open
+  camera there and reads the older per-backend folders (`dark_frames/<backend>/`,
+  `smile_maps/<backend>/`, `calibration/wavelength/<backend>/`) only as a fallback.
 
 ## API summary
 
 `CubeData` (`validate()`), `default_reference_row`, `normalize_wavelength_config`,
-`WavelengthCalibration`, `CameraSetting`, `CalibrationStore`, `StoredWavelength`, `StoredResolution`.
-Implementation: `geometry.py`, `wavelength.py`, `calibration_set.py`, `__init__.py`.
+`WavelengthCalibration`, `CameraSetting`, `CalibrationStore`, `StoredWavelength`, `StoredResolution`,
+`CameraProfile`, `profile_name`.
+Implementation: `geometry.py`, `wavelength.py`, `calibration_set.py`, `camera_profile.py`, `__init__.py`.
 
 ## Threading
 

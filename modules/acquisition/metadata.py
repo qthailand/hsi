@@ -39,6 +39,15 @@ def _number(value, kind):
     return None if value is None else kind(value)
 
 
+def _device_text(backend, name: str) -> Optional[str]:
+    """``backend.<name>()`` (``model_name``/``serial_number``), or ``None`` if absent or failing."""
+    method = getattr(backend, name, None)
+    try:
+        return (method() or None) if callable(method) else None
+    except Exception:
+        return None
+
+
 def camera_bit_info(backend) -> dict:
     """Bit depth of the frames, real bits before scaling, and the frames' full-scale value.
 
@@ -72,7 +81,8 @@ def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
 
     Args:
         backend: The camera backend (``info``, ``current_bin``, and optionally ``gain`` /
-            ``exposure_ms`` attributes holding the values actually applied).
+            ``exposure_ms`` attributes holding the values actually applied, and
+            ``model_name()`` / ``serial_number()``).
         config: Object with ``camera_backend``, ``camera_index``, ``raw_inverted``, ``m`` (nm/pixel
             at bin 1), ``c`` (nm) and ``resolution`` (nm per output bin).
         scan: Stage settings of this scan, e.g. ``{'stage_type': 'rotation', 'degree': 10,
@@ -95,6 +105,8 @@ def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
         "started_at": started.isoformat(timespec="seconds"),
         "camera_backend": str(config.camera_backend),
         "camera_index": int(getattr(config, "camera_index", 0) or 0),
+        "camera_model": _device_text(backend, "model_name"),
+        "camera_serial": _device_text(backend, "serial_number"),
         "camera_bin": bin_value,
         "frame_height": int(info.height),
         "frame_width": int(info.width),

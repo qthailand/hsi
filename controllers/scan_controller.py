@@ -44,8 +44,8 @@ from modules.acquisition import ScanSession, build_raw_metadata
 from modules.dark import DarkFrameLibrary, select_dark, valid_temperature
 from modules.stage import StageThread
 
-from config import AppConfig
-from modules.contracts import CalibrationStore, CameraSetting
+from config import AppConfig, calibration_store
+from modules.contracts import CameraProfile, CameraSetting
 from modules.spectral_processing.wavelength import spectrum_from_corrected_row
 from modules.cube_io import create_pushbroom_cube_from_corrected
 from modules.smile import SmileCorrector
@@ -59,6 +59,9 @@ STAGE_SETTING_KEYS = ("rotation_speed_dps", "rotation_degree", "linear_distance_
 RANGE_SETTING_KEY = "wavelength_range_nm"
 
 logger = logging.getLogger(__name__)
+
+#: A dark captured further than this (°C) from the sensor's current temperature is flagged.
+DARK_TEMPERATURE_WARN_C = 5.0
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -117,19 +120,20 @@ class ScanController:
         self.disable_camera = _env_enabled("HSI_DISABLE_CAMERA", False)
         self.disable_preview_thread = _env_enabled("HSI_DISABLE_PREVIEW_THREAD", False)
 
-        # ── dark frame ───────────────────────────────────────────
-        self.dark_lib = DarkFrameLibrary(
-            folder=self.config.dark_frame_folder,
-            n_frames=self.config.dark_frame_n_frames,
-        )
-        self.dark_reference: dict | None = None
-        self._dark_path: str | None = None      # file of the active dark (to notice a nearer one)
-
         # ── camera backend factory (config.camera_backend: poa | genicam | ximea) ──
         from modules.camera import create_backend
         self.backend = create_backend(self.config)
 
         self.backend.open()
+
+        # ── camera profile: this camera's dark / smile / wavelength folders (model + serial,
+        #    known after open); the engine and the calibration windows read it from the config ──
+        self.camera_profile = self._open_camera_profile()
+        self.config.camera_profile = self.camera_profile
+        self.dark_lib = self._open_dark_library()
+        self.dark_reference: dict | None = None
+        self._dark_path: str | None = None      # file of the active dark (to notice a nearer one)
+        self._dark_provenance: dict = {}        # header keys of the active dark (file, temperature, frames)
 
         # ── preview thread ───────────────────────────────────────
         from modules.acquisition import CameraPreviewThread
@@ -152,13 +156,13 @@ class ScanController:
         self.preview_thread.correction_status.connect(self.win.correction_status.update_status)
         self.preview_thread.saturation_ready.connect(self._on_saturation)
         self.preview_thread.set_raw_inverted(self.config.raw_inverted)
+        # A Smile model measured at another camera setting is refused (worker thread).
+        self.preview_thread.set_smile_setting_check(self._smile_setting_problems)
         # Wavelength calibrations stored per camera setting replace config m/c at start and on bin changes.
         store = getattr(self.config, '_config_store', None)
-        self._wavelength_store = (
-            CalibrationStore(store.wavelength_folder(self.config.camera_backend), self.config.smile_map_folder)
-            if store is not None else None)
+        self._wavelength_store = calibration_store(self.config) if store is not None else None
         if self._wavelength_store is not None:
-            self.preview_thread.set_wavelength_lookup(self._stored_wavelength_profile)
+            self.preview_thread.set_wavelength_lookup(self._stored_wavelength)
             # FWHM stored per setting sets the bin width when resolution_source is "fwhm".
             self.preview_thread.set_resolution_lookup(self._stored_fwhm_nm)
         # The configured range applies from the first frame (nothing pending, nothing saved).
@@ -260,8 +264,10 @@ class ScanController:
                 raise ValueError("Profile image shape differs from camera geometry")
         self.preview_thread.request_wavelength(profile)
 
-    def _stored_wavelength_profile(self):
-        """Wavelength profile stored for the camera's current setting (called on the worker thread).
+    def _stored_wavelength(self):
+        """Wavelength calibration stored for the camera's current setting, with its file and save
+        time (``StoredWavelength``, so the cube records where its wavelengths came from); called
+        on the worker thread.
 
         Raises:
             LookupError: No file for this bin, or it was measured at another setting
@@ -273,7 +279,16 @@ class ScanController:
             raise LookupError(f"no {self._wavelength_store.wavelength_path(setting)}")
         if not stored.ok:
             raise LookupError(f"{stored.path} is for another setting: {'; '.join(stored.problems)}")
-        return stored.profile
+        return stored
+
+    def _smile_setting_problems(self, saved: dict) -> list:
+        """Mismatches between the camera setting a Smile model was measured at and the camera's
+        current one (empty = it fits); called on the worker thread."""
+        return self.camera_setting().mismatch(CameraSetting.from_dict(saved))
+
+    def _stored_wavelength_profile(self):
+        """Wavelength profile stored for the camera's current setting (see :meth:`_stored_wavelength`)."""
+        return self._stored_wavelength().profile
 
     def _stored_fwhm_nm(self) -> float:
         """Median FWHM (nm) stored for the camera's current setting (called on the worker thread).
@@ -305,11 +320,10 @@ class ScanController:
         if self.state == self.SCANNING or self.dark_lib.is_collecting:
             raise RuntimeError("Stop scan/dark capture before calibration")
         model = SmileCorrector(**params).fit(frame)
-        from pathlib import Path
-        folder = Path(self.config.smile_map_folder)
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"smile_model_bin{self.backend.current_bin}.npz"
-        model.save(str(path))
+        setting = self.camera_setting()
+        path = calibration_store(self.config).smile_path(setting)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        model.save(str(path), setting.to_dict())
         self.load_smile_model(str(path))
         return True
 
@@ -465,6 +479,10 @@ class ScanController:
 
     def _apply_backend_limits(self):
         try:
+            self.win.camera_controls.set_camera_name(self.backend.model_name())
+        except Exception as e:
+            logger.debug("Could not query camera model: %s", e)
+        try:
             gmin, gmax = self.backend.gain_range
             emin_us, emax_us = self.backend.exposure_range_us
             self.win.camera_controls.set_limits(            
@@ -495,6 +513,8 @@ class ScanController:
     def _set_state(self, state: str):
         self.session.state = state
         self.win.set_status(state)
+        if state != self.SCANNING and hasattr(self.win, "set_calibration_warning"):
+            self.win.set_calibration_warning("")       # the warnings belonged to that scan
 
         if state == self.PREVIEW:
             self.viewer.set_scanning_ui(False)
@@ -551,6 +571,52 @@ class ScanController:
     #  Dark frame
     # ══════════════════════════════════════════════════════════════
 
+    def _camera_identity(self) -> tuple[str | None, str | None]:
+        """``(model, serial)`` the open camera reports; ``None`` for what it does not."""
+        identity = []
+        for name in ("model_name", "serial_number"):
+            try:
+                identity.append(getattr(self.backend, name)() or None)
+            except Exception as e:
+                logger.debug("Could not query camera %s: %s", name, e)
+                identity.append(None)
+        return identity[0], identity[1]
+
+    def _open_camera_profile(self) -> CameraProfile:
+        """The open camera's profile folder (``profile.json`` written/refreshed)."""
+        model, serial = self._camera_identity()
+        profile = CameraProfile.for_camera(self.config.camera_profile_folder, self.config.camera_backend,
+                                           model, serial)
+        try:
+            info = self.backend.info
+            profile.write_info(frame_width=int(info.width), frame_height=int(info.height),
+                               camera_bin=int(self.backend.current_bin))
+        except Exception as e:
+            logger.warning("Could not write %s: %s", profile.info_path, e)
+        logger.info("Camera profile: %s (model %s, serial %s)", profile.root,
+                    model or "unknown", serial or "unknown")
+        return profile
+
+    def _open_dark_library(self) -> DarkFrameLibrary:
+        """Dark library in the camera profile's ``dark`` folder.
+
+        Darks of the older per-backend folder (``dark_frame_folder``) stay readable as a fallback;
+        the shape check in ``select_dark`` still refuses another sensor's size.
+        """
+        profile = self.camera_profile
+        return DarkFrameLibrary(folder=str(profile.dark_folder), n_frames=self.config.dark_frame_n_frames,
+                                fallback_folder=self.config.dark_frame_folder,
+                                camera_model=profile.model, camera_serial=profile.serial)
+
+    def _dark_file_label(self, path: str) -> str:
+        """``dark reference`` header value: ``<camera>/dark/<file>`` for the profile's darks,
+        ``<legacy folder>/<backend>/<file>`` for an older dark of unknown camera."""
+        path = os.path.abspath(path)
+        profile_root = os.path.abspath(str(self.camera_profile.root))
+        inside = os.path.normcase(path).startswith(os.path.normcase(profile_root) + os.sep)
+        base = os.path.dirname(profile_root) if inside else os.path.dirname(os.path.dirname(os.path.dirname(path)))
+        return os.path.relpath(path, base).replace(os.sep, "/")
+
     # _current_dark_params
     def _current_dark_params(self) -> tuple[int, float, float]:
         return (
@@ -561,6 +627,7 @@ class ScanController:
 
     def _load_dark_reference_for_current_params(self):
         self._dark_path = None
+        self._dark_provenance = {}
         try:
             bin_value, exposure_ms, gain = self._current_dark_params()
             info = self.backend.info
@@ -585,7 +652,14 @@ class ScanController:
                 return
 
             self.dark_reference = result
-            self._dark_path = os.path.join(self.dark_lib.folder, result["filename"])
+            self._dark_path = result["path"]
+            dark_file = self._dark_file_label(result["path"])
+            self._dark_provenance = {"dark_file": dark_file, "dark_frames": result["n_frames"]}
+            if os.path.normcase(os.path.dirname(result["path"])) != os.path.normcase(self.dark_lib.folder):
+                logger.warning("Using dark %s from the shared backend folder (camera unknown); "
+                               "capture a dark for this camera", dark_file)
+            if selection.dark_temperature is not None:
+                self._dark_provenance["dark_temperature_c"] = float(selection.dark_temperature)
             n_hot = selection.n_hot
             self.win.dark_panel.set_loaded(
                 bin_value=bin_value,
@@ -602,13 +676,14 @@ class ScanController:
             logger.info(
                 "Dark loaded: %s bin=%d exp=%.1f gain=%.1f "
                 "frames=%d shape=%s hot=%d dark temp=%s camera temp=%s",
-                result["filename"], bin_value, exposure_ms, gain,
+                dark_file, bin_value, exposure_ms, gain,
                 result["n_frames"], result["mean"].shape, n_hot,
                 selection.dark_temperature, selection.temperature,
             )
         except Exception as e:
             self.dark_reference = None
             self._dark_path = None
+            self._dark_provenance = {}
             self.backend.set_dark_reference(None, None)
             self.win.dark_panel.set_error("Load failed")
             logger.exception("Failed to load dark frame: %s", e)
@@ -708,7 +783,7 @@ class ScanController:
         return meta
 
     #: Raw-metadata keys of a scan that also go into its cube's export header.
-    _HEADER_SCAN_KEYS = ("started_at", "exposure_ms", "gain", "camera_bin", "stage_type",
+    _HEADER_SCAN_KEYS = ("started_at", "camera_model", "camera_serial", "exposure_ms", "gain", "camera_bin", "stage_type",
                          "speed_um_s", "speed_um_s_achieved", "degree_per_second",
                          "degree_per_second_achieved")
 
@@ -723,7 +798,71 @@ class ScanController:
             meta.update(self.preview_thread.correction_info())
         except Exception:
             logger.debug("Correction state unavailable for the export header", exc_info=True)
+        if meta.get("dark_corrected"):
+            meta.update(getattr(self, "_dark_provenance", {}))
+        warnings = self.calibration_warnings()
+        if warnings:
+            meta["calibration_warnings"] = "; ".join(warnings)
+        else:
+            meta.pop("calibration_warnings", None)
         return meta
+
+    def calibration_warnings(self) -> list:
+        """Calibration problems in effect now: the worker's (wavelength fallback, Smile model of
+        another or unknown camera setting) and the dark reference's (missing while dark
+        subtraction is on, or captured more than ``DARK_TEMPERATURE_WARN_C`` from the sensor)."""
+        warnings = []
+        try:
+            engine = self.preview_thread.calibration_provenance().get("calibration_warnings")
+        except Exception:
+            engine = None
+        if engine:
+            warnings.extend(engine.split("; "))
+        dark_lib = getattr(self, "dark_lib", None)
+        if (getattr(getattr(self, "backend", None), "_dark_enabled", False)
+                and not getattr(dark_lib, "is_collecting", False)):
+            if getattr(self, "dark_reference", None) is None:
+                try:
+                    bin_value, exposure_ms, gain = self._current_dark_params()
+                    detail = f" for bin {bin_value}, {exposure_ms:g} ms, gain {gain:g}"
+                except Exception:
+                    detail = ""
+                warnings.append(f"Dark subtraction is on but no dark reference is loaded{detail}")
+            else:
+                dark_t = getattr(self, "_dark_provenance", {}).get("dark_temperature_c")
+                now_t = valid_temperature(getattr(self, "_last_temp", None))
+                if dark_t is not None and now_t is not None and abs(now_t - dark_t) > DARK_TEMPERATURE_WARN_C:
+                    warnings.append(f"Dark captured at {dark_t:.1f} C, sensor now {now_t:.1f} C")
+                dark_path = getattr(self, "_dark_path", None)
+                camera_dir = getattr(dark_lib, "folder", None)
+                if (dark_path and camera_dir and os.path.normcase(os.path.dirname(dark_path))
+                        != os.path.normcase(camera_dir)):
+                    warnings.append("Dark reference is an older file of unknown camera, "
+                                    "not one captured with this camera")
+        warnings.extend(self._legacy_calibration_warnings())
+        return warnings
+
+    def _legacy_calibration_warnings(self) -> list:
+        """Smile / wavelength / FWHM files in use that come from the older per-backend folders
+        (unknown camera) instead of this camera's profile."""
+        store = getattr(self, "_wavelength_store", None)
+        if store is None:
+            return []
+        try:
+            setting = self.camera_setting()
+            info = self.preview_thread.correction_info()
+        except Exception:
+            return []
+        in_use = (("Smile model", bool(info.get("smile_corrected")), store.find_smile),
+                  ("Wavelength calibration", info.get("wavelength_source") == "stored", store.find_wavelength),
+                  ("FWHM", str(getattr(self.config, "resolution_source", "")) == "fwhm", store.find_resolution))
+        warnings = []
+        for label, used, find in in_use:
+            path = find(setting) if used else None
+            if path is not None and store.is_fallback(path):
+                warnings.append(f"{label} {path.name} is an older file of unknown camera "
+                                f"(not in this camera's profile)")
+        return warnings
 
     # ══════════════════════════════════════════════════════════════
     #  Saved settings
@@ -1176,8 +1315,15 @@ class ScanController:
         )
 
         # ── state transition + stage launch ───────────────────
+        warnings = self.calibration_warnings()
         self._set_state(self.SCANNING)
-        self._create_and_start_stage()  
+        self._create_and_start_stage()
+        if warnings and self.state == self.SCANNING:   # not blocking; the cube header records them too
+            logger.warning("Scan started with calibration warnings: %s", "; ".join(warnings))
+            show = getattr(self.win, "set_calibration_warning", None)   # absent on test windows
+            if show is not None:
+                show(f"{len(warnings)} calibration warning{'s' if len(warnings) > 1 else ''}: "
+                     + "; ".join(warnings))
 
     def _collect_raw_metadata(self) -> dict:
         """Provenance of the scan that is starting (stored with the raw spectrogram)."""
@@ -1514,4 +1660,4 @@ class ScanController:
             logger.warning("Backend close error: %s", e)
 
         logger.info("ScanController cleanup done")
-        return True
+        return True

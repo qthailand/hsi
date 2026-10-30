@@ -520,8 +520,13 @@ class SmileCorrectionWidget(QWidget):
             return
         text = "Camera setting: " + s.label()
         if self._store is not None:
-            path = self._store.smile_path(s)
-            text += f"  ·  stored model: {path.name}" if path.exists() else "  ·  no model stored yet"
+            path = self._store.find_smile(s)
+            if path is None:
+                text += "  ·  no model stored yet"
+            else:
+                text += f"  ·  stored model: {path.name}"
+                if self._store.is_fallback(path):
+                    text += " (older file of unknown camera)"
         self.lbl_setting.setText(text)
 
     def _update_apply_state(self) -> None:
@@ -555,10 +560,13 @@ class SmileCorrectionWidget(QWidget):
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             backup = self._store.backup(path)
+            setting = self._setting.to_dict()           # lets the app refuse it on another camera
             if self._corrector is not None:
-                self._corrector.save(str(path))
+                self._corrector.save(str(path), setting)
             else:
-                save_calibration(str(path), calibration_from_analysis(self._result))
+                cal = calibration_from_analysis(self._result)
+                cal.camera_setting = setting
+                save_calibration(str(path), cal)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Apply failed: {exc}")
             return None
@@ -1139,10 +1147,12 @@ class SmileCorrectionWidget(QWidget):
             return
         if not path.endswith(".npz"):
             path += ".npz"
+        setting = self._setting.to_dict() if self._setting is not None else None
         if self._corrector is not None:
-            self._corrector.save(path)
+            self._corrector.save(path, setting)
         else:
             cal = calibration_from_analysis(self._result)
+            cal.camera_setting = setting
             save_calibration(path, cal)
         self._set_status(f"Saved calibration: {path}")
 

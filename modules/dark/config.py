@@ -9,8 +9,10 @@ class DarkConfig:
     """Where dark references live and how many frames a capture averages.
 
     Attributes:
-        dark_frame_folder: Folder of ``dark_b<bin>_e<exposure>_g<gain>_t<temperature>.npz`` files
-            (the application appends the camera backend name, one folder per camera).
+        dark_frame_folder: Older folder of ``dark_b<bin>_e<exposure>_g<gain>_t<temperature>.npz``
+            files (the application appends the camera backend name). New darks go to the open
+            camera's profile (``camera_profiles/<backend>/<model>_<serial>/dark``, see
+            :class:`modules.contracts.CameraProfile`); this folder is only read as a fallback.
         dark_frame_n_frames: Frames averaged per dark capture.
     """
 

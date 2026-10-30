@@ -36,7 +36,7 @@ import numpy as np
 import faulthandler
 import time
 from harvesters.core import Harvester
-from .base import AbstractCameraBackend, CameraBackendInfo
+from .base import AbstractCameraBackend, CameraBackendInfo, device_text
 
 try:
     from genicam.genapi import EAccessMode
@@ -153,6 +153,8 @@ class GenICamBackend(AbstractCameraBackend):
         self._target_temp_node: str | None = None    # writable TEC set-point found at open
         self._cooler_enable_node: str | None = None
         self._cooling_state_node: str | None = None
+        self._model_name: str | None = None
+        self._serial_number: str | None = None
 
         # GigE config
         self.BUFFER_COUNT = 64
@@ -188,6 +190,14 @@ class GenICamBackend(AbstractCameraBackend):
     def info(self) -> CameraBackendInfo:
         """CameraBackendInfo: width/height re-read from the camera after bin/param changes."""
         return self._info
+
+    def model_name(self) -> str | None:
+        """The ``DeviceModelName`` node read at ``open`` (``None`` before, or if absent)."""
+        return self._model_name
+
+    def serial_number(self) -> str | None:
+        """The ``DeviceSerialNumber`` node read at ``open`` (``None`` before, or if absent)."""
+        return self._serial_number
 
     # ══════════════════════════════════════════════════════
     #  Node helpers
@@ -544,6 +554,8 @@ class GenICamBackend(AbstractCameraBackend):
         self._ia.buffer_handling_mode = "OldestFirst"
         self._ia.num_buffers = self.BUFFER_COUNT
         self._nm = self._ia.remote_device.node_map
+        self._model_name = device_text(self._read_node("DeviceModelName"))
+        self._serial_number = device_text(self._read_node("DeviceSerialNumber"))
         if self.sensor_pixel_size is not None:
             wanted = "SensorBpp%d" % self.sensor_pixel_size
             if self._set_node_value("SensorPixelSize", wanted):

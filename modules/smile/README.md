@@ -21,8 +21,9 @@ Reference row: the zero-displacement row defaults to `modules.contracts.default_
 the same row used by wavelength calibration.
 
 **Apply to camera (bin N)**: stores the analysed model for the frame's camera setting as
-`smile_maps/<backend>/smile_model_bin<N>.npz` (the file the HSI runtime loads for that bin; the
-previous one is copied to `history/`) and emits `applyRequested(path)` so the host loads it into
+`camera_profiles/<backend>/<model>_<serial>/smile/smile_model_bin<N>.npz` (the open camera's
+profile; the file the HSI runtime loads for that bin; the previous one is copied to `history/`;
+models in the older `smile_maps/<backend>/` are still read when the profile has none) and emits `applyRequested(path)` so the host loads it into
 the live session. It is refused when the camera has moved to another bin/size since the frame was
 grabbed. The wavelength calibration for Spectral Quality is loaded automatically from the store
 for the same setting; *โหลด Wavelength Calibration…* overrides it.
@@ -73,7 +74,8 @@ corrected = corrector.transform(raw_frame, crop=True)
 
 # live pipeline (HSI): one model per hardware bin, dtype preserved, no crop
 from modules.smile.runtime import SmileRuntime
-rt = SmileRuntime("smile_maps"); rt.set_bin(1)   # loads smile_maps/smile_model_bin1.npz if present
+rt = SmileRuntime("camera_profiles/poa/Apollo-M_MAX_CAMP7161/smile", fallback_folder="smile_maps/poa")
+rt.set_bin(1)                                     # smile_model_bin1.npz: own folder first, then the fallback
 out = rt.apply(sensor_frame)                      # same shape and dtype; unchanged if no model
 ```
 
@@ -93,9 +95,13 @@ newer ones; `allow_pickle=False`):
 
 `metadata` JSON keys: `format_version`, `margin` `[left, right]` (px), `image_shape` `[H, W]`,
 `deg_y`, `deg_x`, `surface_coef` (flat, y-major), `y_rng`, `x_rng`, `interp`, `backend`, `fit_rms`,
-`cv_rms`, `rms_before`, `rms_after` (px), `n_lines_used`, `n_lines_total`, `created`, `notes`, `y_ref`.
-The model is only valid for frames of the same orientation, hardware bin and size as the
-calibration image. `SmileRuntime` looks for `smile_model_bin<N>.npz` in its folder.
+`cv_rms`, `rms_before`, `rms_after` (px), `n_lines_used`, `n_lines_total`, `created`, `notes`, `y_ref`,
+and `camera_setting` (`CameraSetting.to_dict()`: backend, index, bin, orientation, frame size) when
+the model was saved with one (Apply to camera, `SmileCorrector.save(path, camera_setting)`; older
+files have none). The model is only valid for frames of the same camera, orientation, hardware bin
+and size as the calibration image: the HSI app refuses a model whose `camera_setting` differs and
+applies one without it as "setting unverified". `SmileRuntime` looks for `smile_model_bin<N>.npz`
+in its folder.
 
 **Wavelength JSON for quality analysis**: either layout accepted by
 `modules.contracts.normalize_wavelength_config` (profile from `modules.wavelength_calibration`, or

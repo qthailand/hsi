@@ -48,7 +48,7 @@ _STATE_COLORS = {"stable": "#66bb6a", "low": "#ffa726", "high": "#ffa726", "aler
 class CameraControls(QGroupBox):
     """Gain / exposure / binning / keep_spectrogram controls with signals.
 
-    A ``QGroupBox`` titled "Camera" holding a gain spin box, an exposure spin box
+    A ``QGroupBox`` titled "Camera" (or the model, see :meth:`set_camera_name`) holding a gain spin box, an exposure spin box
     (ms, 3 decimals), a bin combo box and a "Keep Spectrogram" check box. It is
     constructible with no arguments; call :meth:`set_limits` and
     :meth:`set_bin_options` after the camera is open so the ranges match the sensor.
@@ -164,6 +164,14 @@ class CameraControls(QGroupBox):
     def target_temperature(self) -> float | None:
         """Target temperature in °C, or ``None`` when the camera has no cooling target."""
         return float(self.temp_spin.value()) if self._cooling_supported else None
+
+    # ── title ──────────────────────────────────────────────────
+
+    def set_camera_name(self, name) -> None:
+        """Title the box with the camera model, or "Camera" when ``name`` is empty / ``None``."""
+        name = str(name).strip() if name else ""
+        self.setTitle(name or "Camera")
+        self.setToolTip(f"Camera: {name}" if name else "")
 
     # ── temperature ────────────────────────────────────────────
 

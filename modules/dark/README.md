@@ -9,6 +9,10 @@ Qt-free dark-frame handling for the camera backends:
 * `DarkFrameLibrary` captures N dark frames, computes mean and hot-pixel map, and stores
   one `.npz` per `(bin, exposure, gain, sensor temperature)`; `load`/`find` return the file
   captured nearest the current temperature (60 °C is assumed when the camera reports none).
+* Dark current and hot pixels belong to one sensor, so the application keeps the darks in the
+  open camera's profile, `camera_profiles/<backend>/<model>_<serial>/dark/`
+  (`modules.contracts.CameraProfile`); the older per-backend folder `dark_frames/<backend>/`
+  is read only as a fallback.
 
 ## Requirements
 
@@ -27,7 +31,10 @@ shapes must match.
 import numpy as np
 from modules.dark import DarkFrameLibrary, DarkProcessor
 
-lib = DarkFrameLibrary("dark_frames", n_frames=50)
+# the application passes the camera profile's dark folder and the older backend folder:
+lib = DarkFrameLibrary("camera_profiles/poa/Apollo-M_MAX_CAMP7161/dark", n_frames=50,
+                       fallback_folder="dark_frames/poa",
+                       camera_model="Apollo-M MAX", camera_serial="CAMP7161")
 lib.start_capture(bin=1, exposure=100.0, gain=5.0)
 # in the camera loop, with the shutter closed:
 #   if lib.add_frame(frame, temperature=camera.get_temperature()): break   # True once saved
@@ -46,13 +53,16 @@ proc.set_dark_reference(ref["mean"], ref["hot_pixel_map"])
 * `hot_pixel_map`: same shape, non-zero = hot (`uint8`, 255 from the library). A hot pixel
   is detected with threshold `max(mean + 4 sigma, 99.9th percentile)` on the
   max-normalised mean frame (falling back to `mean + 3 sigma` / 99.5th percentile).
-* File `dark_frames/dark_b{bin}_e{exposure:.1f}_g{gain:.1f}_t{temperature:+d}.npz` (temperature
+* Folder: `folder` (in the application the camera profile's `dark/`). `fallback_folder` (the
+  older `dark_frames/<backend>/`) is searched only when `folder` has no file for the requested
+  `(bin, exposure, gain)`, and is never written or deleted.
+* File `dark_b{bin}_e{exposure:.1f}_g{gain:.1f}_t{temperature:+d}.npz` (temperature
   = mean over the capture in °C, rounded to whole degrees; a recapture in the same degree
   replaces the file) with arrays `mean`, `hot_pixel_map`, `bin` (int32), `exposure` (ms,
   float32), `gain` (float32), `n_frames` (int32), and `temperature`, `temperature_min`,
-  `temperature_max` (°C, float64). Without a temperature (camera reports `-999`, or an
-  older file) the name has no `_t` part and the temperature arrays are absent; such a file
-  is used only when its `(bin, exposure, gain)` has no file with a temperature.
+  `temperature_max` (°C, float64), `camera_model`, `camera_serial` (str, when known).
+  Without a temperature (camera reports `-999`, or an older file) the name has no `_t` part
+  and the temperature arrays are absent; such a file is used only when its `(bin, exposure, gain)` has no file with a temperature.
   Note: no `format_version` key is stored.
 * `_apply_hot_pixel` modifies the given frame in place; `_apply_dark_subtract` returns a
   new array (or the same/copy when no usable dark is set).
@@ -62,9 +72,12 @@ proc.set_dark_reference(ref["mean"], ref["hot_pixel_map"])
 * `DarkProcessor`: `set_dark_reference(mean, hot_map)`, `set_dark_enabled(bool)` (flag
   only), `_apply_dark_subtract(frame)`, `_apply_hot_pixel(frame)`.
   `dark_reference` returns the current immutable `DarkReference` (dark mean and hot-pixel tables).
-* `DarkFrameLibrary(folder, n_frames=50)`: `start_capture`, `add_frame(frame, temperature)`,
-  `cancel`, `progress`, `is_collecting`, `find`/`load(bin, exposure, gain, temperature)`,
-  `exists`, `delete(..., temperature=None)`, `list_keys`. `UNKNOWN_TEMPERATURE_C` (60.0) and
+* `DarkFrameLibrary(folder, n_frames=50, fallback_folder=None, camera_model=None, camera_serial=None)`:
+  `start_capture`, `add_frame(frame, temperature)`, `cancel`, `progress`, `is_collecting`,
+  `find`/`load(bin, exposure, gain, temperature)` (`load` adds `camera_model`, `camera_serial`
+  and the full `path`), `exists`, `delete(..., temperature=None)` and `list_keys` (both
+  `folder` only).
+* `UNKNOWN_TEMPERATURE_C` (60.0) and
   `valid_temperature(value)` (``None`` for ``-999``/NaN) are exported too.
 
 ## Threading

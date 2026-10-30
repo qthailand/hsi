@@ -57,6 +57,15 @@ class CameraBackendInfo:
     height: int
     image_format: object
 
+
+def device_text(value) -> str | None:
+    """Decode an SDK string (``bytes`` or ``str``) to stripped text, or ``None`` if empty."""
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
 class AbstractCameraBackend(DarkProcessor, ABC):
     """Contract every camera backend honours, plus the shared frame pipeline.
 
@@ -242,6 +251,21 @@ class AbstractCameraBackend(DarkProcessor, ABC):
     @abstractmethod
     def get_temperature(self) -> float:
         """Return the sensor temperature in degrees Celsius, or ``-999.0`` if unavailable."""
+
+    def model_name(self) -> str | None:
+        """Return the camera model the SDK reports (e.g. ``"Uranus-C"``), or ``None`` if unknown.
+
+        The default is ``None``; backends override it. The value is known after ``open``.
+        """
+        return None
+
+    def serial_number(self) -> str | None:
+        """Return the camera's serial number from the SDK, or ``None`` if unknown.
+
+        With :meth:`model_name` it identifies the physical camera (dark references are kept per
+        camera). The default is ``None``; backends override it. The value is known after ``open``.
+        """
+        return None
 
     def cooling_supported(self) -> bool:
         """Return True if the sensor temperature can be regulated to a target (TEC cooling).

@@ -470,7 +470,7 @@ class CalibrationWindow(QWidget):
         bip.tofile(tmp_path)
 
         hdr_path = tmp_path + '.hdr'
-        with open(hdr_path, 'w') as h:
+        with open(hdr_path, 'w', encoding='utf-8', newline='\n') as h:
             h.write('ENVI\n')
             h.write(f'description = {{Scan Memory: {name}}}\n')
             h.write(f'samples = {W}\n')
@@ -684,6 +684,7 @@ class CalibrationWindow(QWidget):
         self.rowwise_factors = None
         self.factors = None
         self._factor_wavelengths = None
+        self._reference_info = None     # header metadata of the active factors (which reference)
         self._source_mode = None
 
         self.label.setText('...')
@@ -777,6 +778,7 @@ class CalibrationWindow(QWidget):
         self.rowwise_factors = None
         self.factors = None
         self._factor_wavelengths = None
+        self._reference_info = None
         self.label_profile.setText("No reflectance profile loaded.")
         self.label_fluo_profile.setText("No fluorescence profile loaded.")
         for btn in (self.btn_rowwise, self.btn_save_profile, self.btn_fluo_cal, self.btn_save_fluo_profile):
@@ -819,8 +821,9 @@ class CalibrationWindow(QWidget):
                 self.rowwise_factors = factors
                 self.factors = None
                 self._factor_wavelengths = wavelengths
+                self._reference_info = self._loaded_profile_info(f"factor profile {os.path.basename(load_path)}", factors)
                 self.label_profile.setText(f"Loaded: {os.path.basename(load_path)}")
-                QMessageBox.information(self, 'Success', f'Profile loaded:\n{load_path}')
+                self._report_loaded_profile(load_path)
                 self.mark_button_done(self.btn_load_profile)
                 self.update_preview_image()
                 self._clear_memmap_temp_states()
@@ -891,6 +894,7 @@ class CalibrationWindow(QWidget):
             return
 
         self._reference_wavelengths = ref_meta.get('wavelength')
+        self._pending_reference_cube = self._reference_cube_label(ref_filepath, ref_meta)
         self.progess.setMaximum(ref_meta['bands'])
         self.progess.setValue(0)
         worker, thread = self._run_in_thread(
@@ -909,9 +913,22 @@ class CalibrationWindow(QWidget):
             self.spectralon_rows_span = result['span']
             self.factors = None
             self._factor_wavelengths = self._reference_wavelengths
+            self._reference_info = dict(result.get('reference') or {})
+            label = getattr(self, '_pending_reference_cube', None)
+            if label:                       # a scan in memory has only a temp file name
+                self._reference_info['reflectance_reference_cube'] = label
             self.label_profile.setText("Row-wise factors computed.")
-            QMessageBox.information(self, 'Row-wise Calibration',
-                                    'Row-wise factors computed successfully.')
+            outside = int(result.get('out_of_range_bands') or 0)
+            if outside:
+                lo, hi = result.get('table_range_nm', (float('nan'), float('nan')))
+                QMessageBox.warning(
+                    self, 'Row-wise Calibration',
+                    f'Row-wise factors computed, but {outside} bands lie outside the reference '
+                    f'table ({lo:g}-{hi:g} nm). Those bands have no reflectance (NaN) in the '
+                    'output; choose a reference table that covers the cube range to calibrate them.')
+            else:
+                QMessageBox.information(self, 'Row-wise Calibration',
+                                        'Row-wise factors computed successfully.')
             self.mark_button_done(self.btn_rowwise)
             self.update_preview_image()
 
@@ -967,6 +984,7 @@ class CalibrationWindow(QWidget):
             "factors": getattr(self, 'factors', None),
             "rowwise_factors": self.rowwise_factors,
             "factor_wavelengths": self._factor_wavelengths,
+            "reference_info": getattr(self, '_reference_info', None),
             "binning_factor": n_bin,
         }
         worker, thread = self._run_in_thread(self.create_datacube_logic, params)
@@ -1054,6 +1072,7 @@ class CalibrationWindow(QWidget):
             "factors": getattr(self, 'factors', None),
             "rowwise_factors": getattr(self, 'rowwise_factors', None),
             "factor_wavelengths": self._factor_wavelengths,
+            "reference_info": getattr(self, '_reference_info', None),
             "lam_target": lam_target.tolist(),
             "binning_factor": n_bin
         }
@@ -1116,12 +1135,18 @@ class CalibrationWindow(QWidget):
             elif getattr(self, 'factors', None) is not None:
                 im = im * float(self.factors[idx])
 
-            m, M = np.nanpercentile(im, 1), np.nanpercentile(im, 99)
-            show = np.zeros_like(im) if M <= m else np.clip((im - m) / (M - m), 0, 1)
+            finite = np.isfinite(im)
+            title = f'Preview (Band #{idx + 1})'
+            if not finite.any():        # factors NaN: band outside the reference table
+                show = np.zeros_like(im)
+                title += ' - no reflectance (outside reference table)'
+            else:
+                m, M = np.percentile(im[finite], 1), np.percentile(im[finite], 99)
+                show = np.zeros_like(im) if M <= m else np.clip(np.nan_to_num((im - m) / (M - m)), 0, 1)
 
             self.axes.clear()
             self.axes.imshow(show, interpolation='none', cmap='gray')
-            self.axes.set_title(f'Preview (Band #{idx + 1})')
+            self.axes.set_title(title)
             self.canvas.draw_idle()
             self.attach_interaction_handlers()
         except Exception as e:
@@ -1517,6 +1542,32 @@ class CalibrationWindow(QWidget):
     #  Fluo Calibration
     # =====================================================================
 
+    def _reference_cube_label(self, ref_filepath, ref_meta):
+        """Name of the reference cube for the output header: the file, or for a scan held in memory
+        (a temporary file every scan overwrites) the scan's acquisition time."""
+        if self._source_mode == 'scan_memory':
+            started = (ref_meta or {}).get('acquisition time')
+            return f"scan of {started}" if started else "scan in memory (not saved)"
+        return os.path.basename(str(ref_filepath))
+
+    @staticmethod
+    def _loaded_profile_info(name, factors):
+        """Header metadata of a loaded factor profile; bands without a finite factor are a warning."""
+        values = np.asarray(factors, dtype=np.float64)
+        empty = int(np.count_nonzero(~np.isfinite(values).any(axis=0) if values.ndim == 2 else ~np.isfinite(values)))
+        info = {'reflectance_reference': name}
+        if empty:
+            info['calibration_warnings'] = f'{empty} bands have no factor (NaN) in {name}'
+        return info
+
+    def _report_loaded_profile(self, load_path):
+        warning = (self._reference_info or {}).get('calibration_warnings')
+        if warning:
+            QMessageBox.warning(self, 'Profile loaded', f'Profile loaded:\n{load_path}\n\n{warning}: those bands '
+                                'will have no reflectance (NaN) in the output.')
+        else:
+            QMessageBox.information(self, 'Success', f'Profile loaded:\n{load_path}')
+
     def event_fluorescence_calibration(self):
         """Choose a reference file and ROI, then compute fluorescence factors on the worker thread.
         """
@@ -1538,6 +1589,7 @@ class CalibrationWindow(QWidget):
             return
 
         self._reference_wavelengths = ref_meta.get('wavelength')
+        self._pending_reference_cube = self._reference_cube_label(ref_filepath, ref_meta)
         self.progess.setMaximum(ref_meta['bands'])
         self.progess.setValue(0)
         worker, thread = self._run_in_thread(
@@ -1564,6 +1616,8 @@ class CalibrationWindow(QWidget):
             self.factors = result['factors']
             self.rowwise_factors = None
             self._factor_wavelengths = self._reference_wavelengths
+            self._reference_info = {'reflectance_reference': 'fluorescence factors (computed)',
+                                    'reflectance_reference_cube': getattr(self, '_pending_reference_cube', None)}
             self.label_fluo_profile.setText("Fluorescence factors (Smoothed) computed.")
             self.label_profile.setText("No reflectance profile loaded.")
             QMessageBox.information(self, 'Fluorescence Calibration',
@@ -1608,9 +1662,10 @@ class CalibrationWindow(QWidget):
                 self.factors = factors
                 self.rowwise_factors = None
                 self._factor_wavelengths = wavelengths
+                self._reference_info = self._loaded_profile_info(f"fluorescence profile {os.path.basename(load_path)}", factors)
                 self.label_fluo_profile.setText(f"Loaded: {os.path.basename(load_path)}")
                 self.label_profile.setText("No reflectance profile loaded.")
-                QMessageBox.information(self, 'Success', f'Profile loaded:\n{load_path}')
+                self._report_loaded_profile(load_path)
                 self.mark_button_done(self.btn_load_fluo_profile)
                 self.update_preview_image()
                 self._clear_memmap_temp_states()

@@ -58,18 +58,24 @@ store.save_wavelength_default(profile, camera_config)
                           wavelength_range_nm (optional, {camera_backend: [start_nm, end_nm] | null};
                           backend names are lower-cased, values rounded to 0.1 nm, start < end;
                           missing/null = the full calibrated range; written by the Scan Window)
-    dark.json             dark_frame_folder, dark_frame_n_frames
-    smile.json            smile_map_folder
+    dark.json             dark_frame_folder (older per-backend darks, read as a fallback), dark_frame_n_frames
+    smile.json            smile_map_folder (older per-backend Smile models, read as a fallback)
     camera_<uuid>.json    legacy only: older versions wrote it on Save as Default; used until camera.json is edited after it
   calibration/wavelength/
     base.json             {"m": nm/px (unbinned), "c": nm, "units": "nm"}
     profile_<uuid>.json   WavelengthCalibration fields (format_version 1, units "nm", stage) plus
                           "compatibility": {camera_backend, camera_id, camera_index, raw_inverted, camera_bin}
-    <backend>/wavelength_bin<N>.json   per camera setting (modules.contracts.CalibrationStore);
-                          wavelength_folder(backend) is this folder. The scan uses it at start and
-                          after every bin change, ahead of the m/c returned by read()
-    <backend>/resolution_bin<N>.json   median FWHM (nm) per camera setting; the bin width when
-                          resolution_source is "fwhm"
+    <backend>/wavelength_bin<N>.json   older layout, read as a fallback (wavelength_folder(backend));
+    <backend>/resolution_bin<N>.json   new files go to the camera profile below
+camera_profiles/<backend>/<model>_<serial>/      one physical camera (modules.contracts.CameraProfile;
+                          root: camera.json camera_profile_folder, optional, default "camera_profiles")
+    profile.json          backend, model, serial, created_at, last_opened_at, frame size and bin at open
+    dark/                 dark_b<bin>_e<exposure>_g<gain>_t<temperature>.npz
+    smile/                smile_model_bin<N>.npz, history/
+    wavelength/           wavelength_bin<N>.json (per camera setting; the scan uses it at start and
+                          after every bin change, ahead of the m/c returned by read()),
+                          resolution_bin<N>.json (median FWHM in nm; the bin width when
+                          resolution_source is "fwhm"), history/
 ```
 
 * Section files hold only the keys listed (see `SECTIONS`); unknown keys passed to `initialize` are dropped.

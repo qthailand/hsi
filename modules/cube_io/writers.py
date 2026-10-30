@@ -65,6 +65,8 @@ COUNT_HEADER_FIELDS = (
 #: written when present in ``config``: ``(config key, header field, kind)``.  ``bool`` fields are
 #: written ``1``/``0``; a missing key means unknown (e.g. a cube opened from a file without it).
 SCAN_HEADER_FIELDS = (
+    ('camera_model', 'camera model', str),
+    ('camera_serial', 'camera serial number', str),
     ('exposure_ms', 'exposure time (ms)', float),
     ('gain', 'sensor gain', float),
     ('frame_rate_hz', 'frame rate (Hz)', float),
@@ -72,8 +74,21 @@ SCAN_HEADER_FIELDS = (
     ('dark_corrected', 'dark corrected', bool),
     ('hot_pixel_corrected', 'hot pixel corrected', bool),
     ('hot_pixel_count', 'hot pixel count', int),
+    ('dark_file', 'dark reference', str),          # its temperature: 'dark temperature' above
+    ('dark_frames', 'dark reference frames', int),
     ('smile_corrected', 'smile corrected', bool),
     ('smile_model', 'smile model', str),
+    ('smile_model_created', 'smile model created', str),
+    ('wavelength_source', 'wavelength calibration source', str),
+    ('wavelength_profile', 'wavelength calibration', str),
+    ('wavelength_profile_saved', 'wavelength calibration saved', str),
+    ('wavelength_rms_nm', 'wavelength calibration rms (nm)', float),
+    ('wavelength_m_nm_per_px', 'wavelength slope (nm/px, bin 1)', float),
+    ('wavelength_c_nm', 'wavelength offset (nm)', float),
+    ('reflectance_reference', 'reflectance reference', str),
+    ('reflectance_reference_cube', 'reflectance reference cube', str),
+    ('reflectance_reference_rows', 'reflectance reference rows', str),
+    ('calibration_warnings', 'calibration warnings', str),
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),
     ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
@@ -98,7 +113,9 @@ def _format_header_value(value, kind):
         return str(int(value))
     if kind is float:
         return f'{float(value):.10g}'
-    return str(value).replace('\n', ' ').replace('{', '(').replace('}', ')')
+    text = str(value).replace('\n', ' ').replace('{', '(').replace('}', ')')
+    # mismatch texts use these; plain ASCII keeps every header readable by older tools
+    return text.replace('≠', '!=').replace('×', 'x').replace('°', ' deg ').replace('·', '-')
 
 
 def metadata_header_lines(config, counts=True):
@@ -155,10 +172,25 @@ def metadata_from_header(meta):
     return out
 
 
-def carried_header_lines(meta, calibrated):
+def carried_header_lines(meta, calibrated, extra=None):
     """Header lines that a cube derived from the file of ``meta`` keeps (acquisition time,
-    temperatures, scan settings, corrections; raw-count fields only when not ``calibrated``)."""
+    temperatures, scan settings, corrections; raw-count fields only when not ``calibrated``).
+
+    ``extra``: metadata of the derived cube itself (e.g. ``reflectance_reference``) written
+    with it; its ``calibration_warnings`` are appended to the carried ones (each once).  When it
+    names a reflectance reference, the source's ``reflectance_reference*`` fields are dropped
+    first (a calibrated cube calibrated again must not keep the old reference cube / rows).
+    """
     config = metadata_from_header(meta)
+    extra = {k: v for k, v in (extra or {}).items() if v is not None}
+    if any(k.startswith('reflectance_reference') for k in extra):
+        for key in [k for k in config if k.startswith('reflectance_reference')]:
+            del config[key]
+    for key, value in extra.items():
+        if key == 'calibration_warnings' and config.get(key):
+            carried = str(config[key]).split('; ')
+            value = '; '.join(carried + [w for w in str(value).split('; ') if w not in carried])
+        config[key] = value
     lines = [f"acquisition time = {config['started_at']}"] if 'started_at' in config else []
     return lines + metadata_header_lines(config, counts=not calibrated)
 
@@ -278,7 +310,8 @@ class HypercubeWriter:
                 ``data bit depth``, ``sensor bit depth`` and ``data full scale``; optional scan
                 temperatures (°C, see :data:`TEMPERATURE_HEADER_FIELDS`) as ``sensor temperature
                 start/end/min/max``, ``dark temperature`` and ``target temperature``; optional
-                scan settings and corrections (:data:`SCAN_HEADER_FIELDS`: exposure, gain, frame
+                scan settings and corrections (:data:`SCAN_HEADER_FIELDS`: camera model and
+                serial number, exposure, gain, frame
                 rate, bin, dark / hot-pixel / smile corrected, smile model, stage speeds).
             fsync: Accepted for API symmetry; currently unused.
             hypercube: Band-first ``(wavelength, slit, scan)`` array, kept by

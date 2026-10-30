@@ -41,14 +41,16 @@ class FakeStage:
 @pytest.fixture
 def isolated_config(monkeypatch, tmp_path):
     """MainWindow reads a fresh default config, never the developer's live ``config/``, nor the
-    project's smile models or darks (a real sensor's model does not fit the fake frames)."""
+    project's smile models, darks or camera profiles (a real sensor's model does not fit the fake
+    frames)."""
     from dataclasses import asdict
     import config as app_config
     import windows.main_window as main_window_module
     from modules.configuration import ConfigStore
     data = asdict(app_config.AppConfig())
     data.update(m=.29, c=400, smile_map_folder=str(tmp_path / 'smile_maps'),
-                dark_frame_folder=str(tmp_path / 'dark_frames'))
+                dark_frame_folder=str(tmp_path / 'dark_frames'),
+                camera_profile_folder=str(tmp_path / 'camera_profiles'))
     directory = tmp_path / 'config'
     ConfigStore(directory).initialize(data)
     monkeypatch.setattr(main_window_module, 'load_app_config', lambda: app_config.load_app_config(str(directory)))
@@ -429,7 +431,8 @@ def test_persisted_settings_are_the_users_edits_only(monkeypatch, tmp_path):
     from modules.configuration import ConfigStore
     app = QApplication.instance() or QApplication([])
     data = asdict(app_config.AppConfig())
-    data.update(m=.29, c=400, default_exposure_ms=1.0, default_bin=2)
+    data.update(m=.29, c=400, default_exposure_ms=1.0, default_bin=2,
+                camera_profile_folder=str(tmp_path / 'camera_profiles'))
     directory = tmp_path / 'config'
     ConfigStore(directory).initialize(data)
     monkeypatch.setattr(main_window_module, 'load_app_config', lambda: app_config.load_app_config(str(directory)))
@@ -473,7 +476,8 @@ def test_two_open_copies_do_not_overwrite_each_others_edits(monkeypatch, tmp_pat
 
     app = QApplication.instance() or QApplication([])
     data = asdict(app_config.AppConfig())
-    data.update(m=.29, c=400, default_exposure_ms=1.0, default_bin=2)
+    data.update(m=.29, c=400, default_exposure_ms=1.0, default_bin=2,
+                camera_profile_folder=str(tmp_path / 'camera_profiles'))
     directory = tmp_path / 'config'
     ConfigStore(directory).initialize(data)
     monkeypatch.setattr(main_window_module, 'load_app_config', lambda: app_config.load_app_config(str(directory)))

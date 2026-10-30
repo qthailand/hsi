@@ -65,6 +65,7 @@ def main():
         print(f"  bit_depth={backend.bit_depth}")
         print(f"  bins={backend.get_bins()}")
         print(f"  width={backend.info.width}, height={backend.info.height}")
+        print(f"  model={backend.model_name()}, serial={backend.serial_number()}")
 
     except Exception as e:
         print(f"[STEP 3] FAIL — {e}")
@@ -146,12 +147,18 @@ def main():
     print("\n[STEP 6] Testing DarkFrameLibrary...")
 
     try:
+        from modules.contracts import CameraProfile
         from modules.dark import DarkFrameLibrary
+        profile = CameraProfile.for_camera(config.camera_profile_folder, config.camera_backend,
+                                           backend.model_name(), backend.serial_number())
         dark_lib = DarkFrameLibrary(
-            folder=config.dark_frame_folder,
+            folder=str(profile.dark_folder),
             n_frames=config.dark_frame_n_frames,
+            fallback_folder=config.dark_frame_folder,
+            camera_model=profile.model,
+            camera_serial=profile.serial,
         )
-        print(f"[STEP 6a] OK — folder={config.dark_frame_folder}")
+        print(f"[STEP 6a] OK — folder={dark_lib.folder} (fallback {dark_lib.fallback_folder})")
         print(f"  is_collecting={dark_lib.is_collecting}")
 
         result = dark_lib.load(

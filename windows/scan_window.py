@@ -135,6 +135,7 @@ class ScanWindow(QWidget):
         self.correction_status = CorrectionStatusDisplay(self)
         self.correction_status.dark.setFixedWidth(180)
         self.correction_status.smile.setFixedWidth(180)
+        self.correction_status.wavelength.setFixedWidth(180)
 
         # ── Stage — rotation ─────────────────────────────────────
         # The rotation stage runs multiples of 0.01 deg/s (half steps of 0.02 deg), so the
@@ -254,6 +255,7 @@ class ScanWindow(QWidget):
             "sharpness": 0.0,
             "temp": -999.0,
             "camera_fps": None,
+            "calibration_warning": "",   # set for a scan started with calibration warnings
         }
 
         # ── LEFT PANEL ───────────────────────────────────────────
@@ -312,6 +314,7 @@ class ScanWindow(QWidget):
         status_column.setSpacing(6)
         status_column.addWidget(self.correction_status.dark, stretch=1)
         status_column.addWidget(self.correction_status.smile, stretch=1)
+        status_column.addWidget(self.correction_status.wavelength, stretch=1)
         controls_body.addLayout(settings_column, stretch=1)
         controls_body.addLayout(status_column)
         controls_layout.addLayout(controls_body)
@@ -442,9 +445,11 @@ class ScanWindow(QWidget):
             started, expected = self._scan_clock
             scan_time = (f"Scan {_format_duration(time.monotonic() - started)}"
                          f" / ~{_format_duration(expected)}  ·  ")
+        warning = s.get("calibration_warning") or ""
         return (
             f"{s['state']}  ·  "
-            f"{scan_time}"
+            + (f"{warning}  ·  " if warning else "")
+            + f"{scan_time}"
             f"FPS {s['fps']:.1f}"
             f"{cam_fps}  ·  "
             f"Frame {s['frame']:,}  ·  "
@@ -781,6 +786,10 @@ class ScanWindow(QWidget):
     def set_status(self, text: str):
         self._status["state"] = text
         self.sharpness_panel.set_scanning(text == "SCANNING")
+
+    def set_calibration_warning(self, text: str):
+        """Calibration warnings of the running scan, shown after the state ("" for none)."""
+        self._status["calibration_warning"] = text
 
     def set_fps(self, fps: float):
         self._status["fps"] = fps

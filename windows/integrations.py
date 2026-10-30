@@ -41,19 +41,15 @@ logger = logging.getLogger(__name__)
 
 
 def calibration_store(host):
-    """The calibration store of the configured camera backend.
+    """The calibration store of the open camera (see :func:`config.calibration_store`).
 
-    Wavelength profiles: ``<config>/calibration/wavelength/<backend>/wavelength_bin<N>.json``
-    (FWHM: ``resolution_bin<N>.json`` in the same folder);
-    smile models: ``config.smile_map_folder`` (already per backend), ``smile_model_bin<N>.npz``.
+    Saves into the camera's profile, ``camera_profiles/<backend>/<model>_<serial>/``
+    (``wavelength/wavelength_bin<N>.json``, ``wavelength/resolution_bin<N>.json``,
+    ``smile/smile_model_bin<N>.npz``); the older per-backend folders
+    (``calibration/wavelength/<backend>``, ``config.smile_map_folder``) are read as a fallback.
     """
-    from pathlib import Path
-    from modules.contracts import CalibrationStore
-    config = host.config
-    store = getattr(config, "_config_store", None)
-    folder = (store.wavelength_folder(config.camera_backend) if store else
-              Path("config") / "calibration" / "wavelength" / str(config.camera_backend).lower())
-    return CalibrationStore(folder, config.smile_map_folder)
+    from config import calibration_store as store_for
+    return store_for(host.config)
 
 
 def camera_setting(host):
@@ -226,6 +222,9 @@ class WavelengthIntegration(Integration):
         try:
             path = calibration_store(self.host).save_wavelength(profile, setting)
             logger.info("Wavelength calibration stored for %s: %s", setting.label(), path)
+            controller = self.host.scan_controller
+            if controller is not None:                  # cubes from now on name this file
+                controller.preview_thread.record_wavelength_file(profile, path)
             self.host.show_status(f"Wavelength calibration applied and saved for {setting.label()}")
             if widget is not None:
                 try:

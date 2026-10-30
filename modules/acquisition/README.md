@@ -127,7 +127,11 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
 * `AcquisitionEngine(backend, config=None, sink=None, profile=True)`: `run_until_stopped`,
   `request_stop`, `request_params(gain, exposure_ms)`, `request_bin(n)`,
   `request_wavelength(profile)`, `set_wavelength_lookup(lookup)` (stored calibration per bin, used at
-  start and after every bin change), `set_resolution_lookup(lookup)` / `request_resolution_reload()`
+  start and after every bin change; with none for the bin the previous m/c is kept and reported on the
+  Wavelength card and in `calibration_provenance()`, never silently), `set_smile_setting_check(check)`
+  (a Smile model measured at another camera setting is not applied; one that records none is applied
+  as "setting unverified"), `calibration_provenance()` (wavelength source / file / m, c and the
+  calibration warnings in effect, part of `correction_info()` and so of the cube header), `set_resolution_lookup(lookup)` / `request_resolution_reload()`
   (stored FWHM per bin as the bin width when `config.resolution_source == "fwhm"`: `fwhm_step_factor`
   × FWHM, at least 2 spectral pixels; `config.resolution` when there is none), `binning_info()`
   (bin width in use and its source, stored in the scan metadata), `request_snapshot(id)`, `request_processed_frame()`, `request_smile_model(path)`,

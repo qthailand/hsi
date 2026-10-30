@@ -6,7 +6,10 @@ Offline radiometric calibration and post-processing of ENVI hyperspectral cubes.
 It turns a raw cube (sensor counts) into a calibrated, optionally cropped, spatially
 binned and wavelength-resampled ENVI BIP cube. Calibration factors come from a scan
 of a white reference (row-wise reflectance factors from a reflectance table such as a
-Spectralon Excel sheet, restricted to an ROI) or from a fluorescence reference
+Spectralon Excel sheet, restricted to an ROI; the table is never extrapolated: bands outside its
+wavelength range get NaN reflectance and a warning, and the output header records the table,
+reference cube and ROI rows as `reflectance reference*` with the warning in `calibration warnings`)
+or from a fluorescence reference
 (ROI-average spectrum, Savitzky-Golay smoothed, inverted). `core.py` is Qt-free;
 `widget.py` holds the interactive `CalibrationWindow` and the `RoiDialog` ROI picker;
 `workers.py` is a small `QObject` adapter that runs a core function on a `QThread`.

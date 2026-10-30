@@ -21,7 +21,7 @@ import time
 import threading
 import numpy as np
 from .poa import pyPOACamera
-from .base import AbstractCameraBackend, CameraBackendInfo
+from .base import AbstractCameraBackend, CameraBackendInfo, device_text
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,8 @@ class POACameraBackend(AbstractCameraBackend):
         self._stop_event: threading.Event | None = None
         self._has_cooler: bool = False
         self._target_temp_range: tuple | None = None
+        self._model_name: str | None = None
+        self._serial_number: str | None = None
 
     # ══════════════════════════════════════════════════════
     #  Properties
@@ -93,6 +95,14 @@ class POACameraBackend(AbstractCameraBackend):
     def sensor_bit_depth(self) -> int:
         """Bit depth the SDK reports for the sensor (e.g. 12), before RAW16 scales it to 16 bits."""
         return int(getattr(self, "_sensor_bits", self.bit_depth))
+
+    def model_name(self) -> str | None:
+        """``cameraModelName`` from the camera properties (``None`` before ``open``)."""
+        return self._model_name
+
+    def serial_number(self) -> str | None:
+        """``SN`` from the camera properties (``None`` before ``open``)."""
+        return self._serial_number
 
     # ══════════════════════════════════════════════════════
     #  Internal helpers
@@ -174,6 +184,8 @@ class POACameraBackend(AbstractCameraBackend):
         _, camera_properties = pyPOACamera.GetCameraProperties(0)
 
         self.camera_id = camera_properties.cameraID
+        self._model_name = device_text(getattr(camera_properties, "cameraModelName", None))
+        self._serial_number = device_text(getattr(camera_properties, "SN", None))
         self.bit_depth = camera_properties.bitDepth
         self._sensor_bits = int(camera_properties.bitDepth)
         if self.bit_depth in (10, 12, 16):

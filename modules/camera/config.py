@@ -30,6 +30,9 @@ class CameraConfig:
         target_temperature_c: Cooler target (°C) applied at start-up on cameras with a settable
             target (TEC); ``None`` leaves the cooler as the camera has it. Optional in
             ``camera.json``; the application saves the last value the user set.
+        camera_profile_folder: Root of the per-camera calibration folders
+            (``<root>/<backend>/<model>_<serial>/`` with ``dark``, ``smile`` and ``wavelength``,
+            see :class:`modules.contracts.CameraProfile`). Optional in ``camera.json``.
 
     ``default_gain``, ``default_exposure_ms``, ``default_bin`` and ``target_temperature_c`` are
     written back to ``camera.json`` when the user changes them, so the next start uses them.
@@ -44,3 +47,4 @@ class CameraConfig:
     default_bin: int = 1
     sensor_pixel_size: int = 10
     target_temperature_c: float | None = None
+    camera_profile_folder: str = "camera_profiles"

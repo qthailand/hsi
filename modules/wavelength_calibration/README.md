@@ -154,7 +154,8 @@ must be used from the GUI thread and starts no threads of its own.
 
 **6 · Profile → Apply & Save for this setting** applies the profile to the live HSI session and,
 once the acquisition worker has accepted it, stores it for the image's camera setting (camera,
-index, bin, orientation, frame size) in `config/calibration/wavelength/<backend>/wavelength_bin<N>.json`
+index, bin, orientation, frame size) in the open camera's profile,
+`camera_profiles/<backend>/<model>_<serial>/wavelength/wavelength_bin<N>.json`
 (`modules.contracts.CalibrationStore`; the previous file is copied to `history/`). Smile Analysis
 (Spectral Quality) and *FWHM / Spectral Resolution* load that file automatically for a frame of
 the same setting. The scan uses it too: when streaming starts and after every bin change the
