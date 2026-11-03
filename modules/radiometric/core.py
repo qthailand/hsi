@@ -10,8 +10,10 @@ Data conventions:
       ``parse_envi_header``: ``lines`` (first spatial axis, the slit direction),
       ``samples`` (second spatial axis, the scan direction), ``bands``,
       ``wavelength`` (float array in nm or ``None``) and ``data type``.
-      Bands are read one at a time as float32 ``(lines, samples)`` images in raw
-      sensor counts, so memory use stays at one or two bands.
+      Bands are read as float32 ``(lines, samples)`` images in raw sensor counts:
+      one at a time from BSQ files; BIL/BIP cubes are converted to BSQ in RAM once
+      (``read_envi_cube_bsq``, kept for the next step on the same cube) or, when too
+      large, read in blocks of up to :data:`BAND_BLOCK_BYTES`.
     * Calibration factors are multipliers applied to counts: ``rowwise`` factors
       are ``(lines, bands)`` float32 (one factor per slit row and band), global
       "fluorescence" factors are ``(bands,)`` (one factor per band).
@@ -51,7 +53,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline
 from scipy.signal import savgol_filter
-from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, envi_dtype
+from modules.cube_io.envi import (parse_envi_header, _read_envi_band_float32, read_envi_bands_float32,
+                                  read_envi_cube_bsq, envi_dtype)
 from modules.cube_io.writers import carried_header_lines
 
 #: Reflectance tables of the reference targets (Spectralon, PVC, ...): Excel sheets without
@@ -185,6 +188,54 @@ def load_factor_profile(path):
     return factors, wavelengths
 
 
+#: Memory for a block of bands read at once from a BIL/BIP file (see :class:`_BandReader`).
+BAND_BLOCK_BYTES = 256 * 1024 * 1024
+
+
+class _BandReader:
+    """``reader(i)``: band ``i`` of an ENVI file as a new float32 ``(lines, samples)`` array.
+
+    BSQ bands are read one by one.  A BIL/BIP cube is converted to BSQ in RAM once and
+    kept for the following steps on it (:func:`read_envi_cube_bsq`); a cube too large for
+    that is read in blocks of up to :data:`BAND_BLOCK_BYTES`, starting at the requested band
+    (or ending at it when reading backwards).  Values equal :func:`_read_envi_band_float32`.
+    """
+
+    def __init__(self, filepath, meta):
+        self.filepath, self.meta = filepath, meta
+        self.n_bands = int(meta['bands'])
+        band_bytes = 4 * int(meta['lines']) * int(meta['samples'])
+        bsq = str(meta.get('interleave', 'bsq')).lower().strip() == 'bsq'
+        self.size = 1 if bsq else max(1, min(self.n_bands, BAND_BLOCK_BYTES // max(band_bytes, 1)))
+        self.start, self.block = 0, None
+        self.cube = None if bsq else read_envi_cube_bsq(filepath, meta)
+
+    def __call__(self, i):
+        i = int(i)
+        if self.cube is not None:
+            return self.cube[i].astype(np.float32)
+        if self.size == 1:
+            return _read_envi_band_float32(self.filepath, self.meta, i)
+        if self.block is None or not self.start <= i < self.start + len(self.block):
+            self.start = i if self.block is None or i >= self.start else max(0, i + 1 - self.size)
+            self.block = read_envi_bands_float32(self.filepath, self.meta, self.start,
+                                                 min(self.n_bands, self.start + self.size))
+        return self.block[i - self.start].copy()
+
+
+def _write_bip(bands, path):
+    """Write band-stacked ``(bands, lines, samples)`` data to ``path`` as BIP.
+
+    Transposes a few lines at a time, in cache: writing the transposed view at once
+    (or band by band into a BIP array) is several times slower.
+    """
+    n_bands, n_lines, n_samples = bands.shape
+    step = max(1, (4 << 20) // max(1, n_bands * n_samples * bands.itemsize))
+    with open(path, 'wb') as fh:
+        for y in range(0, n_lines, step):
+            np.ascontiguousarray(bands[:, y:y + step].transpose(1, 2, 0)).tofile(fh)
+
+
 def _apply_spatial_binning(img, n, to_uint16=False):
     """Average spatial blocks, dropping incomplete edge blocks as before."""
     if n <= 1:
@@ -258,21 +309,43 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
     R_ref_per_band = f_ref(np.asarray(wl, dtype=np.float64)).astype(np.float32)
     out_of_range = int(np.count_nonzero(~np.isfinite(R_ref_per_band)))
 
+    # The averaging window of a row depends only on the row: rows_has_roi[left:right].
+    # Per band, all window means then come from cumulative ROI row sums and counts
+    # (float64): the NaN-ignoring mean of the window's ROI pixels, as np.nanmean.
+    left = np.zeros(H, dtype=np.intp)
+    right = np.zeros(H, dtype=np.intp)
+    for y in range(H):
+        rows_window = pick_rows_in_roi(int(np.clip(y, top_roi, bot_roi)))
+        if len(rows_window):
+            left[y] = np.searchsorted(rows_has_roi, rows_window[0])
+            right[y] = left[y] + len(rows_window)
+    cols = np.where(mask.any(axis=0))[0]
+    c0, c1 = int(cols.min()), int(cols.max()) + 1
+    roi_mask = mask[rows_has_roi, c0:c1]
+
+    def cumulative(values):
+        return np.concatenate(([0], np.cumsum(values)))
+
+    reader = _BandReader(ref_filepath, ref_meta)
     progress_callback(0)
     for i in range(ref_meta['bands']):
-        ref_img = _read_envi_band_float32(ref_filepath, ref_meta, i)
-        ref_roi = np.where(mask[:, :ref_img.shape[1]], ref_img[:, :ref_img.shape[1]], np.nan)
-        fallback = np.nanmedian(ref_roi)
-        if not np.isfinite(fallback) or fallback <= 0:
-            fallback = 1.0
-
-        for y in range(ref_roi.shape[0]):
-            y_ref = int(np.clip(y, top_roi, bot_roi))
-            rows_window = pick_rows_in_roi(y_ref)
-            mean_val = np.nanmean(ref_roi[rows_window, :]) if len(rows_window) > 0 else fallback
-            if not np.isfinite(mean_val) or mean_val <= 0:
-                mean_val = fallback
-            rowwise_factors[y, i] = R_ref_per_band[i] / mean_val
+        ref_img = reader(i)
+        roi = ref_img[rows_has_roi, c0:c1]
+        valid = roi_mask & ~np.isnan(roi)
+        row_sum = np.where(valid, roi, 0).sum(axis=1, dtype=np.float64)
+        inf_row = ~np.isfinite(row_sum)          # a +-inf pixel makes its windows' mean not finite
+        sums = cumulative(np.where(inf_row, 0.0, row_sum))
+        counts = cumulative(valid.sum(axis=1))
+        infs = cumulative(inf_row)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mean_val = (sums[right] - sums[left]) / (counts[right] - counts[left])
+        bad = ~np.isfinite(mean_val) | (mean_val <= 0) | (infs[right] > infs[left])
+        if bad.any():
+            fallback = np.nanmedian(ref_img[mask])
+            if not np.isfinite(fallback) or fallback <= 0:
+                fallback = 1.0
+            mean_val[bad] = fallback
+        rowwise_factors[:, i] = R_ref_per_band[i] / mean_val
 
         progress_callback(i + 1)
     reference = {
@@ -326,11 +399,12 @@ def create_datacube_logic(params, progress_callback=None):
             wl_str = ','.join([str(item) for item in raw_meta['wavelength']])
             hopen.write(f'wavelength = {{{wl_str}}}\n')
 
-    c = np.zeros((cubheight * band_count, cubwidth), dtype=out_dtype)
+    c = np.zeros((band_count, cubheight, cubwidth), dtype=out_dtype)
+    reader = _BandReader(raw_filepath, raw_meta)
     progress_callback(0)
 
     for i in range(band_count):
-        im = _read_envi_band_float32(raw_filepath, raw_meta, i)
+        im = reader(i)
         roi_img = im[y0:y1, x0:x1]
         if rowwise_factors is not None:
             roi_img *= rowwise_factors[y0:y1, i].reshape(-1, 1)
@@ -338,11 +412,10 @@ def create_datacube_logic(params, progress_callback=None):
             roi_img *= float(factors[i])
         out = _apply_spatial_binning(
             roi_img, n_bin, to_uint16=(out_dtype == np.uint16))
-        c[cubheight * i: cubheight * (i + 1)] = _cast_band(out, out_dtype)
+        c[i] = _cast_band(out, out_dtype)
         progress_callback(i + 1)
 
-    bip = c.reshape((band_count, cubheight, cubwidth)).transpose(1, 2, 0)  # HWC
-    bip.tofile(save_path)
+    _write_bip(c, save_path)
     return save_path
 
 
@@ -391,13 +464,14 @@ def create_datacube_resampled_logic(params, progress_callback=None):
             wl_str = ','.join(f"{float(v):.2f}" for v in lam_target)
             hopen.write(f'wavelength = {{{wl_str}}}\n')
 
-    c = np.zeros((cubheight * len(lam_target), cubwidth), dtype=out_dtype_np)
+    c = np.zeros((len(lam_target), cubheight, cubwidth), dtype=out_dtype_np)
+    reader = _BandReader(raw_filepath, raw_meta)
     progress_callback(0)
 
     for j in range(len(lam_target)):
         iL, iR, a = int(idx_left[j]), int(idx_right[j]), float(alpha[j])
-        imL = _read_envi_band_float32(raw_filepath, raw_meta, iL)
-        imR = _read_envi_band_float32(raw_filepath, raw_meta, iR)
+        imL = reader(iL)
+        imR = reader(iR)
 
         Wmin = min(imL.shape[1], imR.shape[1])
         roiL = imL[y0:y1, x0:min(x1, x0 + Wmin)]
@@ -413,11 +487,10 @@ def create_datacube_resampled_logic(params, progress_callback=None):
         roiJ = (1.0 - a) * roiL + a * roiR
         out = _apply_spatial_binning(
             roiJ, n_bin, to_uint16=(out_dtype_np == np.uint16))
-        c[cubheight * j: cubheight * (j + 1)] = _cast_band(out, out_dtype_np)
+        c[j] = _cast_band(out, out_dtype_np)
         progress_callback(j + 1)
 
-    bip = c.reshape((len(lam_target), cubheight, cubwidth)).transpose(1, 2, 0)  # HWC
-    bip.tofile(save_path)
+    _write_bip(c, save_path)
     return save_path
 
 
@@ -433,9 +506,10 @@ def build_raw_cube_tmp(params, progress_callback=None):
     bands = raw_meta['bands']
     mm = np.memmap(tmp_path, mode='w+', dtype=np.uint16, shape=(lines * bands, samples))
 
+    reader = _BandReader(raw_filepath, raw_meta)
     progress_callback(0)
     for i in range(bands):
-        im = _read_envi_band_float32(raw_filepath, raw_meta, i)
+        im = reader(i)
         roi = im[y0:y1, x0:x1]
         mm[lines * i: lines * (i + 1)] = np.clip(roi, 0, 65535).astype(np.uint16)
         progress_callback(i + 1)
@@ -459,9 +533,10 @@ def build_cal_cube_tmp(params, progress_callback=None):
     bands = raw_meta['bands']
     mm = np.memmap(tmp_path, mode='w+', dtype=np.float32, shape=(lines * bands, samples))
 
+    reader = _BandReader(raw_filepath, raw_meta)
     progress_callback(0)
     for i in range(bands):
-        im = _read_envi_band_float32(raw_filepath, raw_meta, i)
+        im = reader(i)
         roi = im[y0:y1, x0:x1]
         if rowwise is not None:
             fac = rowwise[y0:y1, i].reshape(-1, 1)
@@ -481,9 +556,10 @@ def fluo_calculation_heavy_logic(ref_filepath, ref_meta, mask, progress_callback
     num_bands = ref_meta['bands']
     avg_ref_spectrum = np.zeros(num_bands, dtype=np.float32)
 
+    reader = _BandReader(ref_filepath, ref_meta)
     progress_callback(0)
     for i in range(num_bands):
-        img = _read_envi_band_float32(ref_filepath, ref_meta, i)
+        img = reader(i)
         roi_data = img[mask[:, :img.shape[1]]]
         avg_ref_spectrum[i] = np.nanmean(roi_data) if roi_data.size > 0 else 1.0
         progress_callback(i + 1)
