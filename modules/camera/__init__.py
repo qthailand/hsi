@@ -40,16 +40,21 @@ __all__ = [
     "GenICamBackend",
     "XIMEACameraBackend",
     "CameraControls",
+    "PixelPitchDialog",
+    "PixelPitchStatus",
 ]
-__requires__ = ("dark",)
-# CameraControls is a QGroupBox (PyQt5, loaded lazily); constructible with no arguments.
-__widgets__ = ("CameraControls",)
+__requires__ = ("contracts", "dark")
+# Qt widgets (PyQt5, loaded lazily), all constructible with no arguments: CameraControls is a
+# QGroupBox, PixelPitchDialog asks for the sensor pixel pitch, PixelPitchStatus is its status-bar chip.
+__widgets__ = ("CameraControls", "PixelPitchDialog", "PixelPitchStatus")
 
 _LAZY = {
     "POACameraBackend": ".poa_camera",
     "GenICamBackend": ".genicam",
     "XIMEACameraBackend": ".ximea_camera",
     "CameraControls": ".widget",
+    "PixelPitchDialog": ".pixel_pitch",
+    "PixelPitchStatus": ".pixel_pitch",
 }
 
 

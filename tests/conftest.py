@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 
+import pytest
 from PyQt5.QtCore import QtCriticalMsg, QtFatalMsg, qInstallMessageHandler
 
 CRASH_LOG = os.path.join(tempfile.gettempdir(), "hsi_pytest_crash.log")
@@ -42,3 +43,12 @@ def pytest_runtest_setup(item):
     global _current
     _current = item.nodeid
     faulthandler.enable(file=_log, all_threads=True)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Keep each phase's report on the item (``item.rep_setup``, ``item.rep_call``) so a fixture's
+    teardown can see whether its test passed (used by the hardware report files)."""
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, "rep_" + report.when, report)

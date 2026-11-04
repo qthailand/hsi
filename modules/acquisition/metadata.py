@@ -8,7 +8,9 @@ those facts when a scan starts so they can be stored next to the data (HDF5 attr
 
 Data conventions:
     The result is a flat ``dict`` of ``str``/``int``/``float``/``bool`` values (HDF5-attribute
-    friendly). Exposure is milliseconds, ``m_*`` slopes are nm per pixel, ``c_nm``,
+    friendly). ``pixel_size`` (as the SDK reports it, ``1.0`` = unknown) and
+    ``sensor_pixel_pitch_um`` (entered in the camera profile, bin 1) are micrometres.
+    Exposure is milliseconds, ``m_*`` slopes are nm per pixel, ``c_nm``,
     ``resolution_nm`` (bin width actually used) and ``fwhm_nm`` are nm, ``degree*`` are degrees.
     ``resolution_source`` says whether the bin width came from the config or the stored FWHM. ``bit_depth`` is the frames' bit depth,
     ``sensor_bit_depth`` the real data bits before scaling and ``full_scale`` the largest value
@@ -76,7 +78,8 @@ def camera_bit_info(backend) -> dict:
 
 def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
                        started_at: Optional[datetime.datetime] = None,
-                       binning: Optional[dict] = None) -> dict:
+                       binning: Optional[dict] = None,
+                       pixel_pitch_um: Optional[float] = None) -> dict:
     """Describe the camera, processing settings and scan motion of the scan that is starting.
 
     Args:
@@ -90,6 +93,9 @@ def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
         started_at: Scan start time (defaults to now, local time with UTC offset).
         binning: The engine's ``binning_info()`` (bin width actually used and its source);
             without it ``resolution_nm`` is ``config.resolution``.
+        pixel_pitch_um: Sensor pixel pitch at bin 1 the user entered in the camera profile
+            (``CameraProfile.pixel_pitch_um``); stored as ``sensor_pixel_pitch_um``, left out
+            when ``None``. ``pixel_size`` stays what the SDK reported (``1.0`` = unknown).
 
     Returns:
         A flat dict (see the module docstring for units). ``m_nm_per_px`` is the slope for the
@@ -113,6 +119,7 @@ def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
         "bit_depth": _number(getattr(info, "bit_depth", None), int),
         **{key: value for key, value in camera_bit_info(backend).items() if key != "bit_depth"},
         "pixel_size": _number(getattr(info, "pixel_size", None), float),
+        "sensor_pixel_pitch_um": _number(pixel_pitch_um, float),
         "gain": getattr(backend, "gain", None),
         "exposure_ms": getattr(backend, "exposure_ms", None),
         "raw_inverted": bool(config.raw_inverted),

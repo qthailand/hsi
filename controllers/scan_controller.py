@@ -45,7 +45,7 @@ from modules.dark import DarkFrameLibrary, select_dark, valid_temperature
 from modules.stage import StageThread
 
 from config import AppConfig, calibration_store
-from modules.contracts import CameraProfile, CameraSetting
+from modules.contracts import CameraProfile, CameraSetting, sdk_pixel_pitch_um
 from modules.spectral_processing.wavelength import spectrum_from_corrected_row
 from modules.cube_io import create_pushbroom_cube_from_corrected
 from modules.smile import SmileCorrector
@@ -595,6 +595,14 @@ class ScanController:
             logger.warning("Could not write %s: %s", profile.info_path, e)
         logger.info("Camera profile: %s (model %s, serial %s)", profile.root,
                     model or "unknown", serial or "unknown")
+        if profile.pixel_pitch_um is None:
+            logger.warning("Sensor pixel pitch of %s is not set (File > Camera Pixel Pitch)", profile.root)
+        try:
+            sdk_pitch = sdk_pixel_pitch_um(self.backend.info.pixel_size)
+        except Exception:
+            sdk_pitch = None
+        for warning in profile.pitch_warnings(sdk_pitch):
+            logger.warning("Pixel pitch of %s: %s", profile.root, warning)
         return profile
 
     def _open_dark_library(self) -> DarkFrameLibrary:
@@ -783,7 +791,8 @@ class ScanController:
         return meta
 
     #: Raw-metadata keys of a scan that also go into its cube's export header.
-    _HEADER_SCAN_KEYS = ("started_at", "camera_model", "camera_serial", "exposure_ms", "gain", "camera_bin", "stage_type",
+    _HEADER_SCAN_KEYS = ("started_at", "camera_model", "camera_serial", "sensor_pixel_pitch_um",
+                         "exposure_ms", "gain", "camera_bin", "stage_type",
                          "speed_um_s", "speed_um_s_achieved", "degree_per_second",
                          "degree_per_second_achieved")
 
@@ -1336,7 +1345,8 @@ class ScanController:
             scan["speed_um_s"] = self.win.linear_speed_um_s()
         try:
             return build_raw_metadata(backend=self.backend, config=self.config, scan=scan,
-                                      binning=self.preview_thread.binning_info())
+                                      binning=self.preview_thread.binning_info(),
+                                      pixel_pitch_um=self.camera_profile.pixel_pitch_um)
         except Exception:
             logger.exception("Could not collect scan metadata")
             return {}

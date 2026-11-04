@@ -67,6 +67,7 @@ COUNT_HEADER_FIELDS = (
 SCAN_HEADER_FIELDS = (
     ('camera_model', 'camera model', str),
     ('camera_serial', 'camera serial number', str),
+    ('sensor_pixel_pitch_um', 'sensor pixel pitch (um, bin 1)', float),
     ('exposure_ms', 'exposure time (ms)', float),
     ('gain', 'sensor gain', float),
     ('frame_rate_hz', 'frame rate (Hz)', float),

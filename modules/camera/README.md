@@ -183,3 +183,27 @@ Signals: `params_changed()` (gain/exposure edited), `bin_changed()` and
 `set_target_temperature` does not emit). `set_values`,
 `set_bin_options` and `set_selected_bin` do not emit. `set_bin_enabled(False)` locks the
 bin during a scan; `keep_spectrogram()` is read when a scan starts.
+
+### Sensor pixel pitch (`pixel_pitch.py`)
+
+Most SDKs do not report the pixel pitch (the GenICam and XIMEA backends report
+`info.pixel_size == 1.0`), so the user enters it once per camera; it is stored in the camera
+profile's `profile.json` (`CameraProfile.set_pixel_pitch`, micrometres at bin 1). Treat an SDK
+value with `modules.contracts.sdk_pixel_pitch_um(info.pixel_size)`, which turns the `1.0`
+placeholder into `None`.
+
+* `PixelPitchDialog(profile, sdk_pitch_um)` shows the camera (backend, model, serial), pre-fills
+  the stored value or the SDK's suggestion and saves on **Save** (`pitch_saved(float)`).
+* `PixelPitchStatus` is a status-bar chip, hidden until `set_profile(profile, sdk_pitch_um)`.
+  It stays visible while the profile has no pitch (orange) and, for a camera that reports
+  neither model nor serial, permanently (red: the profile is shared). Clicking opens the dialog.
+  It never blocks scanning.
+
+```python
+from modules.camera import PixelPitchStatus
+from modules.contracts import sdk_pixel_pitch_um
+
+chip = PixelPitchStatus()
+window.statusBar().addPermanentWidget(chip)
+chip.set_profile(profile, sdk_pitch_um=sdk_pixel_pitch_um(camera.info.pixel_size))
+```

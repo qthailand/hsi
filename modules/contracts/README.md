@@ -85,12 +85,20 @@ standards = normalize_wavelength_config(json.load(open("profile.json")))
   adds; the HSI app stores `frame_width`/`frame_height`/`camera_bin` at open). The HSI app saves every calibration of the open
   camera there and reads the older per-backend folders (`dark_frames/<backend>/`,
   `smile_maps/<backend>/`, `calibration/wavelength/<backend>/`) only as a fallback.
+  `write_info` keeps keys it is not given, so values the user entered survive every camera open.
+* **Sensor pixel pitch** (in `profile.json`): `set_pixel_pitch(um, note)` saves the pitch at
+  bin 1 in micrometres (0.5-50 µm, else `ValueError`) as the `"sensor"` block
+  (`SensorInfo`: `pixel_pitch_um`, `note`, `entered_at`, `model`, `serial`); the previous block
+  moves to `"sensor_history"`. `pixel_pitch_um` is `None` until it is entered.
+  `pitch_warnings(sdk_pitch_um)` lists reasons to re-check it (profile shared by cameras without
+  a serial, entered for another camera, SDK value more than 1 % off). `sdk_pixel_pitch_um(value)`
+  turns a backend's `info.pixel_size` into a pitch, or `None` for the `1.0` placeholder.
 
 ## API summary
 
 `CubeData` (`validate()`), `default_reference_row`, `normalize_wavelength_config`,
 `WavelengthCalibration`, `CameraSetting`, `CalibrationStore`, `StoredWavelength`, `StoredResolution`,
-`CameraProfile`, `profile_name`.
+`CameraProfile`, `SensorInfo`, `profile_name`, `sdk_pixel_pitch_um`, `PIXEL_PITCH_RANGE_UM`.
 Implementation: `geometry.py`, `wavelength.py`, `calibration_set.py`, `camera_profile.py`, `__init__.py`.
 
 ## Threading

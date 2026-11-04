@@ -503,3 +503,16 @@ def test_two_open_copies_do_not_overwrite_each_others_edits(monkeypatch, tmp_pat
     finally:
         reopened.close()
         app.processEvents()
+
+
+def test_main_window_asks_for_the_camera_pixel_pitch(main_window):
+    """The status bar shows the pixel-pitch chip for the opened camera; File > Camera Pixel Pitch is enabled."""
+    app, window = main_window
+    chip = window.pixel_pitch_status
+    profile = window.scan_window.controller.camera_profile
+    assert chip.profile is profile and window.pixel_pitch_action.isEnabled()
+    assert chip.state == "shared"                 # FakeCamera reports neither model nor serial
+    assert chip.sdk_pitch_um is None              # nor a pixel pitch
+    profile.set_pixel_pitch(5.3)
+    chip.refresh()
+    assert chip.state == "shared" and "5.3" in chip.text()

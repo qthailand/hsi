@@ -83,6 +83,10 @@ class MainWindow(QMainWindow):
 
         self.exit_action = QAction("Exit", self)
         self.exit_action.triggered.connect(self.close)
+        # Sensor pixel pitch of the open camera (entered once per camera profile)
+        self.pixel_pitch_action = QAction("Camera Pixel Pitch...", self)
+        self.pixel_pitch_action.setEnabled(False)            # until a camera is open
+        self.pixel_pitch_action.triggered.connect(self.edit_pixel_pitch)
 
         # ── 2. menubar (สร้างก่อน) ────────────────────────────
         menubar = QMenuBar(self)
@@ -111,6 +115,7 @@ class MainWindow(QMainWindow):
         file_menu = menubar.addMenu("File")
         file_menu.addAction(self.scan_action)
         file_menu.addAction(self.open_envi_action)
+        file_menu.addAction(self.pixel_pitch_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -222,6 +227,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.temp_status)
         self.temp_status.hide()
 
+        # Pixel pitch: an orange chip while the open camera's profile has none (click to enter)
+        from modules.camera import PixelPitchStatus
+        self.pixel_pitch_status = PixelPitchStatus()
+        self.statusBar().addPermanentWidget(self.pixel_pitch_status)
+
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(_STATUS_POLL_MS)
         self._status_timer.timeout.connect(self._update_status_bar)
@@ -244,6 +254,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(widget.status_info())
         else:
             self.statusBar().showMessage("")
+
+    # ── sensor pixel pitch ────────────────────────────────────────
+
+    def _show_camera_pixel_pitch(self, controller) -> None:
+        """Point the pixel-pitch chip and menu entry at the camera ``controller`` opened; the
+        chip stays (also after the scan window closes) until that camera's pitch is entered."""
+        from modules.contracts import sdk_pixel_pitch_um
+        profile = getattr(controller, "camera_profile", None)
+        try:
+            sdk_pitch = sdk_pixel_pitch_um(controller.backend.info.pixel_size)
+        except Exception:
+            sdk_pitch = None
+        self.pixel_pitch_status.set_profile(profile, sdk_pitch_um=sdk_pitch)
+        self.pixel_pitch_action.setEnabled(profile is not None)
+
+    def edit_pixel_pitch(self) -> None:
+        """File > Camera Pixel Pitch: enter or change the last opened camera's pitch."""
+        self.pixel_pitch_status.open_dialog()
 
     # ── scan window ───────────────────────────────────────────────
 
@@ -294,6 +322,7 @@ class MainWindow(QMainWindow):
         scan.snapshot_failed.connect(self.frame_exchange.reject)
         for integration in self.integrations:
             integration.attach_scan(scan.controller)
+        self._show_camera_pixel_pitch(scan.controller)
 
         sub = ResizableMdiSubWindow()
         sub.setWidget(scan)

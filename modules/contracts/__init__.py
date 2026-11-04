@@ -71,9 +71,9 @@ class CubeData:
 from .geometry import default_reference_row
 from .wavelength import WavelengthCalibration, normalize_wavelength_config
 from .calibration_set import CalibrationStore, CameraSetting, StoredResolution, StoredWavelength
-from .camera_profile import CameraProfile, profile_name
+from .camera_profile import PIXEL_PITCH_RANGE_UM, CameraProfile, SensorInfo, profile_name, sdk_pixel_pitch_um
 
 __all__ = ["CubeData", "default_reference_row", "normalize_wavelength_config", "WavelengthCalibration",
            "CameraSetting", "CalibrationStore", "StoredWavelength", "StoredResolution",
-           "CameraProfile", "profile_name"]
+           "CameraProfile", "SensorInfo", "profile_name", "sdk_pixel_pitch_um", "PIXEL_PITCH_RANGE_UM"]
 __requires__ = ()
