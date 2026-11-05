@@ -14,6 +14,10 @@ Data conventions:
       one at a time from BSQ files; BIL/BIP cubes are converted to BSQ in RAM once
       (``read_envi_cube_bsq``, kept for the next step on the same cube) or, when too
       large, read in blocks of up to :data:`BAND_BLOCK_BYTES`.
+    * A scan still in memory (``(lines, samples, bands)``, the scan's ``(slit, scan,
+      wavelength)`` cube) needs no file: ``compute_rowwise_factors_array`` fits the same
+      factors as the file version, ``apply_rowwise_factors`` applies them (after the scan,
+      on the finished cube).
     * Calibration factors are multipliers applied to counts: ``rowwise`` factors
       are ``(lines, bands)`` float32 (one factor per slit row and band), global
       "fluorescence" factors are ``(bands,)`` (one factor per band).
@@ -268,26 +272,102 @@ def _cast_band(img, dtype):
 
 def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
                                     avg_window_size, mask,
-                                    progress_callback=None):
+                                    progress_callback=None, window_fit='mean'):
     """Fit reference-spectrum factors per image row using the selected ROI.
+
+    Each slit row's reference counts come from a window of ``avg_window_size`` ROI rows around it
+    (one-sided at the ROI's ends; rows outside the ROI use the nearest ROI row). ``window_fit``:
+    ``'mean'`` - the window's mean (the original behaviour); ``'linear'`` - a pixel-weighted
+    line through the window's row means evaluated at the row, which stays unbiased where the
+    vignetting falls off along the slit (with the mean, a window one-sided at the ROI end on a
+    falloff of ``g`` per row is off by about ``g * window / 2``).
 
     Returns:
         dict: ``factors`` ``(lines, bands)`` float32, ``span`` (first, last ROI row),
         ``out_of_range_bands`` (bands outside the reference table: factor NaN, so their
-        reflectance is NaN instead of an extrapolated guess), ``table_range_nm`` and
+        reflectance is NaN instead of an extrapolated guess), ``table_range_nm``,
+        ``roi_mean_spectrum`` (float64 ``(bands,)``: mean counts of the valid ROI pixels) and
         ``reference`` (header metadata: ``reflectance_reference`` table file,
         ``reflectance_reference_cube``, ``reflectance_reference_rows``, plus
         ``calibration_warnings`` when bands fall outside the table).
     """
-    progress_callback = progress_callback or (lambda value: None)
+    readers = []                                # opened on the first band: after the ROI checks
+
+    def read_box(i, r0, r1, c0, c1):
+        if not readers:
+            readers.append(_BandReader(ref_filepath, ref_meta))
+        return readers[0](i)[r0:r1, c0:c1]
+
+    return _rowwise_factors(read_box, int(ref_meta['bands']), ref_meta['lines'], ref_meta['samples'],
+                            ref_meta['wavelength'], ref_excel, avg_window_size, mask, progress_callback,
+                            os.path.basename(str(ref_filepath)), window_fit)
+
+
+def compute_rowwise_factors_array(cube, wavelengths, ref_excel, avg_window_size, mask,
+                                  progress_callback=None, source_name='in-memory cube', window_fit='mean'):
+    """:func:`rowwise_calculation_heavy_logic` for a cube held in memory (no temporary file).
+
+    The factors are bit-identical to the file version on the same counts: each band is read
+    as float32, as ``_read_envi_band_float32`` reads a file band.
+
+    Args:
+        cube: ``(lines, samples, bands)`` array or memmap (the scan's ``(slit, scan, wavelength)``
+            layout, any real dtype) in dark-subtracted counts.
+        wavelengths: Band centres in nm, one per band.
+        ref_excel: Reflectance table of the reference target (see :func:`list_reflectance_profiles`).
+        avg_window_size: Number of ROI rows averaged for each slit row.
+        mask: Boolean ROI ``(lines, samples)``.
+        progress_callback: Called with ``0`` and then the number of bands done.
+        source_name: Name recorded as ``reflectance_reference_cube`` in ``reference``.
+
+    Returns:
+        dict: As :func:`rowwise_calculation_heavy_logic`.
+
+    Raises:
+        ValueError: ``cube`` is not 3-D, ``wavelengths`` does not give one value per band, the
+            mask has another shape or covers no pixel.
+    """
+    cube = np.asarray(cube) if not isinstance(cube, np.ndarray) else cube
+    if cube.ndim != 3:
+        raise ValueError(f'cube must be (lines, samples, bands), got shape {cube.shape}')
+    wl = np.asarray(wavelengths, dtype=np.float64).ravel()
+    if wl.size != cube.shape[2]:
+        raise ValueError(f'{wl.size} wavelengths for a cube of {cube.shape[2]} bands')
+    mask = np.asarray(mask, dtype=bool)
+    return _rowwise_factors(lambda i, r0, r1, c0, c1: np.array(cube[r0:r1, c0:c1, i], dtype=np.float32),
+                            cube.shape[2], cube.shape[0], cube.shape[1], wl, ref_excel,
+                            avg_window_size, mask, progress_callback, str(source_name), window_fit)
+
+
+def reflectance_at(ref_excel, wavelengths):
+    """Reflectance of a reference table at ``wavelengths`` (nm), as the factor fit uses it.
+
+    Cubic spline through the table, never extrapolated: wavelengths outside the table give NaN.
+
+    Returns:
+        tuple: ``(reflectance float32 (n,), (table min nm, table max nm))``.
+    """
     data_ref = pd.read_excel(ref_excel, header=None).to_numpy()
     # no extrapolation: a cubic spline outside the table goes wild (PVC 400-999.5 nm gives
     # -885 at 1200 nm); bands outside it get NaN factors and are reported
     f_ref = CubicSpline(data_ref[:, 0], data_ref[:, 1], extrapolate=False)
     table_range = (float(np.min(data_ref[:, 0])), float(np.max(data_ref[:, 0])))
-    wl = ref_meta['wavelength']
+    return f_ref(np.asarray(wavelengths, dtype=np.float64)).astype(np.float32), table_range
 
-    H, W = ref_meta['lines'], ref_meta['samples']
+
+def _rowwise_factors(read_box, n_bands, H, W, wl, ref_excel, avg_window_size, mask,
+                     progress_callback, source_name, window_fit='mean'):
+    """Shared body of the row-wise factor fit.
+
+    ``read_box(i, r0, r1, c0, c1)`` returns band ``i`` restricted to rows ``r0:r1`` and columns
+    ``c0:c1`` (the ROI's bounding box) as float32: every value the fit uses lies inside it.
+    ``window_fit``: ``'mean'`` (the window's mean counts) or ``'linear'`` (a line through the
+    window's rows, evaluated at the row).
+    """
+    progress_callback = progress_callback or (lambda value: None)
+    R_ref_per_band, table_range = reflectance_at(ref_excel, wl)
+
+    mask = np.asarray(mask, dtype=bool)         # a 0/1 integer mask would index rows, not select pixels
     if mask.shape != (H, W):
         raise ValueError('ROI mask shape does not match reference image.')
 
@@ -306,7 +386,6 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
         return rows_has_roi[left:right]
 
     rowwise_factors = np.zeros((H, len(wl)), dtype=np.float32)
-    R_ref_per_band = f_ref(np.asarray(wl, dtype=np.float64)).astype(np.float32)
     out_of_range = int(np.count_nonzero(~np.isfinite(R_ref_per_band)))
 
     # The averaging window of a row depends only on the row: rows_has_roi[left:right].
@@ -321,27 +400,56 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
             right[y] = left[y] + len(rows_window)
     cols = np.where(mask.any(axis=0))[0]
     c0, c1 = int(cols.min()), int(cols.max()) + 1
+    r0, r1 = top_roi, bot_roi + 1
     roi_mask = mask[rows_has_roi, c0:c1]
+    box_mask = mask[r0:r1, c0:c1]               # every ROI pixel: ``img[mask]`` of the full band
+    box_rows = rows_has_roi - r0
+    roi_mean = np.full(n_bands, np.nan, dtype=np.float64)
+    if window_fit not in ('mean', 'linear'):
+        raise ValueError(f"window_fit must be 'mean' or 'linear', got {window_fit!r}")
+    linear = window_fit == 'linear'
+    x_rows = (rows_has_roi - top_roi).astype(np.float64)                   # row positions, ROI-relative
+    x_eval = (np.clip(np.arange(H), top_roi, bot_roi) - top_roi).astype(np.float64)
 
     def cumulative(values):
         return np.concatenate(([0], np.cumsum(values)))
 
-    reader = _BandReader(ref_filepath, ref_meta)
     progress_callback(0)
-    for i in range(ref_meta['bands']):
-        ref_img = reader(i)
-        roi = ref_img[rows_has_roi, c0:c1]
+    for i in range(n_bands):
+        box = read_box(i, r0, r1, c0, c1)
+        roi = box[box_rows]
         valid = roi_mask & ~np.isnan(roi)
         row_sum = np.where(valid, roi, 0).sum(axis=1, dtype=np.float64)
+        n_valid = int(valid.sum())
+        if n_valid:
+            roi_mean[i] = row_sum.sum() / n_valid
         inf_row = ~np.isfinite(row_sum)          # a +-inf pixel makes its windows' mean not finite
-        sums = cumulative(np.where(inf_row, 0.0, row_sum))
-        counts = cumulative(valid.sum(axis=1))
+        finite_sum = np.where(inf_row, 0.0, row_sum)
+        sums = cumulative(finite_sum)
+        n_row = valid.sum(axis=1)
+        counts = cumulative(n_row)
         infs = cumulative(inf_row)
         with np.errstate(divide='ignore', invalid='ignore'):
             mean_val = (sums[right] - sums[left]) / (counts[right] - counts[left])
+            if linear:
+                # pixel-weighted least-squares line through the window's ROI rows, evaluated at the
+                # row itself (its nearest ROI row outside the span): unbiased on a falloff gradient,
+                # where the plain mean of a window that is one-sided at the ROI ends is not
+                n_f = n_row.astype(np.float64)
+                sx = cumulative(n_f * x_rows)
+                sxx = cumulative(n_f * x_rows * x_rows)
+                sxs = cumulative(x_rows * finite_sum)
+                rows_used = cumulative(n_row > 0)
+                w, s = counts[right] - counts[left], sums[right] - sums[left]
+                swx, swxx, swxs = sx[right] - sx[left], sxx[right] - sxx[left], sxs[right] - sxs[left]
+                den = w * swxx - swx * swx
+                slope = (w * swxs - swx * s) / den
+                fitted = (s - slope * swx) / w + slope * x_eval
+                use = (rows_used[right] - rows_used[left] >= 2) & np.isfinite(fitted) & (den > 0)
+                mean_val = np.where(use, fitted, mean_val)
         bad = ~np.isfinite(mean_val) | (mean_val <= 0) | (infs[right] > infs[left])
         if bad.any():
-            fallback = np.nanmedian(ref_img[mask])
+            fallback = np.nanmedian(box[box_mask])
             if not np.isfinite(fallback) or fallback <= 0:
                 fallback = 1.0
             mean_val[bad] = fallback
@@ -350,7 +458,7 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
         progress_callback(i + 1)
     reference = {
         'reflectance_reference': os.path.basename(str(ref_excel)),
-        'reflectance_reference_cube': os.path.basename(str(ref_filepath)),
+        'reflectance_reference_cube': source_name,
         'reflectance_reference_rows': f'{top_roi}-{bot_roi}',
     }
     if out_of_range:
@@ -358,7 +466,55 @@ def rowwise_calculation_heavy_logic(ref_filepath, ref_meta, ref_excel,
             f'{out_of_range} bands outside the reference table '
             f'({table_range[0]:g}-{table_range[1]:g} nm) have no reflectance (NaN)')
     return {'factors': rowwise_factors, 'span': (top_roi, bot_roi), 'out_of_range_bands': out_of_range,
-            'table_range_nm': table_range, 'reference': reference}
+            'table_range_nm': table_range, 'roi_mean_spectrum': roi_mean, 'window_fit': window_fit,
+            'reference': reference}
+
+
+def apply_rowwise_factors(cube, factors, factor_wavelengths=None, wavelengths=None, rows_per_chunk=64,
+                          progress_callback=None):
+    """Calibrate a cube held in memory with row-wise factors: ``cube * factors[:, None, :]``.
+
+    Gives the values :func:`create_datacube_logic` writes for the full, unbinned cube (each band
+    as float32 times the factor in the factor's own dtype, rounded once to float32), without a
+    temporary file. The cube is processed a few slit rows at a time, so no float64 copy of the
+    whole cube is made.
+
+    Args:
+        cube: ``(lines, samples, bands)`` array or memmap, any real dtype (counts).
+        factors: Row-wise factors ``(lines, bands)`` (:func:`compute_rowwise_factors_array`).
+        factor_wavelengths: Band centres (nm) the factors were made for, or ``None``.
+        wavelengths: Band centres (nm) of ``cube``, or ``None``; with both given they are
+            compared by :func:`check_factor_bands`.
+        rows_per_chunk: Slit rows multiplied per step.
+        progress_callback: Optional ``callable(int)``, given the slit rows done after each step.
+
+    Returns:
+        numpy.ndarray: New float32 ``(lines, samples, bands)`` cube; NaN where a factor is NaN
+        (bands outside the reflectance table).
+
+    Raises:
+        ValueError: The factors do not have the cube's slit rows or bands, or their band
+            centres do not fit the cube's.
+    """
+    factors = np.asarray(factors)
+    if not np.issubdtype(factors.dtype, np.floating):
+        factors = factors.astype(np.float32)
+    if cube.ndim != 3 or factors.ndim != 2:
+        raise ValueError(f'expected a (lines, samples, bands) cube and (lines, bands) factors, '
+                         f'got {cube.shape} and {factors.shape}')
+    if factors.shape[0] != cube.shape[0]:
+        raise ValueError(f'Factors for {factors.shape[0]} slit rows do not fit this cube of '
+                         f'{cube.shape[0]} rows: make a reference at the same camera setting.')
+    check_factor_bands(factors.shape[1], factor_wavelengths,
+                       {'bands': cube.shape[2], 'wavelength': wavelengths})
+    out = np.empty(cube.shape, dtype=np.float32)
+    step = max(1, int(rows_per_chunk))
+    for y in range(0, cube.shape[0], step):
+        part = np.asarray(cube[y:y + step], dtype=np.float32)
+        np.multiply(part, factors[y:y + step, None, :], out=out[y:y + step], casting='same_kind')
+        if progress_callback is not None:
+            progress_callback(min(y + step, cube.shape[0]))
+    return out
 
 
 def create_datacube_logic(params, progress_callback=None):

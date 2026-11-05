@@ -1,8 +1,9 @@
 {
-  "stage_type": "rotation",
+  "stage_type": "free",
   "rotation_speed_dps": 2.0,
   "rotation_degree": 5.0,
   "linear_distance_mm": 10.0,
   "linear_speed_um_s": 1000.0,
-  "scan_trim_extra_ms": 0
+  "scan_trim_extra_ms": 0,
+  "free_duration_s":10
 }

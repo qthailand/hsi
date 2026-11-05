@@ -9,6 +9,12 @@ A manual stop (:meth:`StageSequence.request_stop`) interrupts the scan move but 
 returns the stage home, as in v1. ``request_stop(return_home=False)`` aborts without
 homing and is meant for application shutdown only.
 
+Stage type ``"free"`` is a scan without a stage: nothing is opened or moved; the "scan
+move" is a wait of ``duration_s`` seconds (ended early by a stop), with the same
+``on_before``/``on_after`` callbacks and motion times, so the caller records and builds
+the cube exactly as for a stage. There is no homing and no return home (``on_home`` is
+never called).
+
 Threading:
     :meth:`StageSequence.run` blocks and must run on a worker thread (the Qt wrapper
     :class:`modules.stage.StageThread` does this). :meth:`StageSequence.request_stop`
@@ -17,6 +23,7 @@ Threading:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Callable, Optional
@@ -40,6 +47,7 @@ class StageSequence:
         degree: Rotation angle of the scan move (rotation stage).
         distance_mm: Travel of the scan move (linear stage).
         speed_um_s: Speed during the scan (linear stage, micrometres per second).
+        duration_s: Recording time of a free scan (stage type ``"free"``, seconds).
         degree_per_second_achieved: Rotation speed the stage runs, as read back from the
             controller when the scan speed is set (deg/s); ``None`` until then or if the
             driver does not report it.
@@ -57,15 +65,17 @@ class StageSequence:
             to stop from it, read when the scan speed is set (``(0, 0)`` if the driver
             cannot tell).
         trim_extra_ms: Extra time cut off both ends of the constant-speed window
-            (:meth:`steady_window`), for command latency.
+            (:meth:`steady_window`), for command latency (stage moves only; a free scan
+            keeps its whole timed window).
         device: Stage device path or libximc URI for the default drivers; empty = find it
             (``stage_device`` in ``config/scan.json``).
         completed: The whole sequence, including return-home, succeeded.
 
     Args:
-        stage_type: ``"rotation"`` or ``"linear"``.
+        stage_type: ``"rotation"``, ``"linear"`` or ``"free"`` (no stage, timed scan).
         stage_factory: Zero-argument callable returning an unopened stage driver
-            (see :mod:`modules.stage.smc1`); defaults to the XIMC SMC1 drivers.
+            (see :mod:`modules.stage.smc1`); defaults to the XIMC SMC1 drivers. Not used
+            by a free scan.
         on_before: Called just before the scan move (start recording).
         on_after: Called when the scan move ended (build the cube).
         on_home: Called after a successful return-home.
@@ -85,6 +95,7 @@ class StageSequence:
         self.degree = 10
         self.distance_mm = 10.0
         self.speed_um_s = 1000.0
+        self.duration_s = 10.0
         self.degree_per_second_achieved = None
         self.speed_um_s_achieved = None
         self._factory = stage_factory
@@ -162,14 +173,15 @@ class StageSequence:
         ``motion_start_ns`` plus the acceleration time and ``trim_extra_ms``, and
         ``motion_end_ns`` minus the deceleration time and ``trim_extra_ms``; a bound not
         known yet stays ``None``.  A move too short to reach constant speed keeps the
-        whole motion window.
+        whole motion window.  A free scan (no stage) has no ramps and no command latency:
+        its window is the whole timed recording.
 
         Returns:
             tuple: ``(start_ns, end_ns)``, either ``None``.
         """
         start, end = self.motion_start_ns, self.motion_end_ns
         accel_s, decel_s = self.ramp_s
-        extra_ns = int(self.trim_extra_ms * 1e6)
+        extra_ns = 0 if self.stage_type == 'free' else int(self.trim_extra_ms * 1e6)
         if start is not None:
             start += int(accel_s * 1e9) + extra_ns
         if end is not None:
@@ -217,6 +229,48 @@ class StageSequence:
         logger.exception('Stage %s failed', self.phase)
         self._notify_error(str(exc))
 
+    def _wait_free_scan(self, duration_s: float):
+        """Wait ``duration_s`` seconds from ``motion_start_ns``, or until a stop request."""
+        deadline = self.motion_start_ns + int(round(duration_s * 1e9))
+        while True:
+            remaining_s = (deadline - time.perf_counter_ns()) / 1e9
+            # Event.wait may wake a little early (timer resolution): wait again for the rest.
+            # Waits are capped (a very long timeout overflows the OS wait on Windows).
+            if remaining_s <= 0 or self._stop.wait(min(remaining_s, 60.0)):
+                return
+
+    def _run_free(self):
+        """The free scan: no stage, a timed recording of ``duration_s`` seconds.
+
+        Same callbacks, phases and result flags as a stage scan (``on_before`` when the
+        recording starts, ``on_after`` when the time is up or a stop ended it early), but
+        nothing is opened, homed or returned home.
+        """
+        try:
+            duration = float(self.duration_s)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError(f'Free scan time must be a positive number of seconds, not {self.duration_s!r}')
+            if not self._stop.is_set():
+                self.phase = self.SCANNING
+                self.ramp_s = (0.0, 0.0)
+                logger.info('Free scan (no stage): recording for %.6g s', duration)
+                # Noted before on_before, so its handler can already use steady_window().
+                self.motion_start_ns = time.perf_counter_ns()
+                self._notify_before()
+                if not self._stop.is_set():   # stop may arrive between checks
+                    self._wait_free_scan(duration)
+                    self.motion_end_ns = time.perf_counter_ns()
+                else:
+                    self.motion_start_ns = None   # the recording never started
+                self.scan_finished = True
+                self._notify_after()
+        except Exception as exc:
+            self._fail(exc)
+        finally:
+            self.cancelled = self._stop.is_set()
+            self.completed = self.scan_finished and not self.failed
+            self.phase = self.IDLE
+
     # ── sequence ─────────────────────────────────────────
 
     def run(self):
@@ -225,13 +279,18 @@ class StageSequence:
         Never raises: failures set ``failed``/``failed_phase`` and are reported through
         ``on_error``. The stage is always closed. Homing before the scan, the scan
         itself and the return-home are skipped according to stop/abort requests and
-        to the phase in which a failure occurred.
+        to the phase in which a failure occurred. Stage type ``"free"`` runs the timed
+        scan instead (:meth:`_run_free`; no stage).
         """
+        if self.stage_type == 'free':
+            self._run_free()
+            return
         stage = None
         moved = False
         try:
             if self.stage_type not in ('linear', 'rotation'):
-                raise ValueError(f'Unsupported stage type: {self.stage_type}')
+                raise ValueError(f'Unsupported stage type: {self.stage_type} '
+                                 f'(rotation, linear or free)')
             factory = self._factory
             if factory is None:
                 from .smc1 import Stage8SMC1, Stage8SMC1Linear

@@ -44,6 +44,10 @@ from modules.ui_kit.resizable_subwindow import ResizableMdiSubWindow
 
 logger = logging.getLogger(__name__)
 
+#: Raw-count fields of a scan (part of a radiometric reference's key): the values recorded when
+#: the scan started win over a camera query when the reference is made.
+SCAN_BIT_KEYS = ("bit_depth", "sensor_bit_depth", "full_scale")
+
 _STATUS_POLL_MS = 250
 
 
@@ -307,6 +311,13 @@ class MainWindow(QMainWindow):
                 scan.calibration_requested.connect(
                     lambda cube, wl, integration=integration: integration.open_cube(
                         cube, wl, metadata=self._scan_export_metadata()))
+                scan.radiometric_reference_requested.connect(
+                    lambda cube, wl, integration=integration: integration.save_reference(
+                        cube, wl, metadata=self._scan_reference_metadata()))
+                # the same metadata as a reference made of the scan: the same setting, the same key
+                scan.auto_calibration_requested.connect(
+                    lambda cube, wl, integration=integration: integration.auto_calibrate(
+                        cube, wl, metadata=self._scan_reference_metadata()))
         try:
             scan.controller = ScanController(scan, config=self.config,
                                              persist_settings=self.persist_settings)
@@ -375,13 +386,36 @@ class MainWindow(QMainWindow):
             logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
         return {**(camera_bits or {}), **self.scan_controller.last_scan_header}
 
+    def _scan_reference_metadata(self):
+        """Metadata for a radiometric reference made of the last scan: the export-header metadata
+        plus the scan-start metadata it lacks (wavelength m/c at the start, for old headers).
+
+        The bit depth / full scale (part of the reference key) are the ones recorded when the scan
+        started: ``_scan_export_metadata`` asks the camera again now, which can differ or fail
+        (camera stopped or in error) and would give a key no later scan matches."""
+        raw = dict(getattr(self.scan_controller, "_raw_metadata", None) or {})
+        meta = dict(raw)
+        meta.update(self._scan_export_metadata() or {})
+        meta.update({k: raw[k] for k in SCAN_BIT_KEYS if raw.get(k) is not None})
+        return meta
+
     def _create_scan_cube_viewer(self, cube, wavelengths=None):
         """Open a viewer for the cube just scanned, carrying the scan's metadata to its export header.
 
         An export from this viewer marks the scan result saved (no Save / Discard question).
+        The scan's reflectance (automatic radiometric calibration) is exported without the raw-count
+        fields and with the reference it was calibrated with.
         Returns the viewer, or None if it could not be opened.
         """
-        viewer = self.create_cube_viewer(cube, wavelengths, camera_bits=self._scan_export_metadata())
+        metadata, title = self._scan_export_metadata(), None
+        calibration = getattr(self.scan_window, "calibration_header", None)
+        header = calibration(cube) if calibration is not None else None
+        if header is not None:
+            from modules.radiometric.auto import reflectance_export_metadata
+            metadata = reflectance_export_metadata(metadata, header)
+            title = (f"Reflectance Viewer {cube.shape} - "
+                     f"{header.get('reflectance_reference_cube') or header.get('reflectance_reference')}")
+        viewer = self.create_cube_viewer(cube, wavelengths, title=title, camera_bits=metadata)
         if viewer is not None:
             viewer.cube_exported.connect(
                 lambda _path, cube=cube: self.scan_window is not None and self.scan_window.mark_result_saved(cube))

@@ -54,7 +54,8 @@ from modules.reference_roi import select_rgb, compose_preview
 HISTOGRAM_UPDATE_INTERVAL_SEC = 0.25
 SETTINGS_SAVE_DELAY_MS = 1000       # write camera/stage settings once edits pause this long
 #: scan.json keys of ``ScanWindow.stage_spins()``, in the same order.
-STAGE_SETTING_KEYS = ("rotation_speed_dps", "rotation_degree", "linear_distance_mm", "linear_speed_um_s")
+STAGE_SETTING_KEYS = ("rotation_speed_dps", "rotation_degree", "linear_distance_mm", "linear_speed_um_s",
+                      "free_duration_s")
 #: processing.json key of the per-backend wavelength range.
 RANGE_SETTING_KEY = "wavelength_range_nm"
 
@@ -90,6 +91,8 @@ class ScanController:
     _dirty_settings = frozenset()       # setting keys edited since the last save
     _scan_temps = ()
     last_scan_header: dict = {}
+    last_scan_saturation_ceiling = None
+    _frame_calibration = None     # modules.radiometric.auto.FrameCalibration of the scan running
     dark_reference = None
     _closing = False                    # cleanup started: the worker's end is not a failure
     _last_preview_error = ""            # the worker's last error message, shown if it stops
@@ -215,6 +218,7 @@ class ScanController:
         self._scan_temps: list[float] = []         # readings during the current scan
         self.last_scan_temperatures: dict = {}     # temperature metadata of the last cube
         self.last_scan_header: dict = {}           # everything the last cube's export header records
+        self.last_scan_saturation_ceiling = None   # (lines, bands) saturated-pixel value of the last cube
 
         # Settings the user changes are saved once edits pause (see _save_settings).
         if persist_settings:
@@ -371,10 +375,10 @@ class ScanController:
         No cube is published; the image is delivered through
         ``reference_preview_ready`` when the scan move ends.
         """
-        if self.stage is not None:
-            raise RuntimeError("Stage is still stopping or returning home")
         if self.state != self.PREVIEW or self.dark_lib.is_collecting:
             raise RuntimeError("Reference preview needs normal preview (no scan/dark capture)")
+        if self.stage is not None:
+            raise RuntimeError("Stage is still stopping or returning home")
         self.session.start_reference_preview(request_id)
         self.start_scan()
         if self.state != self.SCANNING:
@@ -538,6 +542,13 @@ class ScanController:
             self.win.open_cube_viewer_btn.setText("Open Cube Viewer")
             self.win.open_calibration_btn.setEnabled(False)
             self.win.open_calibration_btn.setText("Open Calibration")
+            save_reference_btn = getattr(self.win, "save_reference_btn", None)   # absent on test windows
+            if save_reference_btn is not None:
+                save_reference_btn.setEnabled(False)
+            self.last_scan_saturation_ceiling = None    # belonged to the cube being replaced
+            clear_calibration = getattr(self.win, "clear_scan_calibration", None)   # absent on test windows
+            if clear_calibration is not None:
+                clear_calibration()                     # its reflectance goes with it
             self.win._pending_cube = None
             self.win._pending_wavelengths = None
             self.win._pending_spectrogram = None
@@ -791,10 +802,13 @@ class ScanController:
         return meta
 
     #: Raw-metadata keys of a scan that also go into its cube's export header.
-    _HEADER_SCAN_KEYS = ("started_at", "camera_model", "camera_serial", "sensor_pixel_pitch_um",
-                         "exposure_ms", "gain", "camera_bin", "stage_type",
+    #: camera_backend, raw_inverted and resolution_nm are part of a radiometric reference's key
+    #: (modules.radiometric.ReferenceKey): a scan reopened from its file must still match.
+    _HEADER_SCAN_KEYS = ("started_at", "camera_backend", "camera_model", "camera_serial",
+                         "sensor_pixel_pitch_um", "raw_inverted", "exposure_ms", "gain", "camera_bin",
+                         "resolution_nm", "stage_type",
                          "speed_um_s", "speed_um_s_achieved", "degree_per_second",
-                         "degree_per_second_achieved")
+                         "degree_per_second_achieved", "duration_s", "duration_s_recorded")
 
     def _scan_header_metadata(self) -> dict:
         """Export-header metadata of the scan that just ended (see ``HypercubeWriter``):
@@ -1316,6 +1330,9 @@ class ScanController:
         gc.collect()
         self.win.set_recorded_count(0)
         self._set_recording(False)
+        # Frame-by-frame radiometric calibration: the reference is chosen now, for the whole scan,
+        # and latched with the recording (all frames reflectance, or all counts).
+        self._frame_calibration, calibration_note = self._plan_frame_calibration(start_temp)
 
         # ── arm preview thread ────────────────────────────────
         self.preview_thread.set_scanning(True)
@@ -1326,6 +1343,9 @@ class ScanController:
         # ── state transition + stage launch ───────────────────
         warnings = self.calibration_warnings()
         self._set_state(self.SCANNING)
+        show_calibration = getattr(self.win, "set_scan_calibration", None)   # absent on test windows
+        if show_calibration is not None and calibration_note is not None:
+            show_calibration(*calibration_note)
         self._create_and_start_stage()
         if warnings and self.state == self.SCANNING:   # not blocking; the cube header records them too
             logger.warning("Scan started with calibration warnings: %s", "; ".join(warnings))
@@ -1334,12 +1354,136 @@ class ScanController:
                 show(f"{len(warnings)} calibration warning{'s' if len(warnings) > 1 else ''}: "
                      + "; ".join(warnings))
 
+    # ── radiometric calibration of the frames ───────────────────────
+
+    def scan_reference_metadata(self, at_start=False, start_temperature_c=None) -> dict:
+        """The metadata a radiometric reference key is built from (``ReferenceKey.from_scan``):
+        the scan's raw metadata, its export-header metadata (corrections, Smile, wavelength
+        calibration, temperatures) and the bit depth recorded at its start.
+
+        Args:
+            at_start: True for the scan that is starting: the corrections are the current ones and
+                the only temperature is ``start_temperature_c`` (none when the camera gave no
+                reading; the last scan's temperatures are always left out). False: the scan that
+                has ended (``last_scan_header``).
+            start_temperature_c: Sensor temperature at the start (``at_start`` only), or ``None``.
+        """
+        raw = dict(getattr(self, "_raw_metadata", None) or {})
+        if not at_start:
+            header = dict(self.last_scan_header)
+        else:
+            header = {k: v for k, v in self._scan_header_metadata().items()
+                      if not k.startswith("sensor_temperature_c")}
+            if start_temperature_c is not None:
+                header["sensor_temperature_c_start"] = start_temperature_c
+        meta = {**raw, **header}
+        meta.update({k: raw[k] for k in ("bit_depth", "sensor_bit_depth", "full_scale") if raw.get(k) is not None})
+        return meta
+
+    def _plan_frame_calibration(self, start_temp):
+        """The reference multiplied into every frame of the scan that is starting, while *Auto
+        radiometric calibration* is ticked and an active reference of this camera fits the setting.
+
+        Returns:
+            ``(frame calibration or None, (state, text) for the scan window or None)``.
+        """
+        box = getattr(self.win, "auto_radiometric_box", None)
+        profile = getattr(self, "camera_profile", None)
+        if (box is None or not box.isChecked() or profile is None
+                or self.session.reference_preview_id is not None):   # a visual-selection scan stays in counts
+            return None, None
+        try:
+            from modules.radiometric import RadiometricReferenceStore
+            from modules.radiometric.auto import plan_frame_calibration
+            plan, frame = plan_frame_calibration(
+                RadiometricReferenceStore(profile.radiometric_folder),
+                self.scan_reference_metadata(at_start=True, start_temperature_c=start_temp),
+                self.preview_thread.binner_lambda_out, self._last_spatial_height or None)
+        except Exception as exc:
+            logger.exception("Radiometric references cannot be read")
+            return None, ("failed", f"This scan: recorded in counts - references cannot be read ({exc})")
+        if frame is not None:
+            problem = self._frame_calibration_memory_problem(frame.factors.shape)
+            if problem:      # recorded in counts (half the memory); calibrated after it if that fits
+                return None, ("not_applied", f"This scan: recorded in counts - {problem}")
+            logger.info("Scan calibrated frame by frame with radiometric reference %s", frame.reference.id)
+            return frame, ("working", f"This scan: calibrated frame by frame with {frame.reference.id}")
+        if plan.ok:      # factors with NaN (bands outside the table): calibrated after the scan
+            return None, ("working", f"This scan: recorded in counts, calibrated with {plan.reference.id} "
+                                     "after it (its factors have bands without reflectance)")
+        if plan.wanted:
+            return None, ("not_applied", f"This scan: recorded in counts - {plan.summary()}")
+        return None, None
+
+    def _frame_calibration_memory_problem(self, factor_shape):
+        """Why the expected scan should not be recorded as float32 reflectance (``None`` = it may):
+        its frames and its cube then take twice the memory of counts. The frame count is estimated
+        from the stage move and the camera frame rate; unknown -> no refusal (``finish_scan`` still
+        falls back to counts when the cube does not fit)."""
+        try:
+            from modules.radiometric.auto import memory_problem
+            seconds = float(self.win.expected_scan_seconds())
+            rate = (self.preview_thread.correction_info() or {}).get("frame_rate_hz")
+            if not rate or seconds <= 0:
+                return None
+            frames = int(seconds * float(rate)) + 1
+            lines, bands = factor_shape
+            return memory_problem((lines, 2 * frames, bands))   # float32 frames + float32 cube
+        except Exception:
+            logger.debug("Scan memory estimate unavailable", exc_info=True)
+            return None
+
+    @staticmethod
+    def _frames_to_counts(frames, factors):
+        """Turn reflectance frames back into counts in place (exact), one frame at a time, so each
+        float32 frame is freed as it is replaced (the list is shared with the session and preview)."""
+        from modules.radiometric.auto import counts_from_reflectance
+        for i, frame in enumerate(frames):
+            if frame.dtype == np.float32:
+                frames[i] = counts_from_reflectance(frame, factors)
+
+    def _finish_frame_calibration(self, frames):
+        """Check the frame-by-frame calibration of the scan that ended (final key, mean sensor
+        temperature) and hand back ``(frames, calibration)``: the reflectance frames and the scan
+        window's calibration, or ``None`` with the frames turned back into counts (exactly, in place)
+        when the reference may not stay applied or a frame could not be multiplied."""
+        frame_cal, self._frame_calibration = self._frame_calibration, None
+        if frame_cal is None:
+            return frames, None
+        from modules.radiometric.auto import AUTO_FRAME_MODE, finish_frame_calibration
+        recorder = getattr(self.preview_thread, "recorder", None)
+        error = getattr(recorder, "factor_error", None)
+        try:
+            plan, problems = finish_frame_calibration(frame_cal, self.scan_reference_metadata())
+        except Exception as exc:                    # never leave reflectance frames unlabelled
+            logger.exception("Frame-by-frame calibration check failed")
+            plan, problems = None, [f"the check failed ({exc})"]
+        if error or any(f.dtype != np.float32 for f in frames):
+            problems = [error or "some frames were recorded in counts"]
+        if problems:
+            logger.warning("Frame-by-frame calibration with %s dropped: %s", frame_cal.reference.id,
+                           "; ".join(problems))
+            self._frames_to_counts(frames, frame_cal.factors)
+            return frames, None
+        header = plan.header_fields()
+        header["reflectance_reference_mode"] = AUTO_FRAME_MODE
+        return frames, {"header": header, "factors": frame_cal.factors,
+                        "text": f"Last scan: {plan.summary()}, frame by frame"}
+
+    def _hide_scan_calibration_note(self):
+        """A scan ended without a cube: its "This scan: ..." line no longer applies."""
+        show = getattr(self.win, "set_scan_calibration", None)   # absent on test windows
+        if show is not None:
+            show("off", "")
+
     def _collect_raw_metadata(self) -> dict:
         """Provenance of the scan that is starting (stored with the raw spectrogram)."""
         scan = {"stage_type": self.win.stage_type()}
         if scan["stage_type"] == "rotation":
             scan["degree"] = self.win.rotation_degree()
             scan["degree_per_second"] = self.win.rotation_speed_dps()
+        elif scan["stage_type"] == "free":      # no stage: a timed scan
+            scan["duration_s"] = self.win.free_duration_s()
         else:
             scan["distance_mm"] = self.win.linear_distance_mm()
             scan["speed_um_s"] = self.win.linear_speed_um_s()
@@ -1364,6 +1508,8 @@ class ScanController:
             elif stage_type == "linear":
                 self.stage.distance_mm = self.win.linear_distance_mm()
                 self.stage.speed_um_s = self.win.linear_speed_um_s()
+            elif stage_type == "free":          # no stage: records for this many seconds
+                self.stage.duration_s = self.win.free_duration_s()
             else:
                 raise ValueError(f"Unsupported stage_type: {stage_type}")
 
@@ -1397,13 +1543,19 @@ class ScanController:
         """
         self.recording = bool(active)
         if self.preview_thread is not None:
-            self.preview_thread.set_recording(self.recording, start_ns=start_ns)
+            frame_cal = self._frame_calibration if self.recording else None
+            if frame_cal is not None:
+                # latched with the arming: every frame of this recording is multiplied
+                self.preview_thread.set_recording(self.recording, start_ns=start_ns, factors=frame_cal.factors)
+            else:
+                self.preview_thread.set_recording(self.recording, start_ns=start_ns)
             if self.recording:
                 # The live preview reads the recording's own list while it grows.
                 self._show_in_cube_preview(self.preview_thread.live_recorded_frames())
 
     def _disarm_stage_recording(self):
         self._set_recording(False)
+        self._frame_calibration = None          # the next scan chooses its own reference
         if self.preview_thread is not None:
             self.preview_thread.take_recorded_frames()  # discard
             self.preview_thread.take_recorded_raw()
@@ -1423,8 +1575,9 @@ class ScanController:
     def _note_achieved_speed(self):
         """Store the scan speed the stage runs (read back from the controller once it set the
         scan speed) in the scan metadata next to the requested one, and return it (µm/s for
-        the linear stage, deg/s for rotation), or ``None`` if the stage did not report it."""
-        if self.stage is None:
+        the linear stage, deg/s for rotation), or ``None`` if the stage did not report it (and
+        for a free scan, which has no stage)."""
+        if self.stage is None or self.stage.stage_type == "free":
             return None
         key = "speed_um_s_achieved" if self.stage.stage_type == "linear" else "degree_per_second_achieved"
         achieved = getattr(self.stage, key, None)
@@ -1432,12 +1585,31 @@ class ScanController:
             self._raw_metadata[key] = achieved
         return achieved
 
+    def _stage_returning_home(self) -> bool:
+        """The stage thread is still running and will move a stage home (not a free scan,
+        which has no stage: its thread ends right after the scan)."""
+        stage = self.stage
+        return stage is not None and stage.isRunning() and getattr(stage, "stage_type", None) != "free"
+
+    def _free_scan_recorded_seconds(self):
+        """Seconds a free scan (no stage) recorded: from its start to the end of its time, or to
+        now when a Stop or a camera error ended it early (rounded to 1 ms); ``None`` for a stage
+        scan or a free scan that never started."""
+        stage = self.stage
+        if stage is None or getattr(stage, "stage_type", None) != "free":
+            return None
+        start = getattr(stage, "motion_start_ns", None)
+        if start is None:
+            return None
+        end = getattr(stage, "motion_end_ns", None) or time.perf_counter_ns()
+        return round(max(0.0, (end - start) / 1e9), 3)
+
     def on_stage_finished(self):
         # v1 behavior: build the cube as soon as the scan move ends (endpoint or
         # manual stop). Return-home continues in the stage thread; start_scan
         # stays blocked until it has finished.
         self.finish_scan()
-        if self.stage is not None and self.stage.isRunning():
+        if self._stage_returning_home():
             self.win.set_status("Cube ready — stage returning home")
 
     def on_stage_returned_home(self):
@@ -1451,6 +1623,7 @@ class ScanController:
             # so the partial recording is not published as a cube.
             self._disarm_stage_recording()
             self._set_state(self.PREVIEW)
+            self._hide_scan_calibration_note()
             self.win.set_status(f"Stage error — scan discarded: {message}")
             request_id = self.session.fail()
             if request_id is not None and self.reference_preview_failed is not None:
@@ -1483,7 +1656,7 @@ class ScanController:
             if self.stage is not None:
                 self.stage.request_stop()
             self.finish_scan()
-            if self.stage is not None and self.stage.isRunning():
+            if self._stage_returning_home():
                 self.win.set_status("Scan stopped — stage returning home")
 
     def _show_in_cube_preview(self, frames, shift=0):
@@ -1523,6 +1696,7 @@ class ScanController:
         window = self.stage.steady_window() if self.stage is not None else (None, None)
         images = self.preview_thread.take_recorded_frames(
             *window, reference_ns=getattr(self.stage, 'motion_start_ns', None))
+        recorded_s = self._free_scan_recorded_seconds()     # the recorder has just been disarmed
         raw = self.preview_thread.take_recorded_raw()
         self.win.set_recorded_count(len(images))     # the frames kept for the cube (after the trim)
 
@@ -1537,7 +1711,14 @@ class ScanController:
         if isinstance(getattr(self, '_raw_metadata', None), dict):
             self._raw_metadata.update(self.last_scan_temperatures)
             self._raw_metadata.update(range_metadata)
+            if recorded_s is not None:
+                self._raw_metadata["duration_s_recorded"] = recorded_s
         self.last_scan_header = self._scan_header_metadata()
+        # the saturation ceiling that applied to this scan (settings are locked while scanning; a
+        # later dark / exposure / Smile change replaces the live one): a radiometric reference made
+        # from this cube must use this one
+        ceiling = getattr(self, "saturation_ceiling", None)
+        self.last_scan_saturation_ceiling = None if ceiling is None else np.array(ceiling, copy=True)
 
         # ── state transition ──────────────────────────────────
         self._set_state(self.PREVIEW)
@@ -1549,27 +1730,64 @@ class ScanController:
 
         if outcome.kind in ("reference", "reference_failed"):
             # Visual-selection scan: publish a preview image, never a cube.
+            self._frame_calibration = None
+            self._hide_scan_calibration_note()
             self._publish_reference_outcome(outcome)
             return
 
-        # The preview now shows the cube's own (trimmed) list; points and bands stay.
         recorder = getattr(self.preview_thread, 'recorder', None)
-        self._show_in_cube_preview(images, recorder.last_trim[0] if recorder is not None else 0)
+        shift = recorder.last_trim[0] if recorder is not None else 0
+        # Frames multiplied by a reference while recorded: checked again with the final metadata
+        # (mean temperature) and against the free memory before the cube is shown or built; turned
+        # back into counts (exactly, in place) when the reference may not stay or does not fit.
+        calibration, note, units_changed = None, None, False
+        if outcome.kind != "empty":
+            had_frame_calibration = self._frame_calibration is not None
+            images, calibration = self._finish_frame_calibration(images)
+            if calibration is not None:
+                problem = self._reflectance_cube_memory_problem(images, calibration["factors"])
+                if problem:
+                    self._frames_to_counts(images, calibration["factors"])
+                    calibration, note = None, ("failed", f"Last scan: not calibrated - {problem}; "
+                                                         "kept in counts (use Calibration)")
+            units_changed = had_frame_calibration and calibration is None
+
+        # The preview now shows the cube's own (trimmed) list; points and bands stay.
+        self._show_in_cube_preview(images, shift)
+        if units_changed:
+            self._clear_preview_spectra()       # they were sampled from reflectance
 
         if outcome.kind == "empty":
+            self._frame_calibration = None
+            self._hide_scan_calibration_note()
             logger.warning("No frames recorded")
             return
 
         try:
             # ── build data cube ───────────────────────────────
-            cube = create_pushbroom_cube_from_corrected(self.session.images)
+            try:
+                cube = create_pushbroom_cube_from_corrected(images)
+            except MemoryError:
+                if calibration is None:
+                    raise
+                # a float32 cube that does not fit: the scan survives in counts (half the size)
+                self._frames_to_counts(images, calibration["factors"])
+                calibration, note = None, ("failed", "Last scan: not calibrated - not enough memory for "
+                                                     "the reflectance cube; kept in counts (use Calibration)")
+                self._clear_preview_spectra()
+                cube = create_pushbroom_cube_from_corrected(images)
 
             # ── wavelength axis ───────────────────────────────
             wavelengths = self.preview_thread.binner_lambda_out
             if wavelengths is None and self.current_wavelengths is not None:
                 wavelengths = self.current_wavelengths.copy()
 
-            self.win.set_cube_ready(cube, wavelengths)
+            if calibration is not None:
+                self.win.set_cube_ready(cube, wavelengths, calibration=calibration)
+            elif note is not None:
+                self.win.set_cube_ready(cube, wavelengths, note=note)
+            else:
+                self.win.set_cube_ready(cube, wavelengths)
 
             if self.session.spectrograms:
                 raw_stack = np.stack(self.session.spectrograms, axis=0)
@@ -1587,7 +1805,23 @@ class ScanController:
         except Exception as e:
             # The camera is fine: stay in PREVIEW so the next scan can start.
             logger.exception("Failed to create cube: %s", e)
+            self._hide_scan_calibration_note()
             self.win.set_status(f"Cube could not be built: {e}")
+
+    @staticmethod
+    def _reflectance_cube_memory_problem(frames, factors):
+        """Why the float32 cube of reflectance ``frames`` should not be built now (``None`` = it may)."""
+        try:
+            from modules.radiometric.auto import memory_problem
+            lines, bands = np.shape(factors)
+            return memory_problem((lines, len(frames), bands))
+        except Exception:
+            return None
+
+    def _clear_preview_spectra(self):
+        clear = getattr(getattr(self.win, "cube_preview", None), "clear_spectra", None)
+        if clear is not None:
+            clear()
 
     def _publish_reference_outcome(self, outcome):
         """Deliver a visual-selection scan result to the host callbacks."""

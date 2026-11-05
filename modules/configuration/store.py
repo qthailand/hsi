@@ -30,7 +30,7 @@ from modules.contracts import WavelengthCalibration
 logger=logging.getLogger(__name__)
 SECTIONS={
  'camera':('camera_backend','camera_id','camera_index','cti_path','default_gain','default_exposure_ms','default_bin','sensor_pixel_size','target_temperature_c','camera_profile_folder'),
- 'scan':('stage_type','rotation_degree','rotation_speed_dps','linear_distance_mm','linear_speed_um_s','scan_trim_extra_ms','stage_device'),
+ 'scan':('stage_type','rotation_degree','rotation_speed_dps','linear_distance_mm','linear_speed_um_s','free_duration_s','scan_trim_extra_ms','stage_device'),
  'processing':('resolution','resolution_source','fwhm_step_factor','raw_inverted','rgb_target_wavelengths','preprocessing_backend','profile_timing','wavelength_range_nm'),
  'dark':('dark_frame_folder','dark_frame_n_frames'),
  'smile':('smile_map_folder',),

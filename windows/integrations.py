@@ -35,6 +35,7 @@ A saved FWHM is re-read by the live session (bin width when ``resolution_source`
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Callable, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -76,11 +77,246 @@ class Integration:
         """Hook called after a ``ScanController`` is created (connect to its worker signals)."""
 
 
+class _AutoCalibrationJob:
+    """One scan being calibrated on a background thread."""
+
+    def __init__(self, window, cube, wavelengths, plan, token=None):
+        self.window = window
+        self.cube = cube
+        self.wavelengths = wavelengths
+        self.plan = plan
+        self.token = token          # the window's calibration request it answers
+
+
+def _make_relay(callback):
+    """A QObject on the GUI thread whose ``done(job, result)`` signal, emitted from any thread,
+    calls ``callback(job, result)`` on the GUI thread (queued)."""
+    from PyQt5.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
+
+    class _Relay(QObject):
+        done = pyqtSignal(object, object)
+
+        def __init__(self):
+            super().__init__()
+            self.done.connect(self._deliver, Qt.QueuedConnection)
+
+        @pyqtSlot(object, object)
+        def _deliver(self, job, result):
+            callback(job, result)
+
+    return _Relay()
+
+
+def _auto_calibration_thread(relay, job_id, cube, reference, wavelengths):
+    """Background thread: the reflectance of ``cube`` (or the exception) to ``relay.done``."""
+    from modules.radiometric.auto import apply_reference
+    try:
+        result = apply_reference(cube, reference, wavelengths)
+    except Exception as exc:                        # MemoryError too: the raw cube stays usable
+        logger.exception("Automatic radiometric calibration with %s failed", reference.id)
+        result = exc
+    try:
+        relay.done.emit(job_id, result)
+    except RuntimeError:                            # application closing
+        pass
+
+
 class RadiometricIntegration(Integration):
-    """Offline BSQ/radiometric calibration window (``modules.radiometric``)."""
+    """Offline BSQ/radiometric calibration window (``modules.radiometric``), and the radiometric
+    references of the open camera: *Save as Radiometric Reference*, the scan window's
+    automatic-calibration badge, and the automatic calibration of each finished scan."""
+
+    #: Badge refresh interval (ms): the age of the active reference keeps growing.
+    STATUS_INTERVAL_MS = 60_000
+
+    def __init__(self, host):
+        super().__init__(host)
+        self._status_timer = None
+        self._relay = None
+        self._auto_threads: list = []
+        self._auto_jobs: dict = {}                  # job id -> _AutoCalibrationJob still running
+        self._job_counter = 0
 
     def menu_entries(self):
         return [("Open BSQ Generator", self.open)]
+
+    def attach_scan(self, controller):
+        """Show the automatic-calibration state of the newly opened camera, and keep it current."""
+        self.refresh_status(controller)
+        try:
+            from PyQt5.QtCore import QTimer
+            window = getattr(controller, "win", None)
+            if window is None or not hasattr(window, "set_radiometric_status"):
+                return
+            timer = QTimer(window)                  # stops with the scan window
+            timer.setInterval(self.STATUS_INTERVAL_MS)
+            timer.timeout.connect(lambda c=controller: self.refresh_status(c))
+            timer.start()
+            self._status_timer = timer
+        except Exception:
+            logger.debug("No radiometric status timer", exc_info=True)
+
+    @staticmethod
+    def reference_store(controller):
+        """The open camera's ``RadiometricReferenceStore`` (its camera profile's ``radiometric/``),
+        or ``None`` without a camera profile."""
+        profile = getattr(controller, "camera_profile", None)
+        if profile is None:
+            return None
+        from modules.radiometric import RadiometricReferenceStore
+        return RadiometricReferenceStore(profile.radiometric_folder)
+
+    def refresh_status(self, controller=None):
+        """Update the scan window's badge from the store of ``controller`` (default: the current one)."""
+        controller = controller if controller is not None else self.host.scan_controller
+        window = getattr(controller, "win", None)
+        if window is None or not hasattr(window, "set_radiometric_status"):
+            return
+        try:
+            store = self.reference_store(controller)
+            state, text = store.status() if store is not None else ("off", "Auto radiometric: no camera profile")
+        except Exception as exc:
+            logger.exception("Cannot read the radiometric references")
+            state, text = "off", f"Auto radiometric: references unreadable ({exc})"
+        try:
+            window.set_radiometric_status(state, text)
+        except RuntimeError:                        # window already deleted
+            pass
+
+    def save_reference(self, cube, wavelengths=None, metadata=None):
+        """*Save as Radiometric Reference*: open the reference dialog on the scan just finished.
+
+        ``metadata`` is the scan's export-header metadata (camera, exposure, corrections,
+        ``started_at``, temperatures, bit depth). The saturation ceiling that applied to that scan
+        (snapshot taken when the cube was built, not the live one, which a later dark, exposure or
+        Smile change replaces) is passed when it fits the cube.
+        """
+        controller = self.host.scan_controller
+        try:
+            from modules.radiometric import RadiometricReferenceDialog
+            store = self.reference_store(controller) if controller is not None else None
+            ceiling = getattr(controller, "last_scan_saturation_ceiling", None)
+            dialog = RadiometricReferenceDialog(cube, wavelengths, metadata=metadata, store=store,
+                                                saturation_ceiling=ceiling, parent=self.host.parent_widget)
+        except Exception as exc:
+            logger.exception("Cannot open the radiometric reference dialog")
+            self.host.error("Save as Radiometric Reference", str(exc))
+            return None
+        dialog.reference_saved.connect(lambda ref: self._on_reference_saved(ref, controller))
+        try:
+            dialog.exec_()
+            return dialog.reference
+        finally:
+            delete = getattr(dialog, "deleteLater", None)   # parented to the main window: free it now
+            if delete is not None:
+                delete()
+
+    def _on_reference_saved(self, reference, controller):
+        active = reference.id in (self.reference_store(controller).active_ids() if controller else [])
+        self.host.show_status(f"Radiometric reference {reference.id} stored"
+                              + (" and active for automatic calibration" if active else ""))
+        self.refresh_status(controller)
+        window = getattr(controller, "win", None)
+        box = getattr(window, "auto_radiometric_box", None)
+        if active and window is not None and hasattr(window, "recalibrate") and box is not None:
+            try:
+                # The scan it was made of is calibrated with it too (while auto calibration is
+                # ticked): its reflectance should be the table's, a direct check of the reference.
+                # A reflectance made with an older reference (frame by frame) is dropped first.
+                if box.isChecked():
+                    window.recalibrate()
+            except RuntimeError:                    # window already deleted
+                pass
+
+    # ── automatic calibration of a finished scan ────────────────────
+
+    def auto_calibrate(self, cube, wavelengths=None, metadata=None):
+        """Calibrate a finished scan with the camera's matching active reference.
+
+        The reference is chosen here, on the GUI thread (a few small files); the cube is multiplied
+        by its factors on a background thread and handed to the scan window
+        (``set_calibrated_cube``), which shows *Open Reflectance Viewer*. The raw cube is never
+        changed. When no reference fits, the scan window says why (exposure, age, temperature ...).
+
+        Args:
+            cube: The scan's ``(lines, samples, bands)`` cube in counts.
+            wavelengths: Its band centres (nm).
+            metadata: The scan's metadata as for *Save as Radiometric Reference*
+                (``MainWindow._scan_reference_metadata``), so the key is built the same way.
+
+        Returns:
+            The ``AutoCalibrationPlan``, or ``None`` when nothing could be looked up.
+        """
+        controller = self.host.scan_controller
+        window = getattr(controller, "win", None)
+        if window is None or not hasattr(window, "set_calibrated_cube"):
+            return None
+        try:
+            from modules.radiometric.auto import memory_problem, plan_auto_calibration
+            store = self.reference_store(controller)
+            if store is None:
+                window.set_scan_calibration("off", "")
+                return None
+            plan = plan_auto_calibration(store, metadata or {}, wavelengths, cube.shape[0])
+            problem = memory_problem(cube.shape) if plan.ok else None
+        except Exception as exc:
+            logger.exception("Automatic radiometric calibration: references cannot be read")
+            window.set_scan_calibration("failed", f"Last scan: not calibrated - references cannot be read ({exc})")
+            return None
+        if not plan.ok:
+            if plan.wanted:
+                window.set_scan_calibration("not_applied", f"Last scan: not calibrated - {plan.summary()}")
+            else:
+                window.set_scan_calibration("off", "")      # no active reference: nothing to say
+            return plan
+        if problem:
+            window.set_scan_calibration("failed", f"Last scan: not calibrated with {plan.reference.id} - "
+                                                  f"{problem}; use Calibration")
+            return plan
+        window.set_scan_calibration("working", f"Last scan: calibrating with {plan.reference.id} …")
+        token = window.calibration_token() if hasattr(window, "calibration_token") else None
+        self._start_auto_job(_AutoCalibrationJob(window, cube, wavelengths, plan, token))
+        return plan
+
+    def _start_auto_job(self, job):
+        if self._relay is None:
+            self._relay = _make_relay(self._on_auto_done)
+        self._job_counter += 1
+        self._auto_jobs[self._job_counter] = job       # the window stays on the GUI side
+        # A daemon thread: closing the application does not wait for (or crash on) a running job.
+        # It holds only arrays and the reference, never a Qt object: one released there would be
+        # destroyed off the GUI thread.
+        thread = threading.Thread(target=_auto_calibration_thread, name="auto-radiometric", daemon=True,
+                                  args=(self._relay, self._job_counter, job.cube, job.plan.reference,
+                                        job.wavelengths))
+        self._auto_threads = [t for t in self._auto_threads if t.is_alive()] + [thread]
+        thread.start()
+
+    def wait_auto_calibration(self, timeout=None) -> bool:
+        """Wait for the running calibrations' threads (their results still arrive through the event
+        loop). Returns True when none is running any more."""
+        for thread in list(self._auto_threads):
+            thread.join(timeout)
+        self._auto_threads = [t for t in self._auto_threads if t.is_alive()]
+        return not self._auto_threads
+
+    def _on_auto_done(self, job_id, result):
+        """GUI thread: hand the reflectance (or the error) to the scan window, if the scan is still its."""
+        job = self._auto_jobs.pop(job_id, None)
+        if job is None:
+            return
+        ref_id = job.plan.reference.id
+        try:
+            if isinstance(result, BaseException):
+                job.window.calibration_failed(
+                    job.cube, f"Last scan: calibration with {ref_id} failed ({result or type(result).__name__}); "
+                              "the cube stays in counts", token=job.token)
+                return
+            if job.window.set_calibrated_cube(job.cube, result, job.plan.header_fields(),
+                                              f"Last scan: {job.plan.summary()}", token=job.token):
+                self.host.show_status(f"Scan calibrated automatically with radiometric reference {ref_id}")
+        except RuntimeError:                        # scan window already deleted
+            pass
 
     def open(self, *_):
         """Open the calibration window, filling the work area."""
@@ -319,8 +555,13 @@ class ReferenceROIIntegration(Integration):
             self.host.ensure_scan_window()
             self._request_id += 1
             self._pending = (self._request_id, widget)
-            widget.status.setText('Scanning with the travel/speed configured in Scan Window; waiting for stage completion…')
-            self.host.scan_controller.start_reference_preview(self._request_id)
+            controller = self.host.scan_controller
+            stage_type = getattr(getattr(controller, 'win', None), 'stage_type', lambda: '')()
+            widget.status.setText(
+                'Scanning for the time configured in Scan Window (no stage); waiting for the scan to end…'
+                if stage_type == 'free' else
+                'Scanning with the travel/speed configured in Scan Window; waiting for stage completion…')
+            controller.start_reference_preview(self._request_id)
         except Exception as exc:
             if self._pending and self._pending[1] is widget:
                 self._pending = None
@@ -329,10 +570,14 @@ class ReferenceROIIntegration(Integration):
     def _cancel_preview(self, widget):
         if self._pending and self._pending[1] is widget:
             self._pending = None
-            if self.host.scan_controller is not None:
-                self.host.scan_controller.stop_scan_manually()
+            controller = self.host.scan_controller
+            free = False
+            if controller is not None:
+                free = getattr(getattr(controller, 'win', None), 'stage_type', lambda: '')() == 'free'
+                controller.stop_scan_manually()
             try:
-                widget.fail_preview('Preview cancelled. Wait for the stage to stop before scanning again.')
+                widget.fail_preview('Preview cancelled.' if free else
+                                    'Preview cancelled. Wait for the stage to stop before scanning again.')
             except RuntimeError:
                 pass
 

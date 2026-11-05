@@ -58,7 +58,10 @@ def test_bsq_processing_bytes(tmp_path,resample,calibrated):
     name='create_datacube_resampled_logic' if resample else 'create_datacube_logic'
     getattr(old,name)(params,Progress());newparams=dict(params,save_path=str(tmp_path/'new.bin'));getattr(core,name)(newparams)
     assert Path(params['save_path']).read_bytes()==Path(newparams['save_path']).read_bytes()
-    assert Path(params['save_path']+'.hdr').read_bytes()==Path(newparams['save_path']+'.hdr').read_bytes()
+    # Same header text; core writes LF on every platform (newline='\n'), the baseline the
+    # platform's own line ending (CRLF on Windows).
+    old_hdr=Path(params['save_path']+'.hdr').read_bytes().replace(b'\r\n',b'\n')
+    assert old_hdr==Path(newparams['save_path']+'.hdr').read_bytes()
 
 @pytest.mark.parametrize('calibrated',[False,True])
 def test_temporary_cube_bytes(tmp_path,calibrated):
@@ -101,14 +104,20 @@ def test_envi_writer_matches_original_bytes(tmp_path,monkeypatch):
     old=export_baseline()
     class FixedDate:
         @staticmethod
-        def now():return datetime.datetime(2020,1,2,3,4,5)
+        def now(tz=None):              # the writer asks for UTC: datetime.now(timezone.utc)
+            fixed=datetime.datetime(2020,1,2,3,4,5)
+            return fixed if tz is None else fixed.replace(tzinfo=tz)
     monkeypatch.setattr(old,'datetime',FixedDate);monkeypatch.setattr(writers,'datetime',FixedDate)
     a=np.arange(3*4*5,dtype=np.uint16).reshape(3,4,5);wl=np.array([400,402,404],np.float32)
     kwargs=dict(config={'m':.29,'c':400},hypercube=a,linear_spectrum=wl)
     old.HypercubeWorker(save_path=str(tmp_path/'old.bin'),**kwargs).run()
     writers.HypercubeWriter(save_path=str(tmp_path/'new.bin'),**kwargs).run()
     assert (tmp_path/'old.bin').read_bytes()==(tmp_path/'new.bin').read_bytes()
-    assert (tmp_path/'old.bin.hdr').read_bytes()==(tmp_path/'new.bin.hdr').read_bytes()
+    # Deliberate header fixes since the baseline (commit 3de1ef7, cube_io README): LF line
+    # endings on every platform (the baseline wrote os.linesep through a text-mode file:
+    # '\r\r\n' on Windows) and 'acquisition time = ...' spaced like every other field.
+    old_hdr=(tmp_path/'old.bin.hdr').read_bytes().replace(b'\r',b'').replace(b'acquisition time=',b'acquisition time = ')
+    assert old_hdr==(tmp_path/'new.bin.hdr').read_bytes()
 
 def test_geotiff_matches_original_data_and_metadata(tmp_path):
     rasterio=pytest.importorskip('rasterio')
@@ -118,7 +127,12 @@ def test_geotiff_matches_original_data_and_metadata(tmp_path):
     errors=[];worker=old.GeoTIFFWorker(save_path=str(tmp_path/'old.tif'),**kwargs);worker.error.connect(errors.append);worker.run();assert not errors
     GeoTIFFWriter(save_path=str(tmp_path/'new.tif'),**kwargs).run()
     with rasterio.open(tmp_path/'old.tif') as x,rasterio.open(tmp_path/'new.tif') as y:
-        np.testing.assert_array_equal(x.read(),y.read());assert x.profile==y.profile;assert x.descriptions==y.descriptions
+        np.testing.assert_array_equal(x.read(),y.read());assert x.descriptions==y.descriptions
+        # The baseline stamped a made-up UTM 47N location (0.1 m pixels); the writer now writes
+        # no georeference, as a pushbroom scan has none (commit 3de1ef7, cube_io README).
+        assert y.crs is None and y.transform.is_identity
+        unplaced=lambda p:{k:v for k,v in p.items() if k not in ('crs','transform')}
+        assert unplaced(x.profile)==unplaced(y.profile)
         for b in range(1,4):assert x.tags(b)==y.tags(b)
 
 def test_qt_adapters_deliver_progress_and_finished(tmp_path):

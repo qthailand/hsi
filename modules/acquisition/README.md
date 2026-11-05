@@ -139,7 +139,12 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `take_recorded_raw`,
   `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
   `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
-* `ScanRecorder`: `set_recording`, `set_min_stamp`, `offer`, `count`, `live_frames`, `take_frames`, `take_raw`.
+* `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer`, `count`, `live_frames`,
+  `take_frames`, `take_raw`, `factors`, `factor_error`. Armed with `factors` (`(slit, bins)` float32,
+  e.g. radiometric factors; `engine.set_recording(True, start_ns, factors=F)`), every recorded frame is
+  stored as `float32(frame) * factors` (a new array, outside the lock); the offered frame (displayed,
+  sharpness) is not changed. The factors are latched for the whole recording; a frame of another
+  shape is recorded in counts and noted in `factor_error`.
 * `ScanSession`: `begin`, `finish`, `fail`, `set_error`, `start_reference_preview`,
   `cancel_reference_preview`, `add_reference_column`.
 * `CorrectionStatusDisplay(parent=None)`: `.dark`, `.smile`, `update_status(status)`;

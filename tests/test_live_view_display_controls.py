@@ -4,9 +4,16 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+_APP = None
+
+
 def _app():
+    """The QApplication, kept for the whole module: one nobody holds is collected at once and
+    the next widget aborts Qt ("Must construct a QApplication before a QWidget")."""
+    global _APP
     from PyQt5.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
+    _APP = QApplication.instance() or QApplication([])
+    return _APP
 
 
 def test_bit_depth_is_shown_with_its_source_and_cannot_be_edited():

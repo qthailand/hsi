@@ -271,7 +271,7 @@ class AcquisitionEngine:
         """Also record the raw sensor frame of every recorded frame."""
         self._keep_spectrogram = bool(enabled)
 
-    def set_recording(self, active: bool, start_ns=None):
+    def set_recording(self, active: bool, start_ns=None, factors=None):
         """Arm/disarm per-frame recording. Arming starts a fresh buffer.
 
         Arming also asks the worker to latch the camera clock, so the scan can later be
@@ -282,13 +282,20 @@ class AcquisitionEngine:
             start_ns: Host ``time.perf_counter_ns()`` before which frames are not recorded
                 at all (the start of the constant-speed window), once the clock is latched;
                 ``None`` records every frame until :meth:`take_recorded_frames` trims.
+            factors: When arming: ``(slit, wavelength_bin)`` float32 factors multiplied into
+                every recorded binned frame (frame-by-frame radiometric calibration), latched
+                for the whole recording; ``None`` records counts. Displayed frames (live image,
+                spectrum, histogram, sharpness) stay in counts either way.
         """
         if active:
             with self._lock:
                 if not self.recorder.enabled:
                     self._armed_ns = time.perf_counter_ns()
                 self._record_start_ns = start_ns
-        self.recorder.set_recording(active)
+        if factors is None:
+            self.recorder.set_recording(active)      # also what a wrapped recorder (tools) expects
+        else:
+            self.recorder.set_recording(active, factors=factors)
         if active:
             # After arming, which clears the recorder's bound, so the latch can set it.
             with self._lock:

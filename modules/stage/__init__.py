@@ -1,7 +1,8 @@
 """Motorised stage for pushbroom scanning (XIMC 8SMC1 rotation and linear stages).
 
 * :class:`StageSequence` - Qt-free scan sequence (open, home, scan, return home, close)
-  with callbacks; usable from scripts and other GUI toolkits.
+  with callbacks; usable from scripts and other GUI toolkits. Stage type ``"free"`` runs
+  the same callbacks as a timed scan without any stage (``duration_s`` seconds).
 * :class:`StageThread` - the same sequence on a ``QThread`` with signals.
 * :class:`Stage8SMC1` / :class:`Stage8SMC1Linear` - drivers for the vendor library
   ``libximc`` (imported only when used).
@@ -9,6 +10,7 @@
 Data conventions:
     Rotation: degrees and degrees per second. Linear: millimetres and
     millimetres/second (``speed_um_s`` in the sequence is micrometres/second).
+    Free: seconds (``duration_s``).
 
 Threading:
     The sequence runs on one worker thread; ``request_stop`` is callable from any
@@ -29,10 +31,10 @@ Example:
     >>> seq.degree = 20; seq.run(); seq.completed, events
     (True, ['before', ('degree', 20), 'after'])
 """
-from .config import StageConfig
+from .config import STAGE_TYPES, StageConfig
 from .sequence import StageSequence
 
-__all__ = ["StageConfig", "StageSequence", "StageThread", "Stage8SMC1", "Stage8SMC1Linear"]
+__all__ = ["STAGE_TYPES", "StageConfig", "StageSequence", "StageThread", "Stage8SMC1", "Stage8SMC1Linear"]
 __requires__ = ()
 __widgets__ = ()
 

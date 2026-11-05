@@ -89,7 +89,8 @@ def build_raw_metadata(*, backend, config, scan: Optional[dict] = None,
         config: Object with ``camera_backend``, ``camera_index``, ``raw_inverted``, ``m`` (nm/pixel
             at bin 1), ``c`` (nm) and ``resolution`` (nm per output bin).
         scan: Stage settings of this scan, e.g. ``{'stage_type': 'rotation', 'degree': 10,
-            'degree_per_second': 1}``; keys with ``None`` values are left out.
+            'degree_per_second': 1}``, or ``{'stage_type': 'free', 'duration_s': 10}`` for a
+            free scan (no stage); keys with ``None`` values are left out.
         started_at: Scan start time (defaults to now, local time with UTC offset).
         binning: The engine's ``binning_info()`` (bin width actually used and its source);
             without it ``resolution_nm`` is ``config.resolution``.

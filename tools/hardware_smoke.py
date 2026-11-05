@@ -103,10 +103,10 @@ def main(argv=None) -> int:
         recorder = controller.preview_thread.recorder
         original_arm, original_take = recorder.set_recording, recorder.take_frames
 
-        def arm(active):
+        def arm(active, *args, **kwargs):              # also factors= (frame-by-frame radiometric)
             if active and "start" not in marks:
                 marks["start"] = fetched["n"]          # camera frames fetched when recording is armed
-            original_arm(active)
+            original_arm(active, *args, **kwargs)
 
         def take(*args, **kwargs):
             marks.setdefault("end", fetched["n"])      # ... and when it is disarmed (cube is built after)
@@ -115,7 +115,8 @@ def main(argv=None) -> int:
         recorder.set_recording, recorder.take_frames = arm, take
 
         def watch():
-            return scan._pending_cube is not None
+            # a scan calibrated frame by frame (an active reference matches) holds its reflectance
+            return scan._pending_cube is not None or scan.calibrated_cube() is not None
 
         controller.start_scan()
         check("scan started", controller.state == controller.SCANNING)
@@ -124,7 +125,7 @@ def main(argv=None) -> int:
         stage_done = pump(lambda: controller.stage is None, 60)
         check("stage returned home", stage_done)
         if ok:
-            cube = scan._pending_cube
+            cube = scan.counts_cube()                  # counts, rebuilt exactly from a reflectance
             slit, scans, bins = cube.shape
             raw = scan._pending_spectrogram
             check("cube axes (slit, scan, wavelength)", slit == info.height and bins > 1, f"{cube.shape}")

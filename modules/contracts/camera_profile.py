@@ -9,6 +9,7 @@ kept together, one folder per camera::
         dark/              dark_b<bin>_e<exposure>_g<gain>_t<temperature>.npz  (modules.dark)
         smile/              smile_model_bin<N>.npz, history/                    (modules.smile)
         wavelength/         wavelength_bin<N>.json, resolution_bin<N>.json, history/
+        radiometric/        ref_<date>_<time>/ (factors, ROI), active.json      (modules.radiometric)
 
 ``<model>`` and ``<serial>`` are what the camera SDK reports (characters outside
 ``A-Z a-z 0-9 . _ -`` become ``_``); a camera that reports neither gets ``unknown``. Files
@@ -192,6 +193,11 @@ class CameraProfile:
     def wavelength_folder(self) -> Path:
         """Wavelength profiles and FWHM measurements per bin."""
         return self.root / "wavelength"
+
+    @property
+    def radiometric_folder(self) -> Path:
+        """Radiometric references for automatic calibration (``modules.radiometric.RadiometricReferenceStore``)."""
+        return self.root / "radiometric"
 
     @property
     def info_path(self) -> Path:

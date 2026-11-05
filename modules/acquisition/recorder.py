@@ -9,6 +9,10 @@ Data conventions:
     Binned frames are ``(slit, wavelength_bin)`` ``uint16``; raw frames are
     ``(slit, spectral_pixel)`` ``uint16`` straight from the sensor. Index *i* of
     ``take_raw()`` is the sensor frame that produced index *i* of ``take_frames()``.
+    A recording armed with ``factors`` (``(slit, wavelength_bin)`` float32, e.g. radiometric
+    calibration factors) stores every binned frame as ``float32(frame) * factors`` instead
+    (a new float32 array; the frame offered is not changed): one recording is either all
+    counts or all multiplied, since the factors are latched when recording is armed.
 
 Threading:
     All methods take one internal lock and may be called from any thread.
@@ -45,6 +49,9 @@ class ScanRecorder:
         self._raw_stamps: list = []     # ... and of each raw frame
         self._min_stamp = None          # frames stamped earlier are not recorded (set_min_stamp)
         self._live_dropped = 0          # ... and how many were refused so far
+        self._factors = None            # multiplied into every recorded frame (set_recording)
+        self._generation = 0            # arming count: a frame multiplied for one recording only
+        self.factor_error = None        # why a frame of this recording could not be multiplied
         self.last_trim = (0, 0)         # (frames dropped before, after) by the last take_frames
         self.last_live_dropped = 0      # frames refused by offer before the last take_frames
         # (first stamp, last stamp, frames without a stamp, frames) of the last take_frames
@@ -55,9 +62,19 @@ class ScanRecorder:
         """True while frames are being recorded."""
         return self._enabled
 
-    def set_recording(self, active: bool) -> None:
+    def set_recording(self, active: bool, factors=None) -> None:
         """Arm or disarm recording; arming (False -> True) starts empty buffers and clears
-        the :meth:`set_min_stamp` bound."""
+        the :meth:`set_min_stamp` bound.
+
+        Args:
+            active: Arm (True) or disarm.
+            factors: When arming: ``(slit, wavelength_bin)`` factors every recorded frame is
+                multiplied by (float32 result), or ``None`` to record counts. Latched for the
+                whole recording; ignored when disarming or when already armed.
+        """
+        if factors is not None:
+            factors = np.array(factors, dtype=np.float32, order='C')   # a private, read-only copy
+            factors.setflags(write=False)
         with self._lock:
             if active and not self._enabled:
                 self._frames = []
@@ -66,7 +83,16 @@ class ScanRecorder:
                 self._raw_stamps = []
                 self._min_stamp = None
                 self._live_dropped = 0
+                self._factors = factors
+                self._generation += 1
+                self.factor_error = None
             self._enabled = bool(active)
+
+    @property
+    def factors(self):
+        """The factors of the current (or last) recording, or ``None`` when it records counts."""
+        with self._lock:
+            return self._factors
 
     def set_min_stamp(self, stamp) -> None:
         """Stop recording frames stamped before ``stamp`` (camera ns; ``None`` = no bound).
@@ -136,7 +162,8 @@ class ScanRecorder:
 
         Args:
             binned: The spectrally binned frame; stored by reference, so it must be a
-                fresh array per call (``LambdaBinner.transform`` allocates one).
+                fresh array per call (``LambdaBinner.transform`` allocates one). With
+                factors, a new float32 product is stored instead and ``binned`` is not changed.
             raw_frame: The sensor frame it came from; copied when ``keep_raw``.
             keep_raw: Also keep the raw frame (the "Keep Spectrogram" option).
             stamp: Camera time of the frame in ns (``None`` if unknown), used by
@@ -145,6 +172,10 @@ class ScanRecorder:
         Returns:
             True if the frame was recorded (not when disarmed, or stamped before the
             :meth:`set_min_stamp` bound).
+
+        A frame whose shape does not fit the factors is recorded in counts and noted in
+        :attr:`factor_error` (the recording is then mixed: the caller must not take it as
+        multiplied).
         """
         with self._lock:
             if not self._enabled:
@@ -152,7 +183,21 @@ class ScanRecorder:
             if self._min_stamp is not None and stamp is not None and stamp < self._min_stamp:
                 self._live_dropped += 1
                 return False
-            self._frames.append(binned)
+            factors, generation = self._factors, self._generation
+        frame = binned
+        if factors is not None:
+            # outside the lock: the GUI's count() / live_frames() never wait for the multiply
+            if binned.shape == factors.shape:
+                frame = np.multiply(binned, factors, dtype=np.float32)
+            else:
+                error = f"frame {binned.shape} does not fit the factors {factors.shape}"
+                with self._lock:
+                    if self.factor_error is None and self._generation == generation:
+                        self.factor_error = error
+        with self._lock:
+            if not self._enabled or self._generation != generation:
+                return False                    # disarmed (or re-armed) meanwhile
+            self._frames.append(frame)
             self._stamps.append(stamp)
             if keep_raw:
                 self._raw.append(raw_frame.copy())

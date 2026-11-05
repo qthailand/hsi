@@ -21,12 +21,14 @@ class StageThread(StageSequence, QThread):
         error(str): Any hardware/Python failure; see ``failed_phase``.
 
     The motion parameters (``degree``, ``degree_per_second``, ``distance_mm``,
-    ``speed_um_s``) and result flags (``failed``, ``completed``, ``cancelled``, ...)
-    are those of :class:`StageSequence`.
+    ``speed_um_s``, ``duration_s``) and result flags (``failed``, ``completed``,
+    ``cancelled``, ...) are those of :class:`StageSequence`. With stage type ``"free"``
+    (no stage) ``stageafter`` comes when the scan time is up and ``returned_home`` never
+    comes.
 
     Args:
         parent: Optional Qt parent.
-        stage_type: ``"rotation"`` or ``"linear"``.
+        stage_type: ``"rotation"``, ``"linear"`` or ``"free"`` (no stage, timed scan).
         stage_factory: Optional zero-argument factory of an unopened stage driver
             (used by tests and simulators).
     """

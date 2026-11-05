@@ -175,6 +175,62 @@ def test_f5_and_esc_start_and_stop_a_scan_and_recorded_matches_the_cube(main_win
     assert pump(app, lambda: controller.stage is None)          # let the stage return home
 
 
+def test_a_free_scan_records_for_its_time_without_a_stage(main_window, monkeypatch):
+    """stage_type "free" (no stage): Start records for the time entered, no stage driver is
+    opened, the status never mentions a stage going home, and the cube header says free."""
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    monkeypatch.setattr(scan.config, 'stage_type', 'free')
+    scan.free_duration_spin.setValue(0.8)
+    opened = []
+    monkeypatch.setattr(FakeStage, '__init__', lambda self, *a, **k: opened.append(self))
+    statuses = []
+    show = scan.set_status
+    monkeypatch.setattr(scan, 'set_status', lambda text: (statuses.append(text), show(text)))
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    started = time.perf_counter()
+    controller.start_scan()
+    assert controller.state == controller.SCANNING
+    countdown = []                                            # the Free Scan box counts down
+    assert pump(app, lambda: (countdown.append(scan.free_countdown_label.text())
+                              or scan._pending_cube is not None))
+    shown = [float(text.split()[0]) for text in countdown if text.endswith(" s")]
+    assert shown and shown[0] == 0.8 and min(shown) < 0.5 and shown == sorted(shown, reverse=True)
+    assert scan.free_countdown_label.text() == "—"           # back to idle once the cube is built
+    assert time.perf_counter() - started >= 0.8               # recorded for the whole time
+    assert pump(app, lambda: controller.stage is None, timeout=5)
+    assert opened == []                                       # no stage driver at all
+    assert not any('home' in str(text) for text in statuses)
+    assert controller.state == controller.PREVIEW
+    assert controller._raw_metadata['stage_type'] == 'free' and controller._raw_metadata['duration_s'] == 0.8
+    header = controller.last_scan_header
+    assert header['stage_type'] == 'free' and header['duration_s'] == 0.8
+    assert 0.8 <= header['duration_s_recorded'] < 0.8 + 0.25    # the whole time was recorded
+    assert 'speed_um_s' not in header and 'degree_per_second' not in header
+    column = scan._pending_cube[0, :, 0].astype(np.int64)     # acquisition order, as a linear scan
+    assert scan._pending_cube.shape[1] > 1 and np.all(np.diff(column) >= 0)
+
+
+def test_a_free_scan_stopped_early_keeps_the_frames_so_far(main_window, monkeypatch):
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    monkeypatch.setattr(scan.config, 'stage_type', 'free')
+    scan.free_duration_spin.setValue(60.0)
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    controller.start_scan()
+    assert pump(app, lambda: controller.recording)            # the recording started
+    assert pump(app, lambda: scan._status['recorded'] > 0 or controller.preview_frame_index > 20, timeout=10)
+    started = time.perf_counter()
+    scan.stop_scan_shortcut.activated.emit()                  # Esc: the cube is built from the frames so far
+    assert controller.state == controller.PREVIEW and scan._pending_cube is not None
+    assert pump(app, lambda: controller.stage is None, timeout=5)
+    assert time.perf_counter() - started < 5                  # the 60 s wait ended with the stop
+    header = controller.last_scan_header
+    assert header['duration_s'] == 60.0 and 0 < header['duration_s_recorded'] < 10   # set vs recorded
+
+
 def test_linear_scan_keeps_acquisition_order_like_the_legacy_swir_app(main_window, monkeypatch):
     """Legacy SWIR_LASTES: linear scans are stacked in frame order, never reversed."""
     app, window = main_window
@@ -185,6 +241,82 @@ def test_linear_scan_keeps_acquisition_order_like_the_legacy_swir_app(main_windo
     controller.start_scan()
     assert pump(app, lambda: scan._pending_cube is not None)
     column = scan._pending_cube[0, :, 0].astype(np.int64)
+    assert np.all(np.diff(column) >= 0) and column[-1] > column[0]
+
+
+def test_a_ticked_scan_is_calibrated_frame_by_frame_and_its_counts_come_back(main_window, monkeypatch):
+    """Auto radiometric calibration with a matching reference (the choice is stubbed: the fake
+    camera has no serial number or dark reference): every recorded frame is multiplied while the
+    scan runs, the cube arrives as reflectance, and its counts are rebuilt exactly."""
+    import modules.radiometric.auto as auto
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    n_bins = controller.preview_thread.binner_n_bins
+    factors = (0.5 + 1e-3 * np.arange(H * n_bins, dtype=np.float32)).reshape(H, n_bins)
+    factors.setflags(write=False)
+    plan = types.SimpleNamespace(ok=True, wanted=True, reference=types.SimpleNamespace(id="ref_test"))
+    final = types.SimpleNamespace(ok=True, header_fields=lambda: {"reflectance_reference_cube": "ref_test"},
+                                  summary=lambda: "calibrated with ref_test")
+    asked = []
+    monkeypatch.setattr(auto, "plan_frame_calibration",
+                        lambda *a, **k: asked.append(a) or (plan, auto.FrameCalibration(plan, factors)))
+    monkeypatch.setattr(auto, "finish_frame_calibration", lambda frame, meta, **k: (final, []))
+    assert scan.auto_radiometric_box.isChecked()
+    controller.start_scan()
+    assert not scan.auto_radiometric_box.isEnabled()            # chosen at Start for the whole scan
+    assert scan.scan_calibration_label.text() == "This scan: calibrated frame by frame with ref_test"
+    _store, start_meta, wavelengths, lines = asked[0]
+    assert lines == H and len(wavelengths) == n_bins and "sensor_temperature_c_end" not in start_meta
+    assert pump(app, lambda: scan.calibrated_cube() is not None)
+    reflectance = scan.calibrated_cube()
+    assert reflectance.dtype == np.float32 and scan._pending_cube is None
+    assert scan.open_reflectance_btn.isVisibleTo(scan)
+    assert scan.calibration_header(reflectance)["reflectance_reference_mode"] == "automatic, frame by frame"
+    counts = scan.counts_cube()
+    assert counts.dtype == np.uint16 and counts.shape == reflectance.shape
+    np.testing.assert_array_equal(reflectance, counts.astype(np.float32) * factors[:, None, :])
+    column = counts[0, :, 0].astype(np.int64)                    # fake frames count up
+    assert np.all(np.diff(column) >= 0) and column[-1] > column[0]
+    assert scan.auto_radiometric_box.isEnabled()
+    # the next scan, unticked, records counts again
+    scan.auto_radiometric_box.setChecked(False)
+    assert pump(app, lambda: controller.stage is None)
+    controller.start_scan()
+    assert pump(app, lambda: scan._pending_cube is not None and scan._pending_cube is not counts)
+    assert scan._pending_cube.dtype == np.uint16 and scan.calibrated_cube() is None
+    assert len(asked) == 1
+
+
+def test_a_reflectance_cube_that_does_not_fit_keeps_the_scan_in_counts(main_window, monkeypatch):
+    """A frame-by-frame scan whose float32 cube cannot be allocated survives in counts (exact)."""
+    import controllers.scan_controller as scan_controller_module
+    import modules.radiometric.auto as auto
+    app, window = main_window
+    scan = window.scan_window
+    controller = scan.controller
+    assert pump(app, lambda: controller.preview_frame_index > 3)
+    n_bins = controller.preview_thread.binner_n_bins
+    factors = np.full((H, n_bins), 0.25, np.float32)
+    factors.setflags(write=False)
+    plan = types.SimpleNamespace(ok=True, wanted=True, reference=types.SimpleNamespace(id="ref_test"))
+    final = types.SimpleNamespace(ok=True, header_fields=lambda: {}, summary=lambda: "calibrated with ref_test")
+    monkeypatch.setattr(auto, "plan_frame_calibration", lambda *a, **k: (plan, auto.FrameCalibration(plan, factors)))
+    monkeypatch.setattr(auto, "finish_frame_calibration", lambda frame, meta, **k: (final, []))
+    build = scan_controller_module.create_pushbroom_cube_from_corrected
+
+    def no_room_for_float32(frames):
+        if frames and frames[0].dtype == np.float32:
+            raise MemoryError("Unable to allocate the float32 cube")
+        return build(frames)
+    monkeypatch.setattr(scan_controller_module, "create_pushbroom_cube_from_corrected", no_room_for_float32)
+    controller.start_scan()
+    assert pump(app, lambda: scan._pending_cube is not None)
+    cube = scan._pending_cube
+    assert cube.dtype == np.uint16 and scan.calibrated_cube() is None
+    assert "not enough memory for the reflectance cube" in scan.scan_calibration_label.text()
+    column = cube[0, :, 0].astype(np.int64)                     # the counts are intact
     assert np.all(np.diff(column) >= 0) and column[-1] > column[0]
 
 

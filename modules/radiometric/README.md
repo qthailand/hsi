@@ -15,10 +15,82 @@ or from a fluorescence reference
 `workers.py` is a small `QObject` adapter that runs a core function on a `QThread`.
 This processing is offline only; it is never part of live acquisition.
 
+For automatic calibration, `reference.py` (Qt-free) keeps *radiometric references* per camera:
+row-wise factors fitted on one Spectralon scan, stored with the camera setting they belong to
+(`ReferenceKey`). A later scan is calibrated with an active reference only when its key matches
+exactly (camera, bin, slit rows, exposure, gain, band centres, bin width, wavelength m/c, Smile,
+data full scale (bit depth), Smile model and its creation time, dark and hot-pixel correction,
+stage type), the reference target was scanned at most 4 h before the scan and the sensor
+temperature is within 2 °C; scan length and speed may differ. Every key field is also an ENVI
+header field, so a scan reopened from its file gives the same key.
+
+A reference is made from the scan just finished with *Save as Radiometric Reference* (Scan
+window): `RadiometricReferenceDialog` (`reference_dialog.py`, Qt) shows the cube, offers five ROI
+tools - **Rect**, **Ellipse**, **Freehand** (all with handles afterwards: edge handles stretch one
+side, e.g. left/right; the freehand polygon's vertices and bounding box are editable), **Detect**
+(the largest bright rectangle/ellipse, then editable) and **Spectral pick** (click: the connected
+region of similar spectra; Ctrl+click adds, Alt+click removes) - plus arrows / Ctrl+arrows / Ctrl+Z,
+the reflectance table, the QC list, and *Create profile*. `roi_tools.py` (Qt-free) holds the
+algorithms. Every ROI goes through one clean-up (`clean_mask`): saturated pixels (the scan
+controller's saturation ceiling, else 95 % of full scale) out, a 3 px inset (the image border
+is not an edge), a spectral gate (pixels unlike the ROI's own per-row spectrum: labels, tape,
+holder), a ±5 % row gate (shadow, dust, bevel) and row bands: a step between neighbouring slit
+rows - the row median brightness jumping by > 6 % (directly and across one row) or the row
+spectrum jumping beyond the row medians' own noise - marks a band. Another material is dropped
+(the one holding the spectral-pick seed, else the largest, stays); brightness bands only at the
+ROI's ends (holder frame, bevel rows), so a dust line across the slit keeps its rows and a gap
+between two picked targets is never cut. Vignetting, even a steep falloff, is continuous. The
+dialog fits the factors with `window_fit="linear"` and an automatic averaging window (the fewest
+rows giving ~500 ROI pixels per factor, usually 1-4, so slit dust and row patterns get their own
+factors): the core's original 20-row window *mean* is biased at the ROI's ends wherever the
+vignetting falls off (on a 552-row slit falling to 55 %: 5-9 % at the end rows; the line fit:
+0.06-0.35 %). Create refuses an incomplete key (e.g. dark subtraction off), a missing table or an
+empty / mostly saturated ROI, and asks when the self-check (factors applied to their own ROI)
+misses the table by > 0.5 % RMS overall or > 1 % in any slit row with 20+ pixels (band-averaged).
+The saturation ceiling and the bit depth used are the ones recorded with the scan. Factors are fitted and applied on
+the cube in memory (`compute_rowwise_factors_array`, `apply_rowwise_factors`), with exactly the
+values of the file-based calibration.
+
+*Auto radiometric calibration* (Scan window, ticked by default, locked during a scan) calibrates
+the scan **frame by frame**. When Start is pressed, `plan_frame_calibration` (`auto.py`, Qt-free)
+builds the scan's key from its start metadata (settings, corrections, start sensor temperature; the
+same fields a reference made of it would use) and searches the camera's active references (GUI
+thread, a few small files). With a match, its factors are latched with the recording
+(`ScanRecorder.set_recording(factors=...)`): the acquisition thread stores every recorded,
+lambda-binned frame as `float32(frame) * F` (the level at which the factors were fitted; a key with
+other bands, bin width or m/c does not match), the values `apply_rowwise_factors` gives, so the cube
+equals a manual calibration with the same factors. Only the recorded copy is multiplied: the live
+image, spectrum, histogram and sharpness stay in counts (exposure is still set on counts), while the
+live cube preview, which reads the recording, shows reflectance. Cost: one multiply per frame, about
+0.17 ms at 552 x 237 including the memory of the kept frame (0.35-1 ms for 1-2 k slit rows), against
+a frame interval of 8-14 ms at 70-123 fps, so the frame rate does not drop while the acquisition
+thread has that headroom. When the scan ends, `finish_frame_calibration` checks again with the final
+metadata (mean of the start and end temperature); if the reference may not stay applied, or a frame
+could not be multiplied, the frames are turned back into counts (`counts_from_reflectance`,
+exact: the factors are finite and positive) and the scan says why.
+
+The scan then holds only its reflectance (*Open Reflectance Viewer*; its export header drops the
+raw-count fields and records the reference: `reflectance reference mode = automatic, frame by
+frame`, its scan time, age, temperature difference and ROI tool). Its counts are rebuilt exactly the
+first time they are needed (Open Cube Viewer, Calibration, Save as Radiometric Reference: a reference
+is always fitted on counts). Untick before scanning a new reference target to record counts.
+
+The after-scan path stays for a scan recorded in counts: ticking the box after a scan calibrates
+that scan (`plan_auto_calibration` + `apply_reference` on a background thread, the counts kept), and
+so does a reference whose factors have NaN bands (outside the reflectance table; those cannot be
+multiplied into the only copy). Unticking after a scan drops its reflectance (counts rebuilt first).
+When no reference fits, the scan window says why (e.g. `exposure: scan 12 ms, reference 10 ms`,
+`reference is 5.0 h old`) at Start and after the scan, and nothing is calibrated. A reference just
+created from the scan, and activated, calibrates that scan too (a direct check: its reflectance is
+the table's).
+
 ## Requirements
 
-* numpy, scipy (`CubicSpline`, `savgol_filter`), pandas (+ `openpyxl`/`xlrd` to read the
-  reflectance Excel sheet).
+* numpy, scipy (`CubicSpline`, `savgol_filter`; `scipy.ndimage` for the ROI tools), pandas
+  (+ `openpyxl`/`xlrd` to read the reflectance Excel sheet).
+* `roi_tools` also needs OpenCV (`cv2`: contour and shape fitting, path simplification) and
+  `matplotlib.path` (polygon rasterisation; no Qt). It is imported only by the dialog and by
+  callers that import `modules.radiometric.roi_tools`.
 * `modules.cube_io` (ENVI header parsing and band reading): `__requires__ = ('cube_io',)`.
 * PyQt5, matplotlib and `spectral` only for the GUI classes; they are loaded lazily, so
   `import modules.radiometric` does not import PyQt5.
@@ -112,6 +184,22 @@ sets the application-wide Fusion style and a dark palette (`QApplication.setPale
   (calibrated); pixel `(y, x)` of band `b` is `[y + b * lines, x]`. The GUI writes them
   to the system temp directory.
 * **ROI mask**: boolean `(lines, samples)` of the reference scan.
+* **Radiometric reference store** (`RadiometricReferenceStore(folder)`; the application uses the
+  camera profile's `radiometric_folder`, `camera_profiles/<backend>/<model>_<serial>/radiometric/`):
+  one folder per reference, `ref_<YYYYMMDD>_<HHMMSS>[_<n>]/`, written to a hidden staging folder
+  and renamed once complete, never modified afterwards:
+  `reference.json` (`format_version` 1, `id` (= folder name; a copied folder is refused),
+  `created_at` (save time) and `acquired_at` (when the target was scanned; the age counts from
+  it), ISO times with offset, `key`
+  = `ReferenceKey.to_dict()`, `reflectance_profile` file name, `avg_window_size`,
+  `roi` {`span`, `pixels`, `rows`, `samples`}, `sensor_temperature_c`, free `info`),
+  `factors.npy` + `factors.wavelength.npy` (`save_factor_profile`), `roi_mask.npy`,
+  `roi_mean_spectrum.npy` (optional); the files are fsynced before the folder is renamed.
+  `active.json` = `{"format_version": 1, "active": [ids]}`, replaced atomically; at most one
+  active reference per key (activating replaces only readable references of the same key; a
+  corrupt `active.json` is reported, never overwritten). Malformed ids in `active.json` are
+  ignored (no path traversal); a reference with a malformed `reference.json` or unreadable
+  factors is skipped and reported by `find` without affecting the others.
 
 ## API summary
 
@@ -134,6 +222,52 @@ sets the application-wide Fusion style and a dark palette (`QApplication.setPale
   factors of `n_bands` bands (band centres `factor_wavelengths`, or `None` = unknown) fit the cube.
 * `save_factor_profile(path, factors, wavelengths=None)` -> profile path (with the sidecar);
   `load_factor_profile(path)` -> `(factors, wavelengths or None)`.
+* `compute_rowwise_factors_array(cube, wavelengths, ref_excel, avg_window_size, mask, progress_callback=None,
+  source_name='in-memory cube', window_fit='mean')`: the row-wise fit on a `(lines, samples, bands)` array
+  or memmap, bit-identical to the file version. Both return `roi_mean_spectrum` (mean ROI counts per band)
+  and `window_fit` too. `window_fit` (also on `compute_rowwise_factors`): `'mean'` = the window's mean
+  counts (the original behaviour, still the default); `'linear'` = a pixel-weighted line through the
+  window's row means evaluated at the row, unbiased on a vignetting falloff.
+* `apply_rowwise_factors(cube, factors, factor_wavelengths=None, wavelengths=None, rows_per_chunk=64,
+  progress_callback=None)` -> new float32 cube
+  `cube * factors[:, None, :]` (row chunks, no float64 copy); refuses other slit rows / bands.
+* `ReferenceKey.from_scan(metadata, wavelengths, lines)` (metadata = raw scan metadata merged with the
+  export-header metadata, or `metadata_from_header` of an ENVI file); `.mismatch(scan_key)` -> ASCII
+  reasons such as `exposure: scan 12 ms, reference 10 ms`; `.missing()` -> why a key cannot carry a
+  reference (exposure, gain, bin, rows or bands unknown, dark subtraction off).
+* `RadiometricReferenceStore(folder)`: `save(factors, key, *, reflectance_profile, avg_window_size, mask,
+  roi_mean_spectrum=None, sensor_temperature_c=None, info=None, acquired_at=None, created_at=None,
+  activate=False)`,
+  `load(id)`, `references()`, `active()`, `active_ids()`, `activate(id)` -> ids replaced,
+  `deactivate(id)`, `find(scan_key, *, scan_temperature_c=None, now=None, max_age_h=4.0,
+  temperature_tolerance_c=2.0)` -> `ReferenceMatch(reference or None, rejected={id: reasons})`
+  with `.ok` and `.reason()` (names the closest rejected reference).
+* `RadiometricReference`: `factors()`, `roi_mask()`, `roi_mean_spectrum()`, `age_hours(now)`,
+  `header_fields()` (the `reflectance_reference*` export-header keys).
+* `reference_problems(reference, scan_key, *, scan_temperature_c, now, max_age_h, temperature_tolerance_c)`
+  and `scan_temperature_c(metadata)` (mean of the scan's start/end sensor temperature, `None` if unknown).
+  `RadiometricReferenceStore.status(now=None)` -> `(state "on"|"expired"|"off", badge text)`.
+* `auto` (also exported): `plan_frame_calibration(store, start_metadata, wavelengths, lines)` -> `(plan,
+  FrameCalibration or None)` (`.factors` read-only float32, `.reference`); `finish_frame_calibration(frame,
+  end_metadata)` -> `(plan, problems)`; `counts_from_reflectance(cube_or_frame, factors)` -> uint16 counts;
+  `plan_auto_calibration(store, metadata, wavelengths, lines, *, max_age_h=4.0,
+  temperature_tolerance_c=2.0)` -> `AutoCalibrationPlan` (`.ok`, `.reference`, `.wanted` = the camera has an
+  active reference at all, `.summary()`, `.header_fields()`, `.age_hours()`, `.delta_t_c()`);
+  `apply_reference(cube, reference, wavelengths=None)` -> float32 reflectance; `reflectance_export_metadata(
+  metadata, fields)` (scan metadata without the raw-count fields, plus the reference fields);
+  `modules.radiometric.auto.memory_problem(shape)` (refuses a reflectance cube larger than 80 % of free RAM).
+* `reflectance_at(ref_excel, wavelengths)` -> `(reflectance float32 per band, NaN outside the table; table range)`.
+* `roi_tools` (import `modules.radiometric.roi_tools`): `rect_mask(shape, x0, y0, x1, y1)`,
+  `ellipse_mask(shape, cx, cy, rx, ry, angle_deg=0)`, `polygon_mask(shape, [(x, y), ...])` (pixel (r, c)
+  has its centre at x=c, y=r; inside = centre inside), `simplify_polyline`, `saturation_map(cube, ceiling=None,
+  full_scale=None)` -> `(mask, source)`, `brightness_map`, `rgb_preview`, `detect_shapes(brightness, saturated)`
+  -> `[ShapeCandidate]` largest first, `largest_shape`, `SpectralIndex(cube, wavelengths, saturated).pick(row, col,
+  threshold_deg=None)` -> `SpectralPick`, `robust_threshold`, `spectral_outliers`, `clean_mask(mask, brightness,
+  saturated, *, inset_px=3, row_tolerance=0.05, index=None | cube+wavelengths)` -> `CleanupResult`,
+  `assess_roi(cleanup, cube, wavelengths, brightness, ...)` -> `RoiQuality(items, numbers)`.
+* `RadiometricReferenceDialog(cube, wavelengths, metadata=None, store=None, saturation_ceiling=None, parent=None)`:
+  signal `reference_saved(RadiometricReference)`, attribute `reference` after `exec_()`; programmatic
+  `set_rect`, `set_polygon`, `spectral_pick`, `nudge`, `undo`, `set_profile`, `create_profile`, `problems()`.
 * `CalibrationWindow`: `load_from_memory`, `load_from_scan`, signal
   `calibration_done(str, dict)`. `RoiDialog(parent, ref_filepath, ref_meta, wl, show_spectrum)`:
   `get_mask()`. `Worker(fn, *args, **kwargs)`: signals `finished(object)`, `error(str)`,
@@ -151,6 +285,16 @@ on its own `QThread` through `Worker` and updates a progress bar whose maximum i
 
 Run `python -m pytest -q tests/test_module_contract.py -k radiometric` and the radiometric /
 calibration tests in `tests/` (e.g. `python -m pytest -q tests -k "radiometric or calibration or bsq"`).
+`tests/test_radiometric_reference.py` covers the in-memory fit/apply (equal to the file pipeline),
+`ReferenceKey` matching and the reference store; `tests/test_radiometric_roi_tools.py` the ROI modes,
+clean-up and QC on a synthetic Spectralon scene (vignetting, bevel, shadow, screw, label, hot spot,
+white paper, Smile-like drift); `tests/test_radiometric_reference_dialog.py` the dialog, the Scan
+window button / badge and the integration (offscreen; message boxes are replaced).
+`tests/test_radiometric_auto.py` the automatic calibration: equal to the manual path (T1), every setting
+difference refused with its reason (T6), age / temperature limits, the export header, the Scan
+window's per-scan box, stale results and failures; frame by frame: the recorder's multiply (equal to the
+cube path), latching, the start / end checks, exact counts; `tests/test_app_smoke.py` a frame-by-frame scan
+through the real engine thread.
 
 ## Known structure limits
 

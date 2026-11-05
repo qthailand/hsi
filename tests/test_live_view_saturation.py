@@ -6,9 +6,16 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
+_APP = None
+
+
 def _app():
+    """The QApplication, kept for the whole module: one nobody holds is collected at once and
+    the next widget aborts Qt ("Must construct a QApplication before a QWidget")."""
+    global _APP
     from PyQt5.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
+    _APP = QApplication.instance() or QApplication([])
+    return _APP
 
 
 def test_live_spectrum_marks_points_that_reach_their_ceiling():

@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import time
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QCheckBox,
     QFormLayout,
     QSpinBox,
     QDoubleSpinBox,
@@ -36,6 +37,7 @@ from modules.camera.widget import CameraControls
 from modules.live_view.spectrum import LiveLineSpectrumWidget
 from modules.cube_preview.widget import RealtimeCubePreviewWidget
 from modules.dark.widget import DarkFramePanel
+from modules.stage.config import FREE_SCAN_MAX_S, FREE_SCAN_MIN_S
 from modules.stage.speed import LINEAR_MAX_UM_S, ROTATION_MAX_DPS, ROTATION_SPEED_RESOLUTION_DPS
 from modules.acquisition.widget import CorrectionStatusDisplay
 from modules.live_view.display_controls import DisplayControls
@@ -51,10 +53,33 @@ CUBE_PREVIEW_TITLE = "Realtime Cube Preview"
 
 
 def _format_duration(seconds: float) -> str:
-    """``12.3 s`` below a minute, else ``m:ss``."""
+    """``12.3 s`` below a minute, ``m:ss`` below an hour, else ``h:mm:ss``."""
     if seconds < 60:
         return f"{seconds:.1f} s"
-    return f"{int(seconds // 60)}:{int(seconds % 60):02d}"
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+#: The free-scan countdown when no free scan is running.
+COUNTDOWN_IDLE = "—"
+#: How often the free-scan countdown is checked while it runs (ms): half its 0.1 s step. A
+#: 100 ms timer starts in step with the tenths, so a tick a few ms late shows one tenth twice
+#: and skips the next; at 50 ms every tenth shows. The label and title are redrawn only when
+#: their text changes.
+COUNTDOWN_INTERVAL_MS = 50
+
+
+def _format_countdown(seconds: float) -> str:
+    """Time left, rounded UP so it reads ``0.0 s`` only when the time is over: ``7.3 s`` below
+    a minute, ``m:ss`` below an hour, else ``h:mm:ss``."""
+    seconds = max(0.0, float(seconds))
+    tenths = math.ceil(seconds * 10 - 1e-9)
+    if tenths < 600:
+        return f"{tenths / 10:.1f} s"
+    hours, rest = divmod(math.ceil(seconds - 1e-9), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
 class _NoWheelUnlessFocusedSpinBox(QDoubleSpinBox):
@@ -80,8 +105,13 @@ class ScanWindow(QWidget):
     snapshot_failed = pyqtSignal(int, str)
     cube_ready = pyqtSignal(object, object)
     calibration_requested = pyqtSignal(object, object)
+    #: *Save as Radiometric Reference*: (cube, wavelengths) of the scan just finished.
+    radiometric_reference_requested = pyqtSignal(object, object)
     #: Save on the unsaved-result prompt: open (cube, wavelengths) with the export dialog.
     save_result_requested = pyqtSignal(object, object)
+    #: Calibrate (cube, wavelengths) with the camera's matching radiometric reference: sent after
+    #: a scan while *Auto radiometric calibration* is ticked, and when it is ticked afterwards.
+    auto_calibration_requested = pyqtSignal(object, object)
     #: The user finished a wavelength range edit: Enter, or focus leaving the Start/End pair.
     wavelength_range_committed = pyqtSignal()
 
@@ -185,6 +215,38 @@ class ScanWindow(QWidget):
 
         self.linear_group = QGroupBox("Linear Stage")
         self.linear_group.setLayout(linear_layout)
+
+        # ── Free scan (no stage) ─────────────────────────────────
+        # stage_type "free": nothing moves; the camera records for this time while the
+        # scene passes the slit by itself (conveyor, vehicle, hand-held sweep).
+        self.free_duration_spin = QDoubleSpinBox()
+        self.free_duration_spin.setDecimals(2)
+        self.free_duration_spin.setRange(FREE_SCAN_MIN_S, FREE_SCAN_MAX_S)
+        self.free_duration_spin.setSingleStep(1.0)
+        self.free_duration_spin.setValue(float(getattr(config, "free_duration_s", 10.0)))
+        self.free_duration_spin.setSuffix(" s")
+        self.free_duration_spin.setToolTip(
+            "No stage: the camera records for this many seconds from Start "
+            "(Stop ends it early; the frames so far become the cube)")
+
+        # Countdown of the running free scan (only the time box is locked while it runs, so
+        # the countdown stays readable when the folded settings pane is dragged open); the
+        # cube preview title and the status line also show the time left.
+        self.free_countdown_label = QLabel(COUNTDOWN_IDLE)
+        self.free_countdown_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        self.free_countdown_label.setToolTip("Time left in the running free scan")
+        self._countdown_timer = QTimer(self)
+        # Precise: a coarse timer drifts (a 100 ms one ticks every ~107-109 ms on Windows).
+        self._countdown_timer.setTimerType(Qt.PreciseTimer)
+        self._countdown_timer.setInterval(COUNTDOWN_INTERVAL_MS)
+        self._countdown_timer.timeout.connect(self._update_countdown)
+
+        free_layout = QFormLayout()
+        free_layout.addRow("Scan Time", self.free_duration_spin)
+        free_layout.addRow("Remaining", self.free_countdown_label)
+
+        self.free_group = QGroupBox("Free Scan (no stage)")
+        self.free_group.setLayout(free_layout)
 
         # ── Wavelength range (bins kept for preview and recording) ──
         self.wavelength_start_spin = _NoWheelUnlessFocusedSpinBox()
@@ -307,6 +369,7 @@ class ScanWindow(QWidget):
         stage_row = QHBoxLayout()
         stage_row.addWidget(self.rotation_group)
         stage_row.addWidget(self.linear_group)
+        stage_row.addWidget(self.free_group)
         stage_row.addWidget(self.wavelength_range_group)
         settings_column.addLayout(stage_row)
 
@@ -334,6 +397,11 @@ class ScanWindow(QWidget):
         self._pending_wavelengths = None
         self._pending_spectrogram = None
         self._pending_spectrogram_metadata = None
+        self._pending_calibrated = None     # float32 reflectance of the pending cube (auto calibration)
+        self._pending_calibration_header = None   # its export-header metadata
+        self._pending_factors = None        # factors of a scan calibrated frame by frame (counts = R / F)
+        self._calibrating_cube = None       # the pending cube while its calibration runs
+        self._calibration_token = 0         # counts calibration requests (stale results refused)
         self._result_at_risk = False        # the pending cube was never exported nor knowingly discarded
         self._close_confirmed = False       # confirm_close() already asked for the close under way
         self._cal_win = None  # ★ keep reference
@@ -381,11 +449,68 @@ class ScanWindow(QWidget):
         cpg_layout.setSpacing(4)
         cpg_layout.addWidget(self.cube_preview)
 
+        # reflectance of the last scan (automatic radiometric calibration): shown while there is one
+        self.open_reflectance_btn = QPushButton("Open Reflectance Viewer")
+        self.open_reflectance_btn.setToolTip(
+            "The last scan calibrated with the camera's active radiometric reference. "
+            "Open Cube Viewer still shows the raw counts.")
+        self.open_reflectance_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #00897b; color: white;
+                border-radius: 6px; padding: 6px 10px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #26a69a; }
+            QPushButton:pressed { background-color: #00695c; }
+            QPushButton:disabled { background-color: #1a2a40; color: #555; }
+        """)
+        self.open_reflectance_btn.setVisible(False)
+
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.open_cube_viewer_btn)
+        btn_row.addWidget(self.open_reflectance_btn)
         btn_row.addWidget(self.open_calibration_btn)
         btn_row.addWidget(self.open_spectrogram_btn)
         cpg_layout.addLayout(btn_row)
+
+        # ── radiometric reference: save this scan as one, and the automatic calibration state ──
+        self.save_reference_btn = QPushButton("Save as Radiometric Reference")
+        self.save_reference_btn.setEnabled(False)
+        self.save_reference_btn.setToolTip(
+            "Scan of a Spectralon (or another reference target)? Store it as the radiometric "
+            "reference of this camera setting; later scans with the same setting are calibrated "
+            "automatically.")
+        self.save_reference_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ef6c00; color: white;
+                border-radius: 6px; padding: 6px 10px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #fb8c00; }
+            QPushButton:pressed { background-color: #e65100; }
+            QPushButton:disabled { background-color: #1a2a40; color: #555; }
+        """)
+        self.radiometric_status_label = QLabel("Auto radiometric: —")
+        self.radiometric_status_label.setWordWrap(True)
+        self.set_radiometric_status("off", "Auto radiometric: —")
+        self.auto_radiometric_box = QCheckBox("Auto radiometric calibration")
+        self.auto_radiometric_box.setChecked(True)
+        self.auto_radiometric_box.setToolTip(
+            "Ticked when Start is pressed: every frame of the scan is calibrated while it is recorded "
+            "with the camera's active radiometric reference, when the camera setting matches it. "
+            "The live image and spectrum stay in counts; the counts of the scan can always be had "
+            "back exactly (Open Cube Viewer, Calibration, Save as Radiometric Reference).\n"
+            "Locked during a scan. Untick before scanning a new reference target to record counts; "
+            "tick after a scan to calibrate that scan, untick to drop its reflectance.")
+        self.auto_radiometric_box.toggled.connect(self._on_auto_radiometric_toggled)
+        ref_row = QHBoxLayout()
+        ref_row.addWidget(self.save_reference_btn)
+        ref_row.addWidget(self.auto_radiometric_box)
+        ref_row.addWidget(self.radiometric_status_label, 1)
+        cpg_layout.addLayout(ref_row)
+        # what automatic calibration did with the last scan (hidden when there is nothing to say)
+        self.scan_calibration_label = QLabel("")
+        self.scan_calibration_label.setWordWrap(True)
+        self.scan_calibration_label.setVisible(False)
+        cpg_layout.addWidget(self.scan_calibration_label)
 
         cube_preview_group.setLayout(cpg_layout)
 
@@ -430,7 +555,9 @@ class ScanWindow(QWidget):
         self.viewer.stop_btn.setToolTip("Stop Scan (Esc)")
 
         self.open_cube_viewer_btn.clicked.connect(self._on_open_cube_viewer)
+        self.open_reflectance_btn.clicked.connect(self._on_open_reflectance)
         self.open_calibration_btn.clicked.connect(self._on_open_calibration)
+        self.save_reference_btn.clicked.connect(self._on_save_reference)
         self.open_spectrogram_btn.clicked.connect(self._on_open_spectrogram)
         self.save_frame_btn.clicked.connect(self.request_processed_frame)
         self.controller = None
@@ -443,14 +570,19 @@ class ScanWindow(QWidget):
         scan_time = ""
         if self._scan_clock is not None:
             started, expected = self._scan_clock
-            scan_time = (f"Scan {_format_duration(time.monotonic() - started)}"
-                         f" / ~{_format_duration(expected)}  ·  ")
+            elapsed = time.monotonic() - started
+            if self.stage_type() == "free":     # an exact time, not a stage move estimate
+                scan_time = (f"Scan {_format_duration(elapsed)} / {_format_duration(expected)}"
+                             f" ({_format_countdown(expected - elapsed)} left)  ·  ")
+            else:
+                scan_time = (f"Scan {_format_duration(elapsed)}"
+                             f" / ~{_format_duration(expected)}  ·  ")
         warning = s.get("calibration_warning") or ""
-        return (
+        return (                     # the scan time before the (long) warnings, so it stays in view
             f"{s['state']}  ·  "
-            + (f"{warning}  ·  " if warning else "")
             + f"{scan_time}"
-            f"FPS {s['fps']:.1f}"
+            + (f"{warning}  ·  " if warning else "")
+            + f"FPS {s['fps']:.1f}"
             f"{cam_fps}  ·  "
             f"Frame {s['frame']:,}  ·  "
             f"Recorded {s['recorded']:,}  ·  "
@@ -465,8 +597,29 @@ class ScanWindow(QWidget):
 
     # ── cube ready ───────────────────────────────────────────────
 
-    def set_cube_ready(self, cube, wavelengths):
-        self._pending_cube = cube
+    def set_cube_ready(self, cube, wavelengths, calibration=None, note=None):
+        """The scan's cube is ready.
+
+        Args:
+            cube: ``(lines, samples, bands)`` in counts, or its reflectance when the frames were
+                calibrated while recorded (``calibration`` given).
+            wavelengths: Band centres (nm).
+            calibration: For a reflectance ``cube``: ``{"header": export-header fields,
+                "factors": (lines, bands) factors, "text": line for the scan}``; the counts are
+                rebuilt from it when asked for (:meth:`counts_cube`).
+            note: For a counts ``cube``: ``(state, text)`` saying why it is not calibrated (e.g. not
+                enough memory for its reflectance); it is shown and no calibration after the scan
+                is tried. ``None``: calibrated after the scan when *Auto radiometric calibration*
+                is ticked and a reference fits.
+        """
+        self.clear_scan_calibration()               # belonged to the cube being replaced
+        if calibration is not None:
+            self._pending_cube = None               # counts only when asked for (exact: R / F)
+            self._pending_calibrated = cube
+            self._pending_calibration_header = dict(calibration.get("header") or {})
+            self._pending_factors = calibration.get("factors")
+        else:
+            self._pending_cube = cube
         self._pending_wavelengths = wavelengths
         self._result_at_risk = True                 # in RAM only until it is exported
 
@@ -477,20 +630,150 @@ class ScanWindow(QWidget):
 
         self.open_calibration_btn.setEnabled(True)
         self.open_calibration_btn.setText(f"Calibration  ({shape_str})")
+        self.save_reference_btn.setEnabled(True)
+        if calibration is not None:
+            self.open_reflectance_btn.setText(f"Open Reflectance Viewer  ({shape_str})")
+            self.open_reflectance_btn.setVisible(True)
+            self.set_scan_calibration("applied", calibration.get("text") or "Last scan: calibrated")
+        elif note is not None:
+            self.set_scan_calibration(*note)
+        else:
+            self.request_auto_calibration()
+
+    def counts_cube(self):
+        """The last scan in counts (Open Cube Viewer, Calibration, Save as Radiometric Reference).
+
+        A scan calibrated while recorded holds only its reflectance: its counts are rebuilt from
+        it the first time they are asked for (``counts_from_reflectance``: exact, since the factors
+        are finite and positive) and kept from then on.
+        """
+        if (self._pending_cube is None and self._pending_calibrated is not None
+                and self._pending_factors is not None):
+            from modules.radiometric.auto import counts_from_reflectance
+            self._pending_cube = counts_from_reflectance(self._pending_calibrated, self._pending_factors)
+        return self._pending_cube
 
     def _on_open_cube_viewer(self):
-        if self._pending_cube is None:
+        cube = self.counts_cube()
+        if cube is None:
             return
-        self.cube_ready.emit(self._pending_cube, self._pending_wavelengths)
+        self.cube_ready.emit(cube, self._pending_wavelengths)
 
     def has_unsaved_result(self) -> bool:
         """True while the last scan's cube exists only in RAM (never exported, not discarded)."""
-        return self._pending_cube is not None and self._result_at_risk
+        return (self._pending_cube is not None or self._pending_calibrated is not None) and self._result_at_risk
 
     def mark_result_saved(self, cube):
-        """``cube`` was exported; if it is the pending result, losing it needs no question."""
-        if cube is not None and cube is self._pending_cube:
+        """``cube`` was exported; if it is the pending result (its raw counts or its reflectance),
+        losing it needs no question."""
+        if cube is not None and (cube is self._pending_cube or cube is self._pending_calibrated):
             self._result_at_risk = False
+
+    # ── automatic radiometric calibration of the last scan ──────────
+
+    def request_auto_calibration(self) -> bool:
+        """Ask for the pending cube's calibration (``auto_calibration_requested``) when *Auto
+        radiometric calibration* is ticked and the cube has no reflectance yet, nor one being made.
+        Returns True when asked."""
+        cube = self._pending_cube
+        if (cube is None or not self.auto_radiometric_box.isChecked()
+                or self._pending_calibrated is not None or self._calibrating_cube is cube):
+            return False
+        self._calibrating_cube = cube
+        self._calibration_token += 1                # a result of an earlier request is refused
+        self.auto_calibration_requested.emit(cube, self._pending_wavelengths)
+        return True
+
+    def calibration_token(self) -> int:
+        """Identifies the current calibration request: a result carrying another token (asked
+        before the reflectance was dropped, or for another reference) is refused."""
+        return self._calibration_token
+
+    def recalibrate(self) -> bool:
+        """Calibrate the pending scan again from its counts (e.g. with a reference just made
+        active): its current reflectance is dropped first. Returns True when asked."""
+        if self._pending_cube is None and self._pending_calibrated is None:
+            return False
+        self.counts_cube()                          # a scan held only as reflectance: counts first
+        self.clear_scan_calibration()
+        return self.request_auto_calibration()
+
+    def _on_auto_radiometric_toggled(self, checked):
+        if checked:
+            self.request_auto_calibration()
+        else:
+            # this scan goes back to counts: its reflectance (made or being made) is dropped,
+            # after its counts are rebuilt when it was calibrated while recorded
+            self.counts_cube()
+            self.clear_scan_calibration()
+
+    def clear_scan_calibration(self):
+        """Forget the reflectance of the pending scan (new scan, or auto calibration unticked);
+        a scan held only as reflectance must have its counts made first (:meth:`counts_cube`)."""
+        self._pending_calibrated = None
+        self._pending_calibration_header = None
+        self._pending_factors = None
+        self._calibrating_cube = None
+        self._calibration_token += 1                # results still on their way are refused
+        self.open_reflectance_btn.setVisible(False)
+        self.open_reflectance_btn.setText("Open Reflectance Viewer")
+        self.set_scan_calibration("off", "")
+
+    def set_scan_calibration(self, state: str, text: str):
+        """Show what automatic calibration does with the last scan: ``state`` ``"applied"``
+        (green), ``"working"`` (blue), ``"not_applied"`` (amber), ``"failed"`` (red), or ``"off"``
+        (the line is hidden)."""
+        color = {"applied": "#43a047", "working": "#42a5f5", "not_applied": "#fb8c00",
+                 "failed": "#e53935"}.get(state)
+        if state in ("not_applied", "failed", "off"):
+            self._calibrating_cube = None
+        self.scan_calibration_label.setText(text if color else "")
+        self.scan_calibration_label.setStyleSheet(f"color: {color or '#7a8699'};")
+        self.scan_calibration_label.setVisible(bool(color and text))
+
+    def _current_request(self, cube, token) -> bool:
+        return (cube is not None and cube is self._pending_cube and self._calibrating_cube is cube
+                and (token is None or token == self._calibration_token))
+
+    def set_calibrated_cube(self, cube, calibrated, header: dict, text: str, token=None) -> bool:
+        """The reflectance ``calibrated`` of ``cube`` is ready, with its export-header metadata.
+
+        Refused (False) when ``cube`` is no longer the pending scan (a newer scan replaced it),
+        auto calibration was unticked meanwhile, or ``token`` (:meth:`calibration_token` when it
+        was asked) is not the current request's: the result belongs to nothing shown any more.
+        """
+        if not self._current_request(cube, token):
+            return False
+        self._calibrating_cube = None
+        self._pending_calibrated = calibrated
+        self._pending_calibration_header = dict(header or {})
+        shape = "x".join(str(n) for n in calibrated.shape)
+        self.open_reflectance_btn.setText(f"Open Reflectance Viewer  ({shape})")
+        self.open_reflectance_btn.setVisible(True)
+        self.set_scan_calibration("applied", text)
+        return True
+
+    def calibration_failed(self, cube, text: str, token=None) -> bool:
+        """Calibrating ``cube`` failed: say so, if it is still the current request. Returns True when shown."""
+        if not self._current_request(cube, token):
+            return False
+        self.set_scan_calibration("failed", text)
+        return True
+
+    def calibrated_cube(self):
+        """The reflectance of the pending scan, or ``None``."""
+        return self._pending_calibrated
+
+    def calibration_header(self, cube):
+        """Export-header metadata of ``cube`` if it is the pending scan's reflectance, else ``None``."""
+        if cube is not None and cube is self._pending_calibrated:
+            return dict(self._pending_calibration_header or {})
+        return None
+
+    def _on_open_reflectance(self):
+        if self._pending_calibrated is None:
+            return
+        self.cube_ready.emit(self._pending_calibrated, self._pending_wavelengths)
 
     def confirm_discard_result(self, action: str) -> bool:
         """Ask before ``action`` drops a never-exported result: Save / Discard / Cancel.
@@ -501,20 +784,25 @@ class ScanWindow(QWidget):
         """
         if not self.has_unsaved_result():
             return True
-        shape = "x".join(str(n) for n in self._pending_cube.shape)
+        held = self._pending_cube if self._pending_cube is not None else self._pending_calibrated
+        shape = "x".join(str(n) for n in held.shape)
         what = (f"cube ({shape}) and its raw spectrogram have" if self._pending_spectrogram is not None
                 else f"cube ({shape}) has")
+        calibrated = self._pending_calibrated
+        which = ("the export dialog of its reflectance cube (Open Cube Viewer exports the raw counts)"
+                 if calibrated is not None else "the export dialog")
         answer = QMessageBox.warning(
             self, "Unsaved Scan",
             f"The last scan's {what} not been saved.\n"
             f"{action} discards it.\n\n"
-            "Save opens the export dialog; try again once the export has finished.",
+            f"Save opens {which}; try again once the export has finished.",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
         if answer == QMessageBox.Discard:
             self._result_at_risk = False
             return True
         if answer == QMessageBox.Save:
-            self.save_result_requested.emit(self._pending_cube, self._pending_wavelengths)
+            self.save_result_requested.emit(calibrated if calibrated is not None else self._pending_cube,
+                                            self._pending_wavelengths)
         return False
 
     def confirm_close(self, action: str = "Closing the scan window") -> bool:
@@ -568,9 +856,23 @@ class ScanWindow(QWidget):
     # ── calibration ──────────────────────────────────────────────
 
     def _on_open_calibration(self):
-        if self._pending_cube is None:
+        cube = self.counts_cube()
+        if cube is None:
             return
-        self.calibration_requested.emit(self._pending_cube, self._pending_wavelengths)
+        self.calibration_requested.emit(cube, self._pending_wavelengths)
+
+    def _on_save_reference(self):
+        cube = self.counts_cube()                  # a reference is fitted on counts, never reflectance
+        if cube is None:
+            return
+        self.radiometric_reference_requested.emit(cube, self._pending_wavelengths)
+
+    def set_radiometric_status(self, state: str, text: str):
+        """Show the automatic radiometric calibration state: ``state`` ``"on"`` (green),
+        ``"expired"`` (amber) or anything else (grey), with ``text``."""
+        color = {"on": "#43a047", "expired": "#fb8c00"}.get(state, "#7a8699")
+        self.radiometric_status_label.setText(text)
+        self.radiometric_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
 
     # ── stage controls ───────────────────────────────────────────
 
@@ -578,6 +880,7 @@ class ScanWindow(QWidget):
         stage_type = str(stage_type).lower()
         self.rotation_group.setVisible(stage_type == "rotation")
         self.linear_group.setVisible(stage_type == "linear")
+        self.free_group.setVisible(stage_type == "free")
 
     def stage_type(self) -> str:
         return str(self.config.stage_type).lower()
@@ -593,6 +896,10 @@ class ScanWindow(QWidget):
 
     def linear_speed_um_s(self) -> float:
         return float(self.speed_um_s_spin.value())
+
+    def free_duration_s(self) -> float:
+        """Recording time of a free scan (stage type ``"free"``, no stage), in seconds."""
+        return float(self.free_duration_spin.value())
 
     # ── bin ──────────────────────────────────────────────────────
 
@@ -622,6 +929,9 @@ class ScanWindow(QWidget):
         self.camera_controls.set_settings_enabled(not active)
         self.rotation_group.setEnabled(not active)
         self.linear_group.setEnabled(not active)
+        self.free_duration_spin.setEnabled(not active)   # the box stays lit for its countdown
+        # chosen at Start for the whole scan (frames are calibrated while recorded)
+        self.auto_radiometric_box.setEnabled(not active)
         splitter = self.settings_splitter
         if active and self._settings_sizes_before_scan is None:
             sizes = splitter.sizes()
@@ -634,14 +944,17 @@ class ScanWindow(QWidget):
         if not active:
             self._scan_clock = None
             self._stage_speed = None
+            self._countdown_timer.stop()
         self._update_scan_title()
+        self._update_countdown()
 
     def _update_scan_title(self):
         self.cube_preview_group.setTitle(
             f"{CUBE_PREVIEW_TITLE}  —  {self.scan_settings_summary()}" if self._scanning else CUBE_PREVIEW_TITLE)
 
     def scan_settings_summary(self) -> str:
-        """The settings a scan uses in one line: bin, exposure, gain, recorded bands, stage move.
+        """The settings a scan uses in one line: bin, exposure, gain, recorded bands, stage move
+        (or the scan time of a free scan, and its time left once it records).
 
         Once the stage reported a speed different from the entered one
         (:meth:`start_scan_clock`), the move adds ``(stage runs ...)``.
@@ -650,7 +963,11 @@ class ScanWindow(QWidget):
         parts = [f"Bin {controls.selected_bin()}", f"{controls.exposure_ms():.3f} ms", f"Gain {controls.gain()}"]
         if self._recorded_bands is not None:
             parts.append(self._recorded_bands)
-        if self.stage_type() == "linear":
+        if self.stage_type() == "free":
+            remaining = self.free_scan_remaining()
+            parts.append(f"{self.free_duration_s():.2f} s free scan (no stage)"
+                         + ("" if remaining is None else f", {_format_countdown(remaining)} left"))
+        elif self.stage_type() == "linear":
             speed = self.linear_speed_um_s()
             parts.append(f"{self.linear_distance_mm():.3f} mm @ {speed:g} µm/s"
                          f"{self._stage_runs(speed, '{:.3f} µm/s')}")
@@ -668,12 +985,14 @@ class ScanWindow(QWidget):
         return f" (stage runs {form.format(speed)})"
 
     def expected_scan_seconds(self, speed=None) -> float:
-        """Duration of the scan move in s (stage acceleration ignored).
+        """Duration of the scan move in s (stage acceleration ignored); a free scan's time.
 
         Args:
             speed: Speed the stage runs (µm/s linear, deg/s rotation), or ``None`` for the
-                entered speed.
+                entered speed (not used by a free scan).
         """
+        if self.stage_type() == "free":
+            return self.free_duration_s()
         if self.stage_type() == "linear":
             speed = self.linear_speed_um_s() if speed is None else speed
             return self.linear_distance_mm() / (speed / 1000.0)
@@ -682,7 +1001,8 @@ class ScanWindow(QWidget):
 
     def start_scan_clock(self, speed=None):
         """Show ``Scan elapsed / ~expected`` in the status line from now (the stage move start)
-        until the scan ends (:meth:`set_scanning` ``False``).
+        until the scan ends (:meth:`set_scanning` ``False``); a free scan shows
+        ``Scan elapsed / time (left)`` and counts down in its box.
 
         Args:
             speed: Speed the stage reported it runs, read back from its controller (µm/s
@@ -693,7 +1013,33 @@ class ScanWindow(QWidget):
         self._scan_clock = (time.monotonic(), self.expected_scan_seconds(speed))
         if self._scanning:
             self._update_scan_title()
+        if self.stage_type() == "free":
+            self._countdown_timer.start()
+            self._update_countdown()
 
+    def free_scan_remaining(self):
+        """Seconds left in the running free scan (0 once its time is up), or ``None`` when no
+        free scan is recording (not scanning, a stage scan, or not started yet)."""
+        if self._scan_clock is None or self.stage_type() != "free":
+            return None
+        started, total = self._scan_clock
+        return max(0.0, total - (time.monotonic() - started))
+
+    def _update_countdown(self):
+        """Redraw the Free Scan box's countdown: the time left while recording, the whole scan
+        time between Start and the recording start, ``—`` when no free scan runs."""
+        remaining = self.free_scan_remaining()
+        if remaining is not None:
+            text = _format_countdown(remaining)
+        elif self._scanning and self.stage_type() == "free":
+            text = _format_countdown(self.free_duration_s())
+        else:
+            text = COUNTDOWN_IDLE
+        if text == self.free_countdown_label.text():
+            return                          # most ticks: the same tenth, nothing to redraw
+        self.free_countdown_label.setText(text)
+        if remaining is not None and self._scanning:
+            self._update_scan_title()       # the preview title shows the time left too
     # ── wavelength range ─────────────────────────────────────────
 
     def requested_wavelength_range(self):
@@ -821,9 +1167,10 @@ class ScanWindow(QWidget):
         self.dark_panel.set_current_temperature(temp_c)
 
     def stage_spins(self):
-        """The four stage scan spin boxes (rotation speed/degree, linear distance/speed)."""
+        """The five scan spin boxes (rotation speed/degree, linear distance/speed, free scan
+        time), in the order of ``STAGE_SETTING_KEYS``."""
         return (self.degree_per_second_spin, self.degree_spin,
-                self.distance_mm_spin, self.speed_um_s_spin)
+                self.distance_mm_spin, self.speed_um_s_spin, self.free_duration_spin)
 
     # ── lifecycle ────────────────────────────────────────────────
 

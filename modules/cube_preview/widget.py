@@ -834,6 +834,11 @@ class RealtimeCubePreviewWidget(QWidget):
 
     # ── spectrum history ──────────────────────────────────
 
+    def clear_spectra(self):
+        """Drop the clicked points and their spectra, e.g. when the frames shown change units
+        (a scan calibrated while recorded turned back into counts)."""
+        self._clear_spectrum_history()
+
     def _clear_spectrum_history(self):
         self._spectrum_history.clear()
         self.image_label.clear_click_points()

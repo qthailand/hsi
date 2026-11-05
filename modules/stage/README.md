@@ -1,6 +1,7 @@
 # modules/stage
 
-Motorised stage for pushbroom scanning: Standa/XIMC **8SMC1** rotation and linear stages.
+Motorised stage for pushbroom scanning: Standa/XIMC **8SMC1** rotation and linear stages,
+and the **free** scan: no stage, the camera records for a set time.
 
 ## Overview
 
@@ -25,10 +26,49 @@ Importing `modules.stage` does not import PyQt5 or `libximc`; both are loaded la
 ```
 python -m modules.stage --type rotation --degree 10 --dps 2
 python -m modules.stage --type linear --distance-mm 20 --speed-um-s 1000
+python -m modules.stage --type free --seconds 5
 ```
 
 Runs one headless sequence on the real stage and prints time-stamped events; exit code 0
-if it completed, else 1.
+if it completed, else 1. `--type free` needs no stage or `libximc`.
+
+## Free scan (no stage)
+
+For a system without a stage, where the scene moves past the slit by itself (conveyor,
+vehicle, aircraft, hand-held sweep), set in `config/scan.json`:
+
+```json
+{
+  "stage_type": "free",
+  "free_duration_s": 10.0
+}
+```
+
+* The scan window shows a **Free Scan (no stage)** box with **Scan Time** (seconds,
+  0.1 s .. 24 h) instead of the stage boxes; edits are saved back to `free_duration_s`.
+* Start records for that time from the moment the scan starts; Stop / Esc ends it early and
+  the frames so far become the cube, as with a stage.
+* Countdown: the box's **Remaining** shows the time left while the scan records, in steps
+  of 0.1 s rounded up (it reads `0.0 s` only when the time is over; `m:ss` from a minute,
+  `h:mm:ss` from an hour; `—` when no free scan runs). A precise 50 ms timer checks it, so
+  every tenth shows; the label is redrawn only when its text changes. Only Scan Time is
+  locked during the scan, so the box stays readable when the folded settings pane is
+  dragged open. While the pane is folded, the cube preview title (`..., 9.1 s left`) and the
+  status line (`Scan elapsed / time (x left)`, ahead of any calibration warnings) show it.
+* `StageSequence("free")` opens no driver (`stage_factory` and `stage_device` are not
+  used): phases `scanning -> idle`, `on_before` at the start, `on_after` when the time is
+  up or a stop came; no homing and no return home (`on_home` is never called, so the
+  status line never says "stage returning home").
+* The recording window (`steady_window`) is the whole timed scan: no ramps, and
+  `scan_trim_extra_ms` is not applied (there is no stage command latency).
+* The scan metadata holds `stage_type = "free"`, `duration_s` (the time set) and
+  `duration_s_recorded` (the time recorded: shorter after a Stop or a camera error); the
+  cube's export header writes `stage type = free`, `free scan time set (s)` and
+  `free scan time recorded (s)`. The number of lines is about the frame rate times the
+  recorded time. A radiometric reference is matched by stage type, so a free scan needs a
+  reference recorded as a free scan.
+* `stage_type` must be `rotation`, `linear` or `free` and `free_duration_s` 0.1 to 86400
+  seconds; the application refuses to start with anything else in `scan.json`.
 
 ## Embedding in an application
 
@@ -119,7 +159,7 @@ microstep (`speed.encode_speed`; a fraction that rounds up to a whole step carri
 | Member | Purpose |
 |--------|---------|
 | `StageSequence(stage_type, stage_factory, on_before, on_after, on_home, on_error)` | configure |
-| `.degree`, `.degree_per_second`, `.distance_mm`, `.speed_um_s` | motion parameters |
+| `.degree`, `.degree_per_second`, `.distance_mm`, `.speed_um_s`, `.duration_s` | motion parameters (`duration_s`: free scan time, s) |
 | `.run()` | execute (blocking, never raises; failures go to `on_error`) |
 | `.request_stop(return_home=True)` | interrupt; `False` aborts without homing (shutdown only) |
 | `StageThread` signals | `stagebefore`, `stageafter`, `returned_home`, `error(str)` |

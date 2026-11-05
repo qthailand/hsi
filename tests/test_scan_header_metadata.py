@@ -166,11 +166,14 @@ def test_scan_controller_collects_the_header_metadata():
     controller._raw_metadata = {'started_at': SCAN['started_at'], 'exposure_ms': 12.5, 'gain': 100,
                                 'camera_bin': 2, 'stage_type': 'linear', 'speed_um_s': 150.0,
                                 'speed_um_s_achieved': 149.921875, 'camera_backend': 'poa',
-                                'frame_width': 804}
+                                'raw_inverted': True, 'resolution_nm': 2.0, 'frame_width': 804}
     controller.last_scan_temperatures = {'sensor_temperature_c_start': -9.5}
     controller.preview_thread = NS(correction_info=lambda: {'dark_corrected': True})
     meta = controller._scan_header_metadata()
-    assert meta == {'started_at': SCAN['started_at'], 'exposure_ms': 12.5, 'gain': 100,
-                    'camera_bin': 2, 'stage_type': 'linear', 'speed_um_s': 150.0,
+    # backend, orientation and bin width belong to a radiometric reference's key; the frame
+    # width is not a header field
+    assert meta == {'started_at': SCAN['started_at'], 'camera_backend': 'poa', 'raw_inverted': True,
+                    'exposure_ms': 12.5, 'gain': 100, 'camera_bin': 2, 'resolution_nm': 2.0,
+                    'stage_type': 'linear', 'speed_um_s': 150.0,
                     'speed_um_s_achieved': 149.921875, 'sensor_temperature_c_start': -9.5,
                     'dark_corrected': True}

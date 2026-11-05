@@ -10,7 +10,7 @@ from modules.acquisition.config import ProcessingConfig, parse_wavelength_ranges
 from modules.camera.config import CameraConfig
 from modules.dark.config import DarkConfig
 from modules.smile.config import SmileConfig
-from modules.stage.config import StageConfig
+from modules.stage.config import FREE_SCAN_MAX_S, FREE_SCAN_MIN_S, STAGE_TYPES, StageConfig
 
 logger = logging.getLogger("HSI")
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -59,7 +59,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
                                                                  "resolution_source", "fwhm_step_factor",
                                                                  "target_temperature_c", "rotation_degree",
                                                                  "rotation_speed_dps", "linear_distance_mm",
-                                                                 "linear_speed_um_s", "scan_trim_extra_ms", "stage_device",
+                                                                 "linear_speed_um_s", "free_duration_s", "scan_trim_extra_ms", "stage_device",
                                                                  "wavelength_range_nm", "camera_profile_folder"}
     target_temperature = data.get("target_temperature_c")
     stage_defaults = StageConfig()
@@ -81,6 +81,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
         rotation_speed_dps=float(data.get("rotation_speed_dps", stage_defaults.rotation_speed_dps)),
         linear_distance_mm=float(data.get("linear_distance_mm", stage_defaults.linear_distance_mm)),
         linear_speed_um_s=float(data.get("linear_speed_um_s", stage_defaults.linear_speed_um_s)),
+        free_duration_s=float(data.get("free_duration_s", stage_defaults.free_duration_s)),
         scan_trim_extra_ms=float(data.get("scan_trim_extra_ms", stage_defaults.scan_trim_extra_ms)),
         stage_device=str(data.get("stage_device") or ""),
         m=float(data.get("m", 0.2903)),
@@ -116,6 +117,12 @@ def load_app_config(path: str | None = None) -> AppConfig:
             raise ValueError(f"{name} must be a positive number, not {value}")
     if not math.isfinite(config.scan_trim_extra_ms) or config.scan_trim_extra_ms < 0:
         raise ValueError(f"scan_trim_extra_ms must be zero or more, not {config.scan_trim_extra_ms}")
+    if config.stage_type not in STAGE_TYPES:
+        raise ValueError(f"stage_type must be one of {', '.join(STAGE_TYPES)}, not {config.stage_type!r}")
+    if not (math.isfinite(config.free_duration_s)
+            and FREE_SCAN_MIN_S <= config.free_duration_s <= FREE_SCAN_MAX_S):
+        raise ValueError(f"free_duration_s must be {FREE_SCAN_MIN_S:g} to {FREE_SCAN_MAX_S:g} seconds, "
+                         f"not {config.free_duration_s}")
     config._config_store = store
     config._wavelength_profile = data.get('_wavelength_profile')
     config.camera_profile = None      # set by the scan controller once the camera is open

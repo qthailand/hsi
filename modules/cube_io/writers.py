@@ -65,13 +65,16 @@ COUNT_HEADER_FIELDS = (
 #: written when present in ``config``: ``(config key, header field, kind)``.  ``bool`` fields are
 #: written ``1``/``0``; a missing key means unknown (e.g. a cube opened from a file without it).
 SCAN_HEADER_FIELDS = (
+    ('camera_backend', 'camera backend', str),
     ('camera_model', 'camera model', str),
     ('camera_serial', 'camera serial number', str),
+    ('raw_inverted', 'raw frames inverted', bool),
     ('sensor_pixel_pitch_um', 'sensor pixel pitch (um, bin 1)', float),
     ('exposure_ms', 'exposure time (ms)', float),
     ('gain', 'sensor gain', float),
     ('frame_rate_hz', 'frame rate (Hz)', float),
     ('camera_bin', 'camera bin', int),
+    ('resolution_nm', 'spectral bin width (nm)', float),
     ('dark_corrected', 'dark corrected', bool),
     ('hot_pixel_corrected', 'hot pixel corrected', bool),
     ('hot_pixel_count', 'hot pixel count', int),
@@ -89,12 +92,21 @@ SCAN_HEADER_FIELDS = (
     ('reflectance_reference', 'reflectance reference', str),
     ('reflectance_reference_cube', 'reflectance reference cube', str),
     ('reflectance_reference_rows', 'reflectance reference rows', str),
+    # automatic calibration with a stored reference (modules.radiometric.auto)
+    ('reflectance_reference_mode', 'reflectance reference mode', str),
+    ('reflectance_reference_scanned', 'reflectance reference scanned', str),
+    ('reflectance_reference_age_h', 'reflectance reference age (h)', float),
+    ('reflectance_reference_delta_t_c', 'reflectance reference temperature difference (C)', float),
+    ('reflectance_reference_roi', 'reflectance reference roi', str),
     ('calibration_warnings', 'calibration warnings', str),
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),
     ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
     ('degree_per_second', 'rotation speed (deg/s)', float),
     ('degree_per_second_achieved', 'rotation speed achieved (deg/s)', float),
+    # stage type "free" (no stage): the time set, and the time recorded (shorter after a Stop)
+    ('duration_s', 'free scan time set (s)', float),
+    ('duration_s_recorded', 'free scan time recorded (s)', float),
 )
 
 
