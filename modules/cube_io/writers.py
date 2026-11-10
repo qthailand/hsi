@@ -72,7 +72,12 @@ SCAN_HEADER_FIELDS = (
     ('sensor_pixel_pitch_um', 'sensor pixel pitch (um, bin 1)', float),
     ('exposure_ms', 'exposure time (ms)', float),
     ('gain', 'sensor gain', float),
-    ('frame_rate_hz', 'frame rate (Hz)', float),
+    ('frame_rate_hz', 'frame rate (Hz)', float),      # what the camera reports (AcquisitionFrameRate)
+    # what the recording reached: (lines - 1) / (time of the last - first line); below the
+    # camera's rate when frames were lost before the recorder
+    ('line_rate_hz', 'line rate measured (Hz)', float),
+    ('line_rate_source', 'line rate source', str),    # 'camera timestamps' or 'host time'
+    ('frames_missing', 'frames missing (estimated)', int),      # camera timestamps only
     ('camera_bin', 'camera bin', int),
     ('resolution_nm', 'spectral bin width (nm)', float),
     ('dark_corrected', 'dark corrected', bool),
@@ -102,6 +107,8 @@ SCAN_HEADER_FIELDS = (
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),
     ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
+    # linear stage only: stage speed / measured line rate = the along-track size of a line
+    ('along_track_step_um', 'along-track step (um/line)', float),
     ('degree_per_second', 'rotation speed (deg/s)', float),
     ('degree_per_second_achieved', 'rotation speed achieved (deg/s)', float),
     # stage type "free" (no stage): the time set, and the time recorded (shorter after a Stop)

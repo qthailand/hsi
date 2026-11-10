@@ -339,7 +339,39 @@ class AcquisitionEngine:
         frames = self.recorder.take_frames(window)
         self._log_trim(frames, offset, motion_start_ns, motion_end_ns,
                        motion_start_ns if reference_ns is None else reference_ns)
+        self._log_line_rate()
         return frames
+
+    def line_rate_info(self) -> dict:
+        """The line rate the frames of the last :meth:`take_recorded_frames` actually reached.
+
+        Returns:
+            dict: ``{}`` when unknown (fewer than two timed frames), else ``line_rate_hz``,
+            ``line_rate_source`` (``'camera timestamps'`` or ``'host time'``), ``frames``
+            and, with camera timestamps, ``frames_missing``
+            (see :func:`modules.acquisition.recorder.line_rate_stats`), plus ``camera_hz``:
+            the camera's own frame rate when it reports one. A line rate below ``camera_hz``
+            means frames were lost between the sensor and the recording.
+        """
+        info = dict(getattr(self.recorder, 'last_line_rate', None) or {})
+        camera_hz = getattr(self, '_camera_hz', None)
+        if info and camera_hz:
+            info['camera_hz'] = float(camera_hz)
+        return info
+
+    def _log_line_rate(self):
+        """The ``Scan line rate:`` line that follows ``Scan trim:`` (the kept frames only)."""
+        info = self.line_rate_info()
+        if not info:
+            logger.info('Scan line rate: unknown (fewer than 2 timed frames)')
+            return
+        camera_hz = info.get('camera_hz')
+        missing = info.get('frames_missing')
+        logger.info('Scan line rate: %.3f Hz from %s over %d frames%s%s',
+                    info['line_rate_hz'], info['line_rate_source'], info['frames'],
+                    '' if missing is None else f', {missing} missing',
+                    '' if not camera_hz else
+                    f' (camera reports {camera_hz:.3f} Hz: {100.0 * info["line_rate_hz"] / camera_hz:.1f}%)')
 
     def _log_trim(self, frames, offset, start_ns, end_ns, reference_ns):
         """The ``Scan trim:`` summary of :meth:`take_recorded_frames` (times in ms from ``reference_ns``)."""

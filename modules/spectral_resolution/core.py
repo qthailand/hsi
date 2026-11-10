@@ -77,6 +77,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+from scipy.special import ndtr as _ndtr
 
 from .baseline import _prepare as _baseline_options
 from .baseline import estimate_baseline
@@ -84,6 +85,7 @@ from .baseline import estimate_baseline
 logger = logging.getLogger(__name__)
 
 FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))   # 2.3548...
+_INV_SQRT_2PI = 1.0 / np.sqrt(2.0 * np.pi)
 
 #: Line profiles :func:`measure_spectrum` / :func:`measure_frame` can fit (``profile=``).
 PROFILES = ("gaussian", "lorentzian")
@@ -198,8 +200,21 @@ class _Gaussian:
     @staticmethod
     def counts(x, area, mu, width):
         """Counts in the pixels centred at ``x`` of a line of ``area`` centred at ``mu``."""
-        from scipy.special import ndtr
-        return area * (ndtr((x + 0.5 - mu) / width) - ndtr((x - 0.5 - mu) / width))
+        return area * (_ndtr((x + 0.5 - mu) / width) - _ndtr((x - 0.5 - mu) / width))
+
+    @staticmethod
+    def derivatives(x, area, mu, width):
+        """``(∂/∂area, ∂/∂mu, ∂/∂width)`` of :meth:`counts` (arrays broadcast like :meth:`counts`).
+
+        With ``a, b = (x ± ½ - μ)/σ``: ``Φ(a) - Φ(b)``, ``-(A/σ)·(φ(a) - φ(b))`` and
+        ``-(A/σ)·(a·φ(a) - b·φ(b))``.
+        """
+        a = (x + 0.5 - mu) / width
+        b = (x - 0.5 - mu) / width
+        pa = np.exp(-0.5 * a * a) * _INV_SQRT_2PI
+        pb = np.exp(-0.5 * b * b) * _INV_SQRT_2PI
+        scale = area / width
+        return _ndtr(a) - _ndtr(b), -scale * (pa - pb), -scale * (a * pa - b * pb)
 
     @staticmethod
     def area(height, width):
@@ -241,6 +256,19 @@ class _Lorentzian:
         return area / np.pi * np.arctan2(width, (x - mu) ** 2 + width ** 2 - 0.25)
 
     @staticmethod
+    def derivatives(x, area, mu, width):
+        """``(∂/∂area, ∂/∂mu, ∂/∂width)`` of :meth:`counts` (arrays broadcast like :meth:`counts`).
+
+        With ``u = x - μ`` and ``D = u² + γ² - ¼`` (counts ``= (A/π)·atan2(γ, D)``):
+        ``atan2(γ, D)/π``, ``(A/π)·2uγ/(D² + γ²)`` and ``(A/π)·(D - 2γ²)/(D² + γ²)``.
+        """
+        u = x - mu
+        d = u * u + width * width - 0.25
+        scale = area / np.pi / (d * d + width * width)
+        return (np.arctan2(width, d) / np.pi, scale * (2.0 * u * width),
+                scale * (d - 2.0 * width * width))
+
+    @staticmethod
     def area(height, width):
         """Area of a line whose continuous profile peaks at ``height``."""
         return height * width * np.pi
@@ -268,13 +296,30 @@ def _line_profile(profile):
 def _components(x, params, n, model=_Gaussian):
     """Per-component pixel-integrated line counts of ``model``, shape ``(n, len(x))``.
 
-    ``params`` = ``[b0, b1, A_0, μ_0, w_0, A_1, ...]`` (``w`` = σ or γ).
+    ``params`` = ``[b0, b1, A_0, μ_0, w_0, A_1, ...]`` (``w`` = σ or γ). All components are
+    evaluated in one broadcast call (element for element the same arithmetic as one call per
+    component).
     """
-    out = np.empty((n, x.size))
-    for k in range(n):
-        area, mu, width = params[2 + 3 * k: 5 + 3 * k]
-        out[k] = model.counts(x, area, mu, width)
-    return out
+    lines = np.asarray(params[2:2 + 3 * n], dtype=float).reshape(n, 3)
+    return model.counts(x[None, :], lines[:, 0:1], lines[:, 1:2], lines[:, 2:3])
+
+
+def _jacobian(x, x0, params, n, model=_Gaussian):
+    """Jacobian ``(len(x), 2 + 3n)`` of ``b0 + b1·(x - x0) + Σ_k P(x; A_k, μ_k, w_k)``.
+
+    Analytic (:meth:`counts` derivatives of the line model): one model evaluation instead of
+    the ``2 + 3n`` a finite-difference Jacobian needs, which made joint fits of many lines
+    (dense lamp spectra, unlisted neighbours) cost O(n²) model evaluations per iteration.
+    """
+    lines = np.asarray(params[2:2 + 3 * n], dtype=float).reshape(n, 3)
+    d_area, d_mu, d_width = model.derivatives(x[None, :], lines[:, 0:1], lines[:, 1:2], lines[:, 2:3])
+    jac = np.empty((x.size, 2 + 3 * n))
+    jac[:, 0] = 1.0
+    jac[:, 1] = x - x0
+    jac[:, 2::3] = d_area.T
+    jac[:, 3::3] = d_mu.T
+    jac[:, 4::3] = d_width.T
+    return jac
 
 
 def _is_peak(y, j) -> bool:
@@ -568,14 +613,18 @@ def measure_spectrum(spectrum, pixels: Sequence[float], *, m: Optional[float] = 
 def _fit_window(least_squares, x, y, x0, n, p0, lower, upper, model, cancel):
     """One bounded least-squares fit of ``n`` components + linear background: ``(params, success)``.
 
-    On an optimiser exception the start values are returned with ``success=False``;
-    :class:`MeasurementCancelled` is passed on.
+    The Jacobian is analytic (:func:`_jacobian`). On an optimiser exception the start values
+    are returned with ``success=False``; :class:`MeasurementCancelled` is passed on.
     """
     def residual(p):
         _check_cancel(cancel)
         return p[0] + p[1] * (x - x0) + _components(x, p, n, model).sum(axis=0) - y
+
+    def jacobian(p):
+        _check_cancel(cancel)
+        return _jacobian(x, x0, p, n, model)
     try:
-        fit = least_squares(residual, p0, bounds=(lower, upper), x_scale="jac", max_nfev=400)
+        fit = least_squares(residual, p0, jac=jacobian, bounds=(lower, upper), x_scale="jac", max_nfev=400)
         return fit.x, bool(fit.success)
     except MeasurementCancelled:
         raise

@@ -65,7 +65,8 @@ vehicle, aircraft, hand-held sweep), set in `config/scan.json`:
   `duration_s_recorded` (the time recorded: shorter after a Stop or a camera error); the
   cube's export header writes `stage type = free`, `free scan time set (s)` and
   `free scan time recorded (s)`. The number of lines is about the frame rate times the
-  recorded time. A radiometric reference is matched by stage type, so a free scan needs a
+  recorded time; the header's `line rate measured (Hz)` is the rate the recording actually
+  reached (the scene's own speed, e.g. a conveyor's, is not known to the app). A radiometric reference is matched by stage type, so a free scan needs a
   reference recorded as a free scan.
 * `stage_type` must be `rotation`, `linear` or `free` and `free_duration_s` 0.1 to 86400
   seconds; the application refuses to start with anything else in `scan.json`.

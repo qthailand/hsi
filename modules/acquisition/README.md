@@ -136,7 +136,7 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   × FWHM, at least 2 spectral pixels; `config.resolution` when there is none), `binning_info()`
   (bin width in use and its source, stored in the scan metadata), `request_snapshot(id)`, `request_processed_frame()`, `request_smile_model(path)`,
   `set_recording`, `set_scanning`, `set_keep_spectrogram`, `set_raw_inverted`,
-  `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `take_recorded_raw`,
+  `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `line_rate_info` (the line rate the frames just taken reached: `line_rate_hz`, `line_rate_source`, `frames`, `frames_missing`, `camera_hz`; also logged as `Scan line rate:`), `take_recorded_raw`,
   `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
   `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
 * `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer`, `count`, `live_frames`,

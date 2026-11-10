@@ -50,6 +50,11 @@ from modules.spectrogram_viewer.window import SpectrogramViewer
 WAVELENGTH_LIMITS_NM = (0.0, 9999.9)
 #: Title of the cube preview box; a scan appends its settings (see ScanWindow.set_scanning).
 CUBE_PREVIEW_TITLE = "Realtime Cube Preview"
+#: A scan's measured line rate below this fraction of the camera's frame rate is warned about
+#: (ScanWindow.status_line_rate_warning), once the scan has at least this many lines (a short
+#: scan's rate is too coarse: one frame of jitter is 1 / lines of it).
+LINE_RATE_WARN_FRACTION = 0.95
+LINE_RATE_WARN_MIN_FRAMES = 50
 
 
 def _format_duration(seconds: float) -> str:
@@ -317,6 +322,7 @@ class ScanWindow(QWidget):
             "sharpness": 0.0,
             "temp": -999.0,
             "camera_fps": None,
+            "line_rate": None,           # line_rate_info() of the last scan (set_line_rate)
             "calibration_warning": "",   # set for a scan started with calibration warnings
         }
 
@@ -578,6 +584,8 @@ class ScanWindow(QWidget):
                 scan_time = (f"Scan {_format_duration(elapsed)}"
                              f" / ~{_format_duration(expected)}  ·  ")
         warning = s.get("calibration_warning") or ""
+        line_rate = s.get("line_rate")
+        line = "" if not line_rate else f"Line rate {line_rate['line_rate_hz']:.1f} Hz  ·  "
         return (                     # the scan time before the (long) warnings, so it stays in view
             f"{s['state']}  ·  "
             + f"{scan_time}"
@@ -586,9 +594,29 @@ class ScanWindow(QWidget):
             f"{cam_fps}  ·  "
             f"Frame {s['frame']:,}  ·  "
             f"Recorded {s['recorded']:,}  ·  "
-            f"Y {s['y']}  ·  "
+            + line                   # the last scan's measured line rate (set_line_rate)
+            + f"Y {s['y']}  ·  "
             f"Sharpness {s['sharpness']:.1f}"
         )
+
+    def status_line_rate_warning(self) -> str:
+        """Why the measured line rate of the last scan needs attention ("" when it does not, or
+        is unknown): frames missing inside the recording, or a line rate below
+        ``LINE_RATE_WARN_FRACTION`` of the camera's own frame rate (lines then cover more of the
+        scene than the frame rate says: the image is squeezed along the scan)."""
+        info = self._status.get("line_rate")
+        if not info:
+            return ""
+        parts = []
+        camera_hz = info.get("camera_hz")
+        if (camera_hz and info.get("frames", 0) >= LINE_RATE_WARN_MIN_FRAMES
+                and info["line_rate_hz"] < LINE_RATE_WARN_FRACTION * camera_hz):
+            parts.append(f"Line rate {100.0 * info['line_rate_hz'] / camera_hz:.0f}% of camera "
+                         f"({info['line_rate_hz']:.1f} / {camera_hz:.1f} Hz)")
+        missing = info.get("frames_missing") or 0
+        if missing > 0:
+            parts.append(f"{missing:,} frames missing")
+        return "  ·  ".join(parts)
 
     def status_temperature(self):
         """Sensor temperature (°C) for the status bar's thermometer, or ``None`` when unknown."""
@@ -1149,6 +1177,12 @@ class ScanWindow(QWidget):
 
     def set_recorded_count(self, n: int):
         self._status["recorded"] = n
+
+    def set_line_rate(self, info):
+        """Measured line rate of the scan that just ended (the acquisition thread's
+        ``line_rate_info()``), shown after the recorded count; ``None`` / ``{}`` clears it
+        (a new scan, or a scan too short to measure)."""
+        self._status["line_rate"] = dict(info) if info and info.get("line_rate_hz") else None
 
     def set_selected_y_label(self, y: int):
         self._status["y"] = y

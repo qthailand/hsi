@@ -1,5 +1,5 @@
 {
-  "stage_type": "free",
+  "stage_type": "rotation",
   "rotation_speed_dps": 2.0,
   "rotation_degree": 5.0,
   "linear_distance_mm": 10.0,

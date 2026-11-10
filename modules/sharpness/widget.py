@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen
-from PyQt5.QtWidgets import QWidget, QSizePolicy
+from PyQt5.QtWidgets import QWidget, QSizePolicy, QToolButton
 
 # ── palette ─────────────────────────────────────────────────────
 _BG = QColor("#1a1a1a")
@@ -39,6 +39,7 @@ _FILL_PEAK = QColor("#81c784")
 
 _PEAK_DECAY = 0.9995          # per set_value call (~5 Hz → half-life ~2.3 min)
 _FONT_FAMILY = "monospace"
+_RESET_H = 20                 # height of the reset button at the bottom of the panel
 
 
 class SharpnessPanel(QWidget):
@@ -53,7 +54,7 @@ class SharpnessPanel(QWidget):
         │ ████████ │  ← vertical bar (score / peak)
         │ ████████ │
         │ ████████ │
-        │          │
+        │   [↺]    │  ← reset button (also: double-click the panel)
         └──────────┘
 
     The widget is 48 px wide, expands vertically (minimum 80 px) and paints itself with
@@ -78,6 +79,19 @@ class SharpnessPanel(QWidget):
         self._peak: float = 1.0
         self._scanning: bool = False
         self._has_data: bool = False
+
+        self.reset_btn = QToolButton(self)
+        self.reset_btn.setText("↺")
+        self.reset_btn.setToolTip(
+            "Reset the sharpness peak (bar scale) and start a new reading.\n"
+            "Double-clicking the panel does the same.")
+        self.reset_btn.setFocusPolicy(Qt.NoFocus)
+        self.reset_btn.setStyleSheet(
+            "QToolButton { background: #2a2a2a; color: #b0b0b0; border: 1px solid #3a3a3a;"
+            " border-radius: 3px; font-size: 12px; padding: 0px; }"
+            "QToolButton:hover { background: #3a3a3a; color: #ffffff; }"
+            "QToolButton:pressed { background: #505050; }")
+        self.reset_btn.clicked.connect(self.reset)
 
     # ── public API ──────────────────────────────────────────────
 
@@ -115,6 +129,17 @@ class SharpnessPanel(QWidget):
         self._has_data = False
         self.update()
 
+    def mouseDoubleClickEvent(self, event):
+        """Double-click resets the peak, like the reset button (Qt override)."""
+        if event.button() == Qt.LeftButton:
+            self.reset()
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event):
+        """Keep the reset button at the bottom of the panel (Qt override)."""
+        super().resizeEvent(event)
+        self.reset_btn.setGeometry(6, self.height() - _RESET_H - 4, self.width() - 10, _RESET_H)
+
     # ── paint ───────────────────────────────────────────────────
 
     def paintEvent(self, _event):
@@ -138,7 +163,7 @@ class SharpnessPanel(QWidget):
             font.setStyleHint(QFont.Monospace)
             p.setFont(font)
             p.setPen(_IDLE_TEXT)
-            p.drawText(0, 0, w, h, Qt.AlignCenter, "\u2014")  # em-dash
+            p.drawText(0, 0, w, h - _RESET_H - 8, Qt.AlignCenter, "\u2014")  # em-dash
             p.end()
             return
 
@@ -162,7 +187,7 @@ class SharpnessPanel(QWidget):
         bar_x = 8
         bar_w = w - 16
         bar_top = 50
-        bar_bottom = h - 10
+        bar_bottom = h - _RESET_H - 12
         bar_h = max(1, bar_bottom - bar_top)
 
         # bar background

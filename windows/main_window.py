@@ -231,6 +231,13 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.temp_status)
         self.temp_status.hide()
 
+        # Line rate: an orange note while the active window's last scan lost frames or ran below
+        # the camera's frame rate (``status_line_rate_warning()``)
+        self.line_rate_status = QLabel()
+        self.line_rate_status.setStyleSheet("color: #ffa726; font-weight: bold;")
+        self.statusBar().addPermanentWidget(self.line_rate_status)
+        self.line_rate_status.hide()
+
         # Pixel pitch: an orange chip while the open camera's profile has none (click to enter)
         from modules.camera import PixelPitchStatus
         self.pixel_pitch_status = PixelPitchStatus()
@@ -251,6 +258,10 @@ class MainWindow(QMainWindow):
         if temp is not None:
             self.temp_status_text.setText(f"{temp:.1f}°C")
         self.temp_status.setVisible(temp is not None)
+        line_rate = (widget.status_line_rate_warning()
+                     if hasattr(widget, "status_line_rate_warning") else "")
+        self.line_rate_status.setText(line_rate)
+        self.line_rate_status.setVisible(bool(line_rate))
         if sub is None:
             self.statusBar().showMessage("")
             return

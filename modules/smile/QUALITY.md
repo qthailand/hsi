@@ -77,6 +77,48 @@ are diagnostic work; their runtime is separate from production remapping.
 - Blends: known reference neighbors less than `resolution_nm` apart are excluded
   from single-line diagnostics. Thus 576.96/579.07 nm are excluded at 5 nm.
   Unlisted interfering lines must be marked manually with `blended=True`.
+  A *brighter* line inside the ±`half_window_px` window but more than
+  `resolution_nm` away is not excluded, and the fit starts at the window's
+  maximum: with the GUI's 32 px window, 800.6 nm next to a stronger 794.8 nm
+  (5.8 nm ≈ 20 px at 0.297 nm/px) is measured on 794.8 nm and shows a
+  wavelength error of about -6 nm. Mark such lines blended or narrow the window.
+
+## Computation
+
+`analyze_quality` fits every sampled row of one reference line in one call
+(`_peaks`; the fit window is the same for all rows):
+
+- The pre-checks of `_peak` (saturation, 4-point baseline, MAD noise, SNR,
+  peak position) run on the whole `(rows, window)` block.
+- Rows whose window holds another peak (prominence above `snr_min` × noise,
+  at least 3 px from the start) are fitted by `_peak`
+  (`scipy.optimize.least_squares`) exactly as before: with several lines in the
+  window the fit has several minima, and another optimiser path from the same
+  start may end in a different one.
+- The other rows are fitted together by a batched, bounded Levenberg-Marquardt
+  with the same model, analytic Jacobian, start values and bounds. A row is
+  kept only when that fit converged with full steps, stays clear of every bound,
+  has sigma >= 0.55 px (near the 0.35 px bound SciPy's trust region crawls and
+  can run out of `max_nfev`) and passes `_peak`'s acceptance tests; every other
+  row, i.e. every rejection, is decided by `_peak` itself.
+- Result: the accept/reject decision is SciPy's in every row (0 differences in
+  about 30 000 synthetic rows: isolated, weak, narrow, wide, edge, two-line,
+  pure-noise windows and full Hg-Ar frames); kept values agree within SciPy's
+  own tolerance (centres to 2e-4 px, FWHM to 1e-4 relative) and the batched
+  cost was never higher than SciPy's.
+- Cross-correlation is unchanged (`correlation_shift` per row).
+- Bootstrap and Smile fit: each IRLS step of `fit_surface_2d` solves the normal
+  equations with one step of iterative refinement (SVD least squares when
+  ill-conditioned); coefficients agree with the SVD solution to ~1e-13 and the
+  4σ rejections are unchanged.
+
+Timing in the widget on a 1104 × 1608 synthetic Hg-Ar frame (27 lines, 15
+references, every 8th row): Smile analysis 3.5 → 2.7 s, *Spectral Quality*
+13.0 → 10.1 s (bootstrap 7.2 → 3.5 s). The batched fit helps little on a dense
+lamp spectrum: with the 32 px window about 78 % of the rows have a neighbour
+line in the window and keep the SciPy fit (≈ 6.8 s); with isolated lines the
+fits are 7-15× faster. The rest is the per-row cross-correlation (≈ 1.4 s) and
+the 100 bootstrap surface fits.
 
 ## Conditional uncertainty
 

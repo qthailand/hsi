@@ -23,6 +23,7 @@ import numpy as np
 # np.trapezoid exists from NumPy 2.0; NumPy 1.x only has np.trapz (same result).
 _trapezoid = getattr(np, 'trapezoid', None) or np.trapz
 from scipy.optimize import least_squares, minimize_scalar
+from scipy.signal import find_peaks
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,168 @@ def _peak(profile, center, halfwin, snr_min, saturation):
     return mu, sigma*2.354820045, a, area, residual_rms
 
 
+# Batched Levenberg-Marquardt of _peaks: iteration cap; rows that need more than _LM_SLOW
+# iterations, end within 1e-6 of a bound or with sigma below _LM_MIN_SIGMA (near the 0.35 px
+# bound scipy's trust region crawls and can run out of max_nfev, i.e. reject the row) are
+# refitted by _peak itself.
+_LM_MAX_ITER = 60
+_LM_SLOW = 30
+_LM_MIN_SIGMA = 0.55
+
+
+def _peaks(profiles, center, halfwin, snr_min, saturation):
+    """:func:`_peak` for every row of ``profiles`` at once: ``(n_rows, 5)`` array.
+
+    Columns ``(mu, fwhm_px, amplitude, area, residual_rms)``; a row :func:`_peak` would
+    reject is all NaN. The window is the same for every row (it depends only on
+    ``center``), so the pre-checks (saturation, 4-point baseline, MAD noise, SNR, peak
+    position) are evaluated on the whole ``(rows, window)`` block, and the Gaussian +
+    linear-background fits run as one batched, bounded Levenberg-Marquardt (same model,
+    analytic Jacobian, start values and bounds as :func:`_peak`). It converges to the same
+    minimum as scipy's trust-region fit (differences below scipy's own ``ftol``/``xtol``,
+    ~1e-3 of the fit's statistical uncertainty); rows whose solution touches a bound, that
+    converge slowly or not at all are handed to :func:`_peak`, so edge cases get exactly
+    the scipy result. The acceptance tests are those of :func:`_peak`.
+    """
+    profiles = np.asarray(profiles, dtype=float)
+    n_rows = profiles.shape[0]
+    out = np.full((n_rows, 5), np.nan)
+    lo = max(0, int(np.floor(center)) - halfwin)
+    hi = min(profiles.shape[1], int(np.floor(center)) + halfwin + 1)
+    x = np.arange(lo, hi, dtype=float)
+    V = profiles[:, lo:hi]
+    if x.size < 9 or n_rows == 0:
+        return out
+    ok = np.ones(n_rows, dtype=bool)
+    if saturation is not None:
+        ok &= ~(V.max(axis=1) >= saturation)
+    origin = x.mean()
+    xo = x - origin
+    edge = [0, 1, -2, -1]
+    slope, intercept = np.polyfit(xo[edge], V[:, edge].T, 1)       # one fit per row (columns)
+    signal = V - (slope[:, None] * xo + intercept[:, None])
+    amplitude = signal.max(axis=1)
+    d = np.diff(V, axis=1)
+    noise = np.median(np.abs(d - np.median(d, axis=1)[:, None]), axis=1) / 0.67449 / np.sqrt(2)
+    noise = np.maximum(noise, np.finfo(float).eps * np.maximum(1., np.abs(V).max(axis=1)))
+    ok &= ~(amplitude <= snr_min * noise)
+    peak = x[np.argmax(signal, axis=1)]
+    ok &= (peak > x[1]) & (peak < x[-2])
+    # Rows with another peak in the window (prominence above snr_min·noise, >= 3 px from the
+    # start) can have several minima; scipy's trust region and a Levenberg-Marquardt path from
+    # the same start may end in different ones, so those rows go to _peak directly.
+    crowded = np.zeros(n_rows, dtype=bool)
+    for row in np.flatnonzero(ok):
+        found, _ = find_peaks(signal[row], prominence=snr_min * noise[row])
+        crowded[row] = np.any(np.abs(x[found] - peak[row]) >= 3)
+    scipy_rows = np.flatnonzero(ok & crowded)
+    rows = np.flatnonzero(ok & ~crowded)
+    if not rows.size:
+        return _scipy_rows(out, profiles, scipy_rows, center, halfwin, snr_min, saturation)
+
+    lower = np.array([0., x[1], 0.35, -np.inf, -np.inf])
+    upper = np.array([np.inf, x[-2], halfwin / 2, np.inf, np.inf])
+    P = np.column_stack([amplitude[rows], peak[rows], np.full(rows.size, max(1., halfwin / 4)),
+                         intercept[rows], slope[rows]])
+    Vr = V[rows]
+
+    def evaluate(P, data):
+        a, mu, sigma = P[:, 0:1], P[:, 1:2], P[:, 2:3]
+        z = (x - mu) / sigma
+        e = np.exp(-0.5 * z * z)
+        r = a * e + P[:, 3:4] + P[:, 4:5] * xo - data               # _gaussian_residual
+        J = np.empty(r.shape + (5,))                                 # _gaussian_jacobian
+        J[..., 0] = e
+        J[..., 1] = a * e * z / sigma
+        J[..., 2] = a * e * z * z / sigma
+        J[..., 3] = 1.0
+        J[..., 4] = xo
+        return r, J
+
+    r, J = evaluate(P, Vr)
+    cost = 0.5 * np.einsum('nm,nm->n', r, r)
+    lam = np.full(rows.size, 1e-3)
+    active = np.ones(rows.size, dtype=bool)
+    converged = np.zeros(rows.size, dtype=bool)
+    iterations = np.zeros(rows.size, dtype=int)
+    eye = np.eye(5)
+    for _ in range(_LM_MAX_ITER):
+        idx = np.flatnonzero(active)
+        if not idx.size:
+            break
+        Ja, ra = J[idx], r[idx]
+        H = np.einsum('nmk,nml->nkl', Ja, Ja)
+        g = np.einsum('nmk,nm->nk', Ja, ra)
+        diag = np.einsum('nkk->nk', H)
+        diag = np.maximum(diag, 1e-12 * diag.max(axis=1, keepdims=True) + 1e-300)   # never singular
+        damped = H + lam[idx, None, None] * diag[:, :, None] * eye
+        try:
+            step = np.linalg.solve(damped, -g[..., None])[..., 0]
+        except np.linalg.LinAlgError:                                 # left to scipy
+            break
+        # Stay strictly inside the bounds like scipy's trust-region-reflective fit: shorten the
+        # step to 95 % of the way to the nearest bound it would cross (clipping onto a bound
+        # can lock a line at zero amplitude, where the centre and width lose their gradient).
+        current = P[idx]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            reach = np.where(step > 0, (upper - current) / step,
+                             np.where(step < 0, (lower - current) / step, np.inf))
+        factor = np.minimum(1.0, 0.95 * reach.min(axis=1))
+        full = factor >= 1.0                    # the step was not shortened by a bound
+        trial = current + factor[:, None] * step
+        r_new, J_new = evaluate(trial, Vr[idx])
+        cost_new = 0.5 * np.einsum('nm,nm->n', r_new, r_new)
+        iterations[idx] += 1
+        better = np.isfinite(cost_new) & (cost_new < cost[idx])
+        take = idx[better]
+        decrease = cost[take] - cost_new[better]
+        relative = np.max(np.abs(trial - current) / (np.abs(current) + 1e-12), axis=1)
+        moved = relative[better]
+        # Only a FULL Gauss-Newton step (small damping, not shortened by a bound) that no longer
+        # lowers the cost, or lowers it by < 1e-14 / moves < 1e-12 relative, means "at the
+        # minimum": a step cut short near a bound is tiny for that reason alone.
+        taken = trial - current
+        predicted = -np.einsum('nk,nk->n', g, taken) - 0.5 * np.einsum('nk,nkl,nl->n', taken, H, taken)
+        rejected = idx[~better]
+        flat = (relative[~better] <= 1e-10) | (predicted[~better] <= 1e-13 * cost[rejected])
+        converged[rejected[(lam[rejected] <= 1e-3) & full[~better] & flat]] = True
+        gauss_newton = (lam[take] <= 1e-3) & full[better]
+        P[take], r[take], J[take], cost[take] = trial[better], r_new[better], J_new[better], cost_new[better]
+        lam[take] = np.maximum(lam[take] / 10., 1e-12)
+        lam[idx[~better]] *= 10.
+        done = gauss_newton & ((decrease <= 1e-14 * cost[take]) | (moved <= 1e-12))
+        converged[take[done]] = True
+        stuck = rejected[(lam[rejected] > 1e10) & full[~better]]     # no full step lowers the cost
+        converged[stuck] = True
+        active &= ~converged
+
+    a, mu, sigma = P[:, 0], P[:, 1], P[:, 2]
+    tolerance = 1e-6 * (1 + np.abs(np.where(np.isfinite(lower), lower, 0)))
+    near_lower = np.isfinite(lower) & (P - lower <= tolerance)
+    tolerance = 1e-6 * (1 + np.abs(np.where(np.isfinite(upper), upper, 0)))
+    near_upper = np.isfinite(upper) & (upper - P <= tolerance)
+    at_bound = np.any(near_lower | near_upper, axis=1)
+    rms = np.sqrt(np.mean(r * r, axis=1))
+    accept = converged & ~at_bound & (iterations <= _LM_SLOW) & (sigma >= _LM_MIN_SIGMA) \
+        & (mu - 3 * sigma >= x[0]) & (mu + 3 * sigma <= x[-1]) \
+        & ~(a / np.maximum(noise[rows], rms) < snr_min)
+    area = _trapezoid(Vr - P[:, 3:4] - P[:, 4:5] * xo, x, axis=1)
+    out[rows[accept]] = np.column_stack([mu, sigma * 2.354820045, a, area, rms])[accept]
+    # Every row the batched fit does not accept cleanly gets the scipy fit itself: a rejection is
+    # always scipy's own decision.
+    scipy_rows = np.concatenate([scipy_rows, rows[~accept]])
+    return _scipy_rows(out, profiles, scipy_rows, center, halfwin, snr_min, saturation)
+
+
+def _scipy_rows(out, profiles, rows, center, halfwin, snr_min, saturation):
+    """Fill ``out[rows]`` with :func:`_peak` (NaN where it rejects) and return ``out``."""
+    for row in rows:
+        fit = _peak(profiles[row], center, halfwin, snr_min, saturation)
+        if fit is not None:
+            out[row] = fit
+    return out
+
+
 def correlation_shift(reference, target, max_shift_px=5., min_score=0.8):
     """Return target displacement in pixels and normalized correlation score.
 
@@ -273,15 +436,15 @@ def analyze_quality(before, after, references, *, m_nm_per_px, c_nm,
             lo = max(0, int(ref.column_px)-ref.half_window_px)
             hi = min(frame.shape[1], int(ref.column_px)+ref.half_window_px+1)
             reference_profile = frame[y_ref, lo:hi]
-            for i, y in enumerate(rows):
-                fit = _peak(frame[y], ref.column_px, ref.half_window_px, snr_min, saturation)
-                if fit is not None:
-                    mu, width, amplitude, area, rms = fit
-                    for k, value in zip(keys[:6], [mu, m_nm_per_px*mu+c_nm-ref.wavelength_nm,
-                                                  abs(m_nm_per_px)*width, amplitude, area, rms]):
-                        data[k][i, j] = value
-                bound = min(5., (hi-lo-5)/4)
-                if bound > 0:
+            # Gaussian fits of every row of this line at once (same window), see _peaks
+            fits = _peaks(frame[rows], ref.column_px, ref.half_window_px, snr_min, saturation)
+            mu, width = fits[:, 0], fits[:, 1]
+            for k, value in zip(keys[:6], [mu, m_nm_per_px*mu+c_nm-ref.wavelength_nm,
+                                          abs(m_nm_per_px)*width, fits[:, 2], fits[:, 3], fits[:, 4]]):
+                data[k][:, j] = value
+            bound = min(5., (hi-lo-5)/4)
+            if bound > 0:
+                for i, y in enumerate(rows):
                     shift, score = correlation_shift(reference_profile, frame[y, lo:hi], bound)
                     data['correlation_shift_px'][i, j] = shift
                     data['correlation_score'][i, j] = score

@@ -99,6 +99,17 @@ its unchanged value (Enter in a spin box) keeps the result.
   window's background by more than 0.1 × noise beyond a straight line, the window is fitted
   again with them subtracted (`FitWindow.wings`; a strong line 10–12 FWHM away biased a weak
   one by −4 to −6.5 %).
+* **Optimiser**: `scipy.optimize.least_squares` (trust-region reflective, bounded) with the
+  *analytic* Jacobian of the model (`_Gaussian.derivatives` / `_Lorentzian.derivatives`), all
+  components evaluated in one broadcast call. A finite-difference Jacobian costs `2 + 3n`
+  model evaluations per iteration for `n` lines, so joint fits in dense spectra grew as n²;
+  the analytic one made a 69-block, 15-line frame ≈ 4× faster (Gaussian 17.8 → 4.5 s,
+  Lorentzian 11.9 → 2.8 s) with the same widths (recorded cases agree to 1e-11; in 549 joint
+  fits of synthetic lamp spectra 541 ended at the same cost, 6 lower, 2 higher by < 1e-5).
+  An ill-posed joint fit can still end in a different local minimum: a Gaussian fitted to
+  crowded Lorentzian lines, where an unlisted neighbour widened to its bound to take up the
+  wings, moved one width by 0.8 %. The remaining time is mostly the optimiser's own linear
+  algebra.
 * **Baseline** (optional, default *None*): estimated on each block's averaged spectrum over
   that block's usable columns only (the columns holding data in all of its rows, within
   `valid_columns`; the border keeps a zero baseline) and subtracted before fitting; the fit
@@ -161,7 +172,8 @@ Profile Gaussian, baseline None, fit window auto (3 × / 5 × FWHM), rows per bl
 without a smile model), saturation auto (from the image's bit depth), Min SNR 10, Min
 prominence 20 × noise, Min distance 3 px. With profile Gaussian and baseline None,
 `measure_spectrum` / `measure_frame` return the results of the version before profiles and
-baselines existed, bit for bit, except where that version was wrong: a start that moved onto a
+baselines existed (bit for bit until the analytic Jacobian; since then to ≈ 1e-11, the
+optimiser's path differing by rounding), except where that version was wrong: a start that moved onto a
 stronger neighbour's flank, a first width taken around a neighbour (lines rejected as
 `outside`), a centre ended on its bound reported as `ok`, and columns zero-filled in only some
 rows of a frame. These occur only in crowded spectra or at a curved smile border: 42 of 44

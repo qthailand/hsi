@@ -808,7 +808,8 @@ class ScanController:
                          "sensor_pixel_pitch_um", "raw_inverted", "exposure_ms", "gain", "camera_bin",
                          "resolution_nm", "stage_type",
                          "speed_um_s", "speed_um_s_achieved", "degree_per_second",
-                         "degree_per_second_achieved", "duration_s", "duration_s_recorded")
+                         "degree_per_second_achieved", "duration_s", "duration_s_recorded",
+                         "line_rate_hz", "line_rate_source", "frames_missing", "along_track_step_um")
 
     def _scan_header_metadata(self) -> dict:
         """Export-header metadata of the scan that just ended (see ``HypercubeWriter``):
@@ -1329,6 +1330,7 @@ class ScanController:
         self.session.begin()
         gc.collect()
         self.win.set_recorded_count(0)
+        self.win.set_line_rate(None)            # the last scan's, until this one ends
         self._set_recording(False)
         # Frame-by-frame radiometric calibration: the reference is chosen now, for the whole scan,
         # and latched with the recording (all frames reflectance, or all counts).
@@ -1604,6 +1606,32 @@ class ScanController:
         end = getattr(stage, "motion_end_ns", None) or time.perf_counter_ns()
         return round(max(0.0, (end - start) / 1e9), 3)
 
+    def _take_line_rate(self):
+        """The line rate the scan just taken reached, as ``(info, metadata)``.
+
+        ``info`` is the acquisition thread's ``line_rate_info()`` (``{}`` when unknown), for the
+        status bar. ``metadata`` are the scan-metadata / cube-header keys from it:
+        ``line_rate_hz``, ``line_rate_source``, ``frames_missing`` (camera timestamps only) and,
+        for a linear stage scan, ``along_track_step_um`` = stage speed (achieved, else set) /
+        line rate: the along-track size of one line. A free scan has no known speed, so no step.
+        """
+        try:
+            info = dict(self.preview_thread.line_rate_info() or {})
+        except Exception:
+            logger.debug("Line rate of the scan unavailable", exc_info=True)
+            return {}, {}
+        rate = info.get("line_rate_hz")
+        if not rate:
+            return {}, {}
+        meta = {key: info[key] for key in ("line_rate_hz", "line_rate_source", "frames_missing")
+                if info.get(key) is not None}
+        raw = getattr(self, "_raw_metadata", None) or {}
+        if getattr(self.stage, "stage_type", None) == "linear":
+            speed = raw.get("speed_um_s_achieved") or raw.get("speed_um_s")
+            if speed:
+                meta["along_track_step_um"] = float(speed) / float(rate)
+        return info, meta
+
     def on_stage_finished(self):
         # v1 behavior: build the cube as soon as the scan move ends (endpoint or
         # manual stop). Return-home continues in the stage thread; start_scan
@@ -1697,8 +1725,10 @@ class ScanController:
         images = self.preview_thread.take_recorded_frames(
             *window, reference_ns=getattr(self.stage, 'motion_start_ns', None))
         recorded_s = self._free_scan_recorded_seconds()     # the recorder has just been disarmed
+        line_rate, line_rate_metadata = self._take_line_rate()     # of the kept frames
         raw = self.preview_thread.take_recorded_raw()
         self.win.set_recorded_count(len(images))     # the frames kept for the cube (after the trim)
+        self.win.set_line_rate(line_rate)
 
         # ── temperatures of this scan (cube header / spectrogram metadata) ──
         try:
@@ -1713,6 +1743,7 @@ class ScanController:
             self._raw_metadata.update(range_metadata)
             if recorded_s is not None:
                 self._raw_metadata["duration_s_recorded"] = recorded_s
+            self._raw_metadata.update(line_rate_metadata)
         self.last_scan_header = self._scan_header_metadata()
         # the saturation ceiling that applied to this scan (settings are locked while scanning; a
         # later dark / exposure / Smile change replaces the live one): a radiometric reference made

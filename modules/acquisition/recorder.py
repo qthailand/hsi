@@ -23,8 +23,60 @@ Threading:
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
+
+#: A gap between two frames longer than this many median frame intervals counts as missing frames.
+MISSING_GAP_FACTOR = 1.5
+
+
+def _rate_hz(stamps):
+    """Frames per second from the first to the last of ``stamps`` (ns, in order), or ``None``
+    when there are fewer than two, one is unknown or they do not increase."""
+    if len(stamps) < 2 or any(s is None for s in stamps):
+        return None
+    if any(b <= a for a, b in zip(stamps, stamps[1:])):
+        return None
+    return (len(stamps) - 1) * 1e9 / (stamps[-1] - stamps[0])
+
+
+def line_rate_stats(camera_stamps, host_stamps=()) -> dict:
+    """The line rate a recording actually reached, from the times of its frames.
+
+    This is the number of frames that ended up in the recording per second, which is what
+    sets the along-track size of a pushbroom pixel. It is lower than the camera's own frame
+    rate when frames were lost between the sensor and the recorder.
+
+    Args:
+        camera_stamps: Camera time of every kept frame (ns, in order; ``None`` = unknown).
+        host_stamps: Host ``time.perf_counter_ns()`` of the same frames, used when the
+            camera times are not all known and increasing.
+
+    Returns:
+        dict: ``{}`` when the rate is unknown (fewer than two timed frames), else
+
+        * ``line_rate_hz``: ``(frames - 1) / (last time - first time)``.
+        * ``line_rate_source``: ``'camera timestamps'`` or ``'host time'``.
+        * ``frames``: Number of frames the rate was measured over.
+        * ``frames_missing`` (camera timestamps only): Frames estimated missing inside the
+          recording: every gap longer than :data:`MISSING_GAP_FACTOR` median intervals counts
+          as ``round(gap / median) - 1`` frames. A camera that loses most of its frames
+          evenly (e.g. every second one) is not detected this way: compare ``line_rate_hz``
+          with the camera's frame rate instead.
+    """
+    camera_stamps, host_stamps = list(camera_stamps), list(host_stamps)
+    rate = _rate_hz(camera_stamps)
+    if rate is not None:
+        gaps = np.diff(np.asarray(camera_stamps, dtype=np.float64))
+        ratio = gaps / float(np.median(gaps))
+        missing = int(np.sum(np.rint(ratio[ratio > MISSING_GAP_FACTOR]) - 1))
+        return {'line_rate_hz': rate, 'line_rate_source': 'camera timestamps',
+                'frames': len(camera_stamps), 'frames_missing': missing}
+    rate = _rate_hz(host_stamps)
+    if rate is not None:
+        return {'line_rate_hz': rate, 'line_rate_source': 'host time', 'frames': len(host_stamps)}
+    return {}
 
 
 def _inside(stamp, window):
@@ -46,6 +98,7 @@ class ScanRecorder:
         self._frames: list = []
         self._raw: list = []
         self._stamps: list = []         # camera time (ns or None) of each binned frame
+        self._host_stamps: list = []    # host perf_counter_ns when each binned frame was offered
         self._raw_stamps: list = []     # ... and of each raw frame
         self._min_stamp = None          # frames stamped earlier are not recorded (set_min_stamp)
         self._live_dropped = 0          # ... and how many were refused so far
@@ -56,6 +109,8 @@ class ScanRecorder:
         self.last_live_dropped = 0      # frames refused by offer before the last take_frames
         # (first stamp, last stamp, frames without a stamp, frames) of the last take_frames
         self.last_stamps = (None, None, 0, 0)
+        # line_rate_stats of the frames the last take_frames kept ({} = unknown)
+        self.last_line_rate: dict = {}
 
     @property
     def enabled(self) -> bool:
@@ -80,6 +135,7 @@ class ScanRecorder:
                 self._frames = []
                 self._raw = []
                 self._stamps = []
+                self._host_stamps = []
                 self._raw_stamps = []
                 self._min_stamp = None
                 self._live_dropped = 0
@@ -130,11 +186,14 @@ class ScanRecorder:
         Returns:
             list: The kept binned frames, in order: the :meth:`live_frames` list itself
             when nothing is dropped, else a new list (``last_trim`` gives the counts
-            dropped, ``last_stamps`` the first/last camera time of all recorded frames).
+            dropped, ``last_stamps`` the first/last camera time of all recorded frames,
+            ``last_line_rate`` the :func:`line_rate_stats` of the kept frames).
         """
         with self._lock:
             self._enabled = False
             frames, stamps, self._frames, self._stamps = self._frames, self._stamps, [], []
+            host, self._host_stamps = self._host_stamps, []
+            self.last_line_rate = line_rate_stats(stamps, host)     # of all frames, unless trimmed
             self.last_trim = (0, 0)
             self.last_live_dropped, self._live_dropped = self._live_dropped, 0
             known = [s for s in stamps if s is not None]
@@ -149,6 +208,8 @@ class ScanRecorder:
             if all(s is not None for s in self._raw_stamps):
                 self._raw = [r for r, s in zip(self._raw, self._raw_stamps) if _inside(s, window) == 0]
             self._raw_stamps = []
+            self.last_line_rate = line_rate_stats([s for s, k in zip(stamps, keep) if k == 0],
+                                                  [h for h, k in zip(host, keep) if k == 0])
             return [f for f, k in zip(frames, keep) if k == 0]
 
     def take_raw(self) -> list:
@@ -177,6 +238,7 @@ class ScanRecorder:
         :attr:`factor_error` (the recording is then mixed: the caller must not take it as
         multiplied).
         """
+        offered_ns = time.perf_counter_ns()
         with self._lock:
             if not self._enabled:
                 return False
@@ -199,6 +261,7 @@ class ScanRecorder:
                 return False                    # disarmed (or re-armed) meanwhile
             self._frames.append(frame)
             self._stamps.append(stamp)
+            self._host_stamps.append(offered_ns)
             if keep_raw:
                 self._raw.append(raw_frame.copy())
                 self._raw_stamps.append(stamp)

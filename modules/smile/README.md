@@ -139,6 +139,16 @@ engine: do not mutate it from several threads. `SmileRuntime` is single-threaded
 frame-loop thread). The widget must be used from the GUI thread; it runs analysis and quality
 diagnostics in `QThread` workers and waits for them in `closeEvent`.
 
+## Performance
+
+`fit_surface_2d` solves each IRLS step through the normal equations (SVD least squares only when
+ill-conditioned; coefficients agree to ~1e-14), which speeds up the leave-one-line-out
+cross-validation and the 100-repeat bootstrap. `analyze_quality` fits and cross-correlates all
+sampled rows of a line in one batch (see `QUALITY.md`, *Computation*). On a 1104 × 1608 frame: Smile
+analysis ≈ 2.1 s, Spectral Quality ≈ 7 s (was 3.2 s and ≈ 14 s). Line tracing stays row by row
+(each row's window follows the previous row; vectorising over lines with different window widths was
+slower and could not keep the float32 sums bit-identical).
+
 ## Tests
 
 `python -m pytest -q modules/smile tests/test_smile_runtime.py tests/test_smile_wavelength_profile.py tests/test_module_contract.py`

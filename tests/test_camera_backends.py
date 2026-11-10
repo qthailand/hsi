@@ -195,22 +195,45 @@ class _Buffer:
     def __exit__(self, *exc): return False
 
 
+def _mono12packed(values):
+    """GigE Vision Mono12Packed bytes of 12-bit ``values`` (h, w): b0 = p0[11:4], b1 = p1[3:0] << 4 | p0[3:0], b2 = p1[11:4]."""
+    p0, p1 = values[:, 0::2].astype(np.uint16), values[:, 1::2].astype(np.uint16)
+    packed = np.empty((values.shape[0], values.shape[1] // 2, 3), np.uint8)
+    packed[..., 0], packed[..., 1], packed[..., 2] = p0 >> 4, ((p1 & 0xF) << 4) | (p0 & 0xF), p1 >> 4
+    return packed.tobytes()
+
+
+class _RawBuffer:
+    """What harvesters' ``fetch(is_raw=True)`` returns: a GenTL buffer (here Mono12Packed only)."""
+    def __init__(self, acquirer, values):
+        self.parent, self.frame_id = acquirer, acquirer.count
+        self.height, self.width = values.shape
+        self.raw_buffer = _mono12packed(values)
+
+
 class _Acquirer:
     def __init__(self):
         self.nodes, self.count, self.running = _NodeMap(), 0, False
         self.remote_device = SimpleNamespace(node_map=self.nodes)
+        self.queued = 0
 
     def start(self): self.running = True
     def stop(self): self.running = False
     def destroy(self): pass
 
-    def fetch(self, timeout=0):
+    def queue_buffer(self, raw): self.queued += 1
+
+    def fetch(self, timeout=0, is_raw=False):
         assert self.running, 'acquisition not started'
         self.last_timeout = timeout
         self.count += 1
         value = getattr(self, 'fixed_value', None)
-        return _Buffer(self.nodes.n['Height'].value, self.nodes.n['Width'].value,
-                       self.count % 255 if value is None else value, self.nodes.n['PixelFormat'].value)
+        h, w = self.nodes.n['Height'].value, self.nodes.n['Width'].value
+        if is_raw:                                  # a varied 12-bit pattern, kept for the test to compare
+            y, x = np.mgrid[0:h, 0:w]
+            self.last_values = ((y * 7 + x * 13 + self.count) % 4096).astype(np.uint16)
+            return _RawBuffer(self, self.last_values)
+        return _Buffer(h, w, self.count % 255 if value is None else value, self.nodes.n['PixelFormat'].value)
 
 
 class _Harvester:
@@ -431,4 +454,23 @@ def test_genicam_fetch_timeout_is_passed_to_harvesters_in_seconds(genicam):
     camera.start_stream()
     assert camera.read_frame_raw(timeout_ms=100) is not None
     assert camera._ia.last_timeout == 0.1                     # harvesters' fetch(timeout) is in s
+    camera.close()
+
+
+def test_genicam_mono12packed_is_unpacked_from_the_raw_buffer(genicam):
+    """fxo992: Mono12Packed is fetched raw and unpacked in one pass (harvesters' own expansion
+    takes 7-10 ms per 1024 x 1280 frame and capped the reader below the camera's frame rate)."""
+    camera = genicam()
+    camera.open()
+    camera._nm.n['PixelFormat']._v = 'Mono12Packed'
+    camera._refresh_info()
+    camera.start_stream()
+    frame = camera.read_frame_raw(timeout_ms=100)
+    np.testing.assert_array_equal(frame, camera._ia.last_values << 4)          # 12 bits -> 16-bit scale
+    buffer = np.zeros(frame.shape, np.uint16)
+    assert camera.read_frame_raw_into(lambda shape: buffer, timeout_ms=100) is buffer
+    np.testing.assert_array_equal(buffer, camera._ia.last_values << 4)
+    assert camera._ia.queued == 2                                               # each buffer back to the pool
+    assert camera.last_frame_info[1] == 2 and camera.last_fetch_timing is not None
+    assert camera._ia.last_timeout == 0.1
     camera.close()
