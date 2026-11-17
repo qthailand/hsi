@@ -1,1 +1,0 @@
-Apply this overlay to the latest HSI build after the fetch/dark profiler patch. Restart the application/kernel. CUDA capability logs appear before MainWindow/camera startup. This patch detects capability only; image processing remains CPU.
