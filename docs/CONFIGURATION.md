@@ -1,9 +1,9 @@
-# Split configuration — single source of truth
+# Configuration — single source of truth
 
-Install over the latest HSI wavelength calibration update. The archive includes
-all required new settings with values from the original supplied HSI configuration.
-If you customized settings locally, set those values in the new files before
-launching. Delete the old backend.json; no runtime code reads or falls back to it.
+Settings are split into one JSON file per concern under `config/`, plus the wavelength
+calibration files under `calibration/wavelength/`. The old `backend.json` is not used: no
+runtime code reads or falls back to it. (How this layout came about:
+[HISTORY.md](HISTORY.md), patch 4.)
 
 config/app.json: format version, section filenames, baseline wavelength file,
 and the selected persistent wavelength profile.
@@ -77,6 +77,3 @@ is retained, without additional bin-center offsets.
 To clear an incompatible default, set active_wavelength to null in app.json;
 the explicit base.json calibration is then used. This does not restore a legacy file.
 
-Validation: 66 passed, 1 skipped (including persistence, restart, incompatibility,
-manifest-write failure and absence of old configuration references).
-Physical camera and production-PC FPS remain to be verified locally.

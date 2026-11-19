@@ -545,6 +545,9 @@ class ScanController:
             save_reference_btn = getattr(self.win, "save_reference_btn", None)   # absent on test windows
             if save_reference_btn is not None:
                 save_reference_btn.setEnabled(False)
+            save_flatfield_btn = getattr(self.win, "save_flatfield_btn", None)
+            if save_flatfield_btn is not None:
+                save_flatfield_btn.setEnabled(False)
             self.last_scan_saturation_ceiling = None    # belonged to the cube being replaced
             clear_calibration = getattr(self.win, "clear_scan_calibration", None)   # absent on test windows
             if clear_calibration is not None:

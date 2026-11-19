@@ -470,6 +470,99 @@ def _rowwise_factors(read_box, n_bands, H, W, wl, ref_excel, avg_window_size, ma
             'reference': reference}
 
 
+def compute_flatfield_factors_array(cube, wavelengths, ref_excel, mask, flatfield,
+                                    progress_callback=None, source_name='in-memory cube'):
+    """Row-wise factors from a small reference target and a flat-field profile of the slit.
+
+    The flat-field profile ``F(row, band)`` (``modules.flatfield.compute_flatfield``) carries how
+    the response changes along the slit; the reference target only gives the scale per band, so
+    its ROI may cover a few slit rows (a Spectralon disc). With ``c`` the ROI counts::
+
+        scale[band]        = R_ref[band] / mean over the ROI of (c / F[row, band])
+        factors[row, band] = scale[band] / F[row, band]
+
+    Unlike :func:`compute_rowwise_factors_array`, rows outside the ROI are calibrated with their
+    own measured response instead of the nearest ROI row's.
+
+    Args:
+        cube: ``(lines, samples, bands)`` scan of the reference target, dark-subtracted counts.
+        wavelengths: Band centres in nm, one per band.
+        ref_excel: Reflectance table of the reference target.
+        mask: Boolean ROI ``(lines, samples)`` on the target.
+        flatfield: Flat-field profile ``(lines, bands)``, finite and positive.
+        progress_callback: Called with ``0`` and then the number of bands done.
+        source_name: Name recorded as ``reflectance_reference_cube`` in ``reference``.
+
+    Returns:
+        dict: As :func:`rowwise_calculation_heavy_logic` (``window_fit`` is ``'flatfield'``), plus
+        ``scale`` float64 ``(bands,)``. Bands outside the reflectance table, or without positive
+        ROI counts, have NaN factors.
+
+    Raises:
+        ValueError: Wrong shapes, an empty ROI, or a profile that is not finite and positive.
+    """
+    progress_callback = progress_callback or (lambda value: None)
+    if getattr(cube, 'ndim', None) != 3:
+        raise ValueError(f'cube must be (lines, samples, bands), got shape {getattr(cube, "shape", None)}')
+    H, W, n_bands = cube.shape
+    wl = np.asarray(wavelengths, dtype=np.float64).ravel()
+    if wl.size != n_bands:
+        raise ValueError(f'{wl.size} wavelengths for a cube of {n_bands} bands')
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != (H, W):
+        raise ValueError('ROI mask shape does not match reference image.')
+    rows = np.where(mask.any(axis=1))[0]
+    if len(rows) == 0:
+        raise ValueError('Selected ROI does not cover any pixels.')
+    flat = np.asarray(flatfield, dtype=np.float64)
+    if flat.shape != (H, n_bands):
+        raise ValueError(f'Flat-field profile {flat.shape} does not fit this cube ({H} rows, {n_bands} bands): '
+                         'make one at the same camera setting.')
+    if not np.all(np.isfinite(flat)) or np.any(flat <= 0):
+        raise ValueError('The flat-field profile must be finite and positive everywhere.')
+    R_ref, table_range = reflectance_at(ref_excel, wl)
+    out_of_range = int(np.count_nonzero(~np.isfinite(R_ref)))
+
+    cols = np.where(mask.any(axis=0))[0]
+    r0, r1, c0, c1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1
+    box_mask = mask[r0:r1, c0:c1]
+    roi_mean = np.full(n_bands, np.nan, dtype=np.float64)
+    scale = np.full(n_bands, np.nan, dtype=np.float64)
+    no_signal = 0
+    progress_callback(0)
+    for i in range(n_bands):
+        box = np.asarray(cube[r0:r1, c0:c1, i], dtype=np.float64)
+        valid = box_mask & np.isfinite(box)
+        n_valid = int(valid.sum())
+        if n_valid:
+            row_sum = np.where(valid, box, 0.0).sum(axis=1)
+            roi_mean[i] = row_sum.sum() / n_valid
+            evened = (row_sum / flat[r0:r1, i]).sum() / n_valid
+            if evened > 0:
+                scale[i] = float(R_ref[i]) / evened
+        if not np.isfinite(scale[i]) and np.isfinite(R_ref[i]):
+            no_signal += 1
+        progress_callback(i + 1)
+    factors = (scale[None, :] / flat).astype(np.float32)
+
+    reference = {
+        'reflectance_reference': os.path.basename(str(ref_excel)),
+        'reflectance_reference_cube': source_name,
+        'reflectance_reference_rows': f'{int(rows[0])}-{int(rows[-1])}',
+    }
+    warnings = []
+    if out_of_range:
+        warnings.append(f'{out_of_range} bands outside the reference table '
+                        f'({table_range[0]:g}-{table_range[1]:g} nm) have no reflectance (NaN)')
+    if no_signal:
+        warnings.append(f'{no_signal} bands without positive reference counts have no reflectance (NaN)')
+    if warnings:
+        reference['calibration_warnings'] = '; '.join(warnings)
+    return {'factors': factors, 'span': (int(rows[0]), int(rows[-1])), 'out_of_range_bands': out_of_range,
+            'table_range_nm': table_range, 'roi_mean_spectrum': roi_mean, 'window_fit': 'flatfield',
+            'scale': scale, 'reference': reference}
+
+
 def apply_rowwise_factors(cube, factors, factor_wavelengths=None, wavelengths=None, rows_per_chunk=64,
                           progress_callback=None):
     """Calibrate a cube held in memory with row-wise factors: ``cube * factors[:, None, :]``.

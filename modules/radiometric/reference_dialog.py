@@ -48,6 +48,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import inspect
 import math
 import os
 from typing import List, Optional
@@ -63,7 +64,8 @@ from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, Q
                              QPushButton, QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from . import roi_tools as rt
-from .core import compute_rowwise_factors_array, list_reflectance_profiles, reflectance_at
+from .core import (compute_flatfield_factors_array, compute_rowwise_factors_array, list_reflectance_profiles,
+                   reflectance_at)
 from .reference import ReferenceKey, scan_temperature_c
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,8 @@ SELF_CHECK_RMS_PERCENT = 0.5
 SELF_CHECK_ROW_PERCENT = 1.0
 #: Rows with fewer ROI pixels do not decide the worst-row self-check (their own noise would).
 SELF_CHECK_MIN_ROW_PX = 20
+#: End of the ROI check's warning for an ROI that does not span the slit (``roi_tools.assess_roi``).
+_HELD_ROWS = ": rows outside get the factors of the nearest ROI rows"
 #: Automatic averaging window: the fewest rows giving about this many ROI pixels per factor
 #: (pixel scatter 2 % -> 0.09 % factor noise).
 AUTO_WINDOW_PIXELS = 500
@@ -104,6 +108,10 @@ class RadiometricReferenceDialog(QDialog):
         saturation_ceiling: Optional ``(lines, bands)`` saturated-pixel value of the scan.
         parent: Parent widget.
         profiles: Reflectance tables to offer (default: ``list_reflectance_profiles()``).
+        flatfield_store: Optional store of flat-field profiles (``modules.flatfield.FlatFieldStore``,
+            anything with ``find(key)``). When it has a profile for the scan's camera setting, the
+            factors can be fitted with it (:func:`~modules.radiometric.core.compute_flatfield_factors_array`):
+            a target covering a few slit rows (a Spectralon disc) then calibrates the whole slit.
 
     Signals:
         reference_saved(object): the stored ``RadiometricReference``.
@@ -112,7 +120,7 @@ class RadiometricReferenceDialog(QDialog):
     reference_saved = pyqtSignal(object)
 
     def __init__(self, cube, wavelengths, metadata=None, store=None, saturation_ceiling=None,
-                 parent=None, profiles=None):
+                 parent=None, profiles=None, flatfield_store=None):
         super().__init__(parent)
         self.setWindowTitle("Save as Radiometric Reference")
         self.cube = cube
@@ -124,6 +132,16 @@ class RadiometricReferenceDialog(QDialog):
         self.store = store
         self.key = ReferenceKey.from_scan(self.metadata, wavelengths, lines)
         self.reference = None
+        self.flatfield = None               # the matching flat-field profile, if any
+        self.flatfield_reason = None        # why none is offered (None: no store given)
+        self._flatfield_array = None
+        if flatfield_store is not None:
+            try:
+                match = flatfield_store.find(self.key)
+                self.flatfield, self.flatfield_reason = match.profile, match.reason()
+            except Exception as exc:
+                logger.exception("Cannot read the flat-field profiles")
+                self.flatfield_reason = f"flat-field profiles unreadable ({exc})"
         ceiling = saturation_ceiling if np.shape(saturation_ceiling) == (lines, bands) else None
         self.ceiling = None if ceiling is None else np.array(ceiling, dtype=np.float32)
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -279,6 +297,18 @@ class RadiometricReferenceDialog(QDialog):
                                           "are left out.")
         self.spectral_gate_box.toggled.connect(lambda *_: self._update_roi())
         form.addRow("Spectral gate", self.spectral_gate_box)
+        self.flatfield_box = QCheckBox("Use flat-field profile")
+        self.flatfield_box.setEnabled(self.flatfield is not None)
+        self.flatfield_box.setChecked(self.flatfield is not None)
+        self.flatfield_box.setToolTip(
+            "Each slit row is calibrated with its own response from the camera's flat-field profile; the "
+            "ROI only gives the reflectance scale, so it may cover a few slit rows (a Spectralon disc).\n"
+            + (f"Profile: {self.flatfield.id}, scanned {self.flatfield.acquired_at}" if self.flatfield is not None
+               else f"Not available: {self.flatfield_reason or 'no camera profile'}. Scan a target that is "
+                    "uniform along the whole slit and use Save as Flat-field Profile."))
+        self.flatfield_box.toggled.connect(self._on_flatfield_toggled)
+        form.addRow("Flat-field", self.flatfield_box)
+        self.form = form
         right.addLayout(form)
 
         qc_group = QGroupBox("Quality checks")
@@ -422,6 +452,10 @@ class RadiometricReferenceDialog(QDialog):
         common = dict(useblit=True, interactive=True, drag_from_anywhere=True, ignore_event_outside=False,
                       use_data_coordinates=True, props=dict(_SHAPE), handle_props=dict(_HANDLES),
                       minspanx=2, minspany=2, spancoords="data")
+        # ``use_data_coordinates`` exists from matplotlib 3.6 on; it only changes the "square" modifier,
+        # so an older matplotlib simply goes without it instead of refusing to open the dialog.
+        accepted = inspect.signature(RectangleSelector.__init__).parameters
+        common = {k: v for k, v in common.items() if k in accepted}
         if kind == "rect":
             self._selector = RectangleSelector(self.ax, self._on_shape_changed, **common)
         elif kind == "ellipse":
@@ -846,6 +880,32 @@ class RadiometricReferenceDialog(QDialog):
                                       "get no reflectance (NaN)")]
         return [rt.QcItem("ok", f"Table covers all bands ({table_range[0]:g}-{table_range[1]:g} nm)")]
 
+    def uses_flatfield(self) -> bool:
+        """Whether the factors will be fitted with the flat-field profile."""
+        return self.flatfield is not None and self.flatfield_box.isChecked()
+
+    def _on_flatfield_toggled(self, checked: bool):
+        self.auto_window_box.setEnabled(not checked)                    # no row window with a profile
+        self.avg_window_spin.setEnabled(not checked and not self.auto_window_box.isChecked())
+        self._update_roi(redraw=False)
+
+    def _quality_items(self) -> List[rt.QcItem]:
+        """The ROI checks, with the row-coverage one told about the flat-field profile: with it an
+        ROI on a few slit rows is fine; without it the warning says how to get one."""
+        items = []
+        for item in (self.quality.items if self.quality else ()):
+            if item.level == "warn" and item.text.endswith(_HELD_ROWS):
+                head = item.text[:-len(_HELD_ROWS)]
+                if self.uses_flatfield():
+                    item = rt.QcItem("ok", f"{head}: the other rows get their own response from flat-field "
+                                           f"{self.flatfield.id}")
+                else:
+                    why = f" ({self.flatfield_reason})" if self.flatfield is None and self.flatfield_reason else ""
+                    item = rt.QcItem("warn", f"{item.text}, wrong where the light falls off along the slit. "
+                                             f"A flat-field profile{why} avoids it")
+            items.append(item)
+        return items
+
     def problems(self) -> List[str]:
         """Why *Create profile* is disabled now (empty = it can be pressed)."""
         problems = list(self.key.missing())
@@ -862,7 +922,7 @@ class RadiometricReferenceDialog(QDialog):
         items = [rt.QcItem("error", t) for t in self.key.missing()]
         if self.store is None:
             items.append(rt.QcItem("error", "No camera profile is open: the reference cannot be stored"))
-        items += self._table_items() + list(self.quality.items if self.quality else ())
+        items += self._table_items() + self._quality_items()
         html = "".join(f"<div style='margin:2px 0'><b style='color:{colors[i.level]}'>{marks[i.level]}</b>"
                        f"&nbsp;{_escape(i.text)}</div>" for i in items)
         numbers = self.quality.numbers if self.quality else {}
@@ -933,11 +993,17 @@ class RadiometricReferenceDialog(QDialog):
         mask = self.cleanup.mask.copy()
         started = self.metadata.get("started_at")
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        source = f"scan {started}" if started else "scan"
         try:
-            result = compute_rowwise_factors_array(self.cube, self.wavelengths, table,
-                                                   self.avg_window_spin.value(), mask,
-                                                   source_name=f"scan {started}" if started else "scan",
-                                                   window_fit=WINDOW_FIT)
+            if self.uses_flatfield():
+                if self._flatfield_array is None:
+                    self._flatfield_array = self.flatfield.profile()
+                result = compute_flatfield_factors_array(self.cube, self.wavelengths, table, mask,
+                                                         self._flatfield_array, source_name=source)
+            else:
+                result = compute_rowwise_factors_array(self.cube, self.wavelengths, table,
+                                                       self.avg_window_spin.value(), mask,
+                                                       source_name=source, window_fit=WINDOW_FIT)
             check, worst_row = self._self_check(result["factors"], mask, table)
         except Exception as exc:
             QApplication.restoreOverrideCursor()
@@ -959,6 +1025,7 @@ class RadiometricReferenceDialog(QDialog):
         info = {"source": result["reference"]["reflectance_reference_cube"],
                 "roi": self.roi_description(), "qc": dict(self.quality.numbers),
                 "window_fit": result["window_fit"],
+                "flatfield": self.flatfield.id if self.uses_flatfield() else None,
                 "self_check_rms_percent": None if check is None else round(float(check), 4),
                 "self_check_worst_row": None if worst_row is None else
                 [int(worst_row[0]), round(float(worst_row[1]), 4)],

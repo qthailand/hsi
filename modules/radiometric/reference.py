@@ -448,8 +448,10 @@ class RadiometricReference:
     def header_fields(self) -> dict:
         """Export-header metadata of a cube calibrated with this reference (``SCAN_HEADER_FIELDS`` keys)."""
         source = self.info.get("source")
+        flat = self.info.get("flatfield")                  # the flat-field profile the factors hold
+        notes = [str(v) for v in (source, f"flat-field {flat}" if flat else None) if v]
         return {"reflectance_reference": self.reflectance_profile,
-                "reflectance_reference_cube": f"{self.id} ({source})" if source else self.id,
+                "reflectance_reference_cube": f"{self.id} ({', '.join(notes)})" if notes else self.id,
                 "reflectance_reference_rows": f"{self.span[0]}-{self.span[1]}"}
 
     @classmethod

@@ -10,6 +10,7 @@ kept together, one folder per camera::
         smile/              smile_model_bin<N>.npz, history/                    (modules.smile)
         wavelength/         wavelength_bin<N>.json, resolution_bin<N>.json, history/
         radiometric/        ref_<date>_<time>/ (factors, ROI), active.json      (modules.radiometric)
+        flatfield/          flat_<date>_<time>/ (profile, ROI)                  (modules.flatfield)
 
 ``<model>`` and ``<serial>`` are what the camera SDK reports (characters outside
 ``A-Z a-z 0-9 . _ -`` become ``_``); a camera that reports neither gets ``unknown``. Files
@@ -198,6 +199,11 @@ class CameraProfile:
     def radiometric_folder(self) -> Path:
         """Radiometric references for automatic calibration (``modules.radiometric.RadiometricReferenceStore``)."""
         return self.root / "radiometric"
+
+    @property
+    def flatfield_folder(self) -> Path:
+        """Flat-field profiles along the slit (``modules.flatfield.FlatFieldStore``)."""
+        return self.root / "flatfield"
 
     @property
     def info_path(self) -> Path:

@@ -316,6 +316,7 @@ class MainWindow(QMainWindow):
         scan = ScanWindow(config=self.config)
         scan.cube_ready.connect(self._create_scan_cube_viewer)
         scan.save_result_requested.connect(self._save_scan_result)
+        scan.status_card_clicked.connect(self._on_status_card_clicked)
         from windows.integrations import RadiometricIntegration
         for integration in self.integrations:
             if isinstance(integration, RadiometricIntegration):
@@ -324,6 +325,9 @@ class MainWindow(QMainWindow):
                         cube, wl, metadata=self._scan_export_metadata()))
                 scan.radiometric_reference_requested.connect(
                     lambda cube, wl, integration=integration: integration.save_reference(
+                        cube, wl, metadata=self._scan_reference_metadata()))
+                scan.flatfield_profile_requested.connect(
+                    lambda cube, wl, integration=integration: integration.save_flatfield(
                         cube, wl, metadata=self._scan_reference_metadata()))
                 # the same metadata as a reference made of the scan: the same setting, the same key
                 scan.auto_calibration_requested.connect(
@@ -396,6 +400,17 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.debug("Camera bit depth unavailable for the export header", exc_info=True)
         return {**(camera_bits or {}), **self.scan_controller.last_scan_header}
+
+    def _on_status_card_clicked(self, key: str):
+        """A status card of the scan window was clicked: open that module's profile view."""
+        from windows.integrations import RadiometricIntegration, SmileIntegration, WavelengthIntegration
+        target, method = {"smile": (SmileIntegration, "open"), "wavelength": (WavelengthIntegration, "open"),
+                          "flatfield": (RadiometricIntegration, "view_flatfield"),
+                          "radiometric": (RadiometricIntegration, "view_reference")}.get(key, (None, None))
+        for integration in self.integrations:
+            if target is not None and isinstance(integration, target):
+                getattr(integration, method)()
+                return
 
     def _scan_reference_metadata(self):
         """Metadata for a radiometric reference made of the last scan: the export-header metadata

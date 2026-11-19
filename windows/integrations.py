@@ -166,6 +166,132 @@ class RadiometricIntegration(Integration):
         from modules.radiometric import RadiometricReferenceStore
         return RadiometricReferenceStore(profile.radiometric_folder)
 
+    @staticmethod
+    def flatfield_store(controller):
+        """The open camera's ``FlatFieldStore`` (its camera profile's ``flatfield/``), or ``None``
+        without a camera profile."""
+        profile = getattr(controller, "camera_profile", None)
+        if profile is None:
+            return None
+        from modules.flatfield import FlatFieldStore
+        return FlatFieldStore(profile.flatfield_folder)
+
+    def refresh_flatfield_status(self, controller=None):
+        """Update the scan window's Flat-field card: the newest profile of the selected bin, and
+        whether the active radiometric reference of that bin was made with it (*Applied*: scans
+        calibrated with that reference are flat-fielded) or not yet (*Ready*).
+        Returns the profile reported, or ``None``."""
+        controller = controller if controller is not None else self.host.scan_controller
+        window = getattr(controller, "win", None)
+        if window is None or not hasattr(window, "set_flatfield_status"):
+            return None
+        profile, tooltip = None, ""
+        try:
+            store = self.flatfield_store(controller)
+            if store is None:
+                state, text = "off", "Flat-field: no camera profile"
+                tooltip = ""
+            else:
+                try:
+                    camera_bin = int(window.selected_bin())
+                except Exception:
+                    camera_bin = None
+                state, text, profile = store.status(camera_bin)
+                if profile is not None:
+                    used_by = self._reference_using(controller, profile)
+                    if used_by is not None:
+                        state = "applied"
+                    tooltip = (f"{profile.id}\n{profile.key.label()}\nScanned {profile.acquired_at}\n"
+                               + (f"Part of the active radiometric reference {used_by}: scans calibrated "
+                                  "with it are flat-fielded.\n" if used_by is not None else
+                                  "No active radiometric reference uses it yet: scan the Spectralon and press "
+                                  "Save as Radiometric Reference.\n")
+                               + "Make a new profile after moving a lamp or changing the working distance.")
+        except Exception as exc:
+            logger.exception("Cannot read the flat-field profiles")
+            state, text = "off", f"Flat-field: profiles unreadable ({exc})"
+        if profile is None and not tooltip:
+            tooltip = ("Scan a target that is uniform along the whole slit (a white strip), then press "
+                       "Save as Flat-field Profile.")
+        try:
+            window.set_flatfield_status(state, text, tooltip)
+        except RuntimeError:                        # window already deleted
+            pass
+        return profile
+
+    def _reference_using(self, controller, profile):
+        """Id of the newest active radiometric reference made with ``profile``, or ``None``."""
+        store = self.reference_store(controller)
+        if store is None:
+            return None
+        for reference in store.active():
+            if reference.info.get("flatfield") == profile.id:
+                return reference.id
+        return None
+
+    def view_flatfield(self):
+        """Flat-field card clicked: plot the profile the card reports (non-modal)."""
+        profile = self.refresh_flatfield_status()
+        if profile is None:
+            return None
+        try:
+            from modules.flatfield.dialog import FlatFieldViewDialog
+            dialog = FlatFieldViewDialog(profile, parent=self.host.parent_widget)
+        except Exception as exc:
+            logger.exception("Cannot show the flat-field profile")
+            self.host.error("Flat-field profile", str(exc))
+            return None
+        self._flatfield_view = dialog               # kept alive while shown
+        dialog.show()
+        return dialog
+
+    def view_reference(self):
+        """Radiometric card clicked: plot the newest active radiometric reference (non-modal).
+        Returns the dialog, or ``None`` without an active reference."""
+        controller = self.host.scan_controller
+        try:
+            store = self.reference_store(controller) if controller is not None else None
+            active = store.active() if store is not None else []
+            if not active:
+                self.host.show_status("No active radiometric reference to show")
+                return None
+            reference = max(active, key=lambda r: (r.acquired, r.id))
+            from modules.radiometric.reference_view import ReferenceViewDialog
+            dialog = ReferenceViewDialog(reference, parent=self.host.parent_widget)
+        except Exception as exc:
+            logger.exception("Cannot show the radiometric reference")
+            self.host.error("Radiometric reference", str(exc))
+            return None
+        self._reference_view = dialog               # kept alive while shown
+        dialog.show()
+        return dialog
+
+    def save_flatfield(self, cube, wavelengths=None, metadata=None):
+        """*Save as Flat-field Profile*: open the flat-field dialog on the scan just finished
+        (arguments as :meth:`save_reference`). Returns the stored profile, or ``None``."""
+        controller = self.host.scan_controller
+        try:
+            from modules.flatfield.dialog import FlatFieldDialog
+            store = self.flatfield_store(controller) if controller is not None else None
+            ceiling = getattr(controller, "last_scan_saturation_ceiling", None)
+            dialog = FlatFieldDialog(cube, wavelengths, metadata=metadata, store=store,
+                                     saturation_ceiling=ceiling, parent=self.host.parent_widget)
+        except Exception as exc:
+            logger.exception("Cannot open the flat-field dialog")
+            self.host.error("Save as Flat-field Profile", str(exc))
+            return None
+        try:
+            dialog.exec_()
+            if dialog.reference is not None:
+                self.host.show_status(f"Flat-field profile {dialog.reference.id} stored: radiometric "
+                                      "references made from now on can use it")
+                self.refresh_flatfield_status(controller)
+            return dialog.reference
+        finally:
+            delete = getattr(dialog, "deleteLater", None)
+            if delete is not None:
+                delete()
+
     def refresh_status(self, controller=None):
         """Update the scan window's badge from the store of ``controller`` (default: the current one)."""
         controller = controller if controller is not None else self.host.scan_controller
@@ -182,6 +308,7 @@ class RadiometricIntegration(Integration):
             window.set_radiometric_status(state, text)
         except RuntimeError:                        # window already deleted
             pass
+        self.refresh_flatfield_status(controller)
 
     def save_reference(self, cube, wavelengths=None, metadata=None):
         """*Save as Radiometric Reference*: open the reference dialog on the scan just finished.
@@ -196,8 +323,10 @@ class RadiometricIntegration(Integration):
             from modules.radiometric import RadiometricReferenceDialog
             store = self.reference_store(controller) if controller is not None else None
             ceiling = getattr(controller, "last_scan_saturation_ceiling", None)
+            flat_store = self.flatfield_store(controller) if controller is not None else None
             dialog = RadiometricReferenceDialog(cube, wavelengths, metadata=metadata, store=store,
-                                                saturation_ceiling=ceiling, parent=self.host.parent_widget)
+                                                saturation_ceiling=ceiling, parent=self.host.parent_widget,
+                                                flatfield_store=flat_store)
         except Exception as exc:
             logger.exception("Cannot open the radiometric reference dialog")
             self.host.error("Save as Radiometric Reference", str(exc))

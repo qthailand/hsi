@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QCheckBox,
     QFormLayout,
+    QGridLayout,
     QSpinBox,
     QDoubleSpinBox,
     QComboBox,
@@ -40,6 +41,7 @@ from modules.dark.widget import DarkFramePanel
 from modules.stage.config import FREE_SCAN_MAX_S, FREE_SCAN_MIN_S
 from modules.stage.speed import LINEAR_MAX_UM_S, ROTATION_MAX_DPS, ROTATION_SPEED_RESOLUTION_DPS
 from modules.acquisition.widget import CorrectionStatusDisplay
+from modules.status_card import StatusCard
 from modules.live_view.display_controls import DisplayControls
 from widgets.sharpness_panel import SharpnessPanel
 from modules.live_view.histogram import HistogramPlot
@@ -105,6 +107,10 @@ class _NoWheelUnlessFocusedSpinBox(QDoubleSpinBox):
             event.ignore()
 
 
+#: Side (px) of the square status cards (Dark, Smile, Wavelength, Flat-field, Radiometric).
+STATUS_CARD_SIZE = 92     # the widest texts (RADIOMETRIC, Capturing) fit
+
+
 class ScanWindow(QWidget):
     snapshot_ready = pyqtSignal(object)
     snapshot_failed = pyqtSignal(int, str)
@@ -112,6 +118,11 @@ class ScanWindow(QWidget):
     calibration_requested = pyqtSignal(object, object)
     #: *Save as Radiometric Reference*: (cube, wavelengths) of the scan just finished.
     radiometric_reference_requested = pyqtSignal(object, object)
+    #: *Save as Flat-field Profile*: (cube, wavelengths) of the scan just finished.
+    flatfield_profile_requested = pyqtSignal(object, object)
+    #: A status card was clicked: ``"smile"``, ``"wavelength"``, ``"flatfield"`` or ``"radiometric"``
+    #: (the host opens that module's profile view).
+    status_card_clicked = pyqtSignal(str)
     #: Save on the unsaved-result prompt: open (cube, wavelengths) with the export dialog.
     save_result_requested = pyqtSignal(object, object)
     #: Calibrate (cube, wavelengths) with the camera's matching radiometric reference: sent after
@@ -168,9 +179,24 @@ class ScanWindow(QWidget):
         # ── Dark frame ───────────────────────────────────────────
         self.dark_panel = DarkFramePanel()
         self.correction_status = CorrectionStatusDisplay(self)
-        self.correction_status.dark.setFixedWidth(180)
-        self.correction_status.smile.setFixedWidth(180)
-        self.correction_status.wavelength.setFixedWidth(180)
+        # flat-field profile and radiometric reference of this camera (set by the radiometric
+        # integration). Five cards: small squares in a grid, the detail in each tooltip
+        self.flatfield_card = StatusCard('Flat-field', self)
+        self.flatfield_card.set_content('Waiting', 'Waiting for camera')
+        self.radiometric_card = StatusCard('Radiometric', self)
+        self.radiometric_card.set_content('Waiting', 'Waiting for camera')
+        self.status_cards = (self.correction_status.dark, self.correction_status.smile,
+                             self.correction_status.wavelength, self.flatfield_card, self.radiometric_card)
+        for card in self.status_cards:
+            card.set_compact(STATUS_CARD_SIZE)
+        # a click on a card opens that module's profile; Smile and Wavelength always have a
+        # window to open, Flat-field and Radiometric only while there is a profile to show
+        self._card_keys = {"smile": self.correction_status.smile, "wavelength": self.correction_status.wavelength,
+                           "flatfield": self.flatfield_card, "radiometric": self.radiometric_card}
+        for key, card in self._card_keys.items():
+            card.clicked.connect(lambda key=key: self.status_card_clicked.emit(key))
+        self.correction_status.smile.set_clickable(True, "Open ▸")
+        self.correction_status.wavelength.set_clickable(True, "Open ▸")
 
         # ── Stage — rotation ─────────────────────────────────────
         # The rotation stage runs multiples of 0.01 deg/s (half steps of 0.02 deg), so the
@@ -379,11 +405,12 @@ class ScanWindow(QWidget):
         stage_row.addWidget(self.wavelength_range_group)
         settings_column.addLayout(stage_row)
 
-        status_column = QVBoxLayout()
+        # a grid, two cards a row: five full cards in one column would not fit the pane's height
+        status_column = QGridLayout()
         status_column.setSpacing(6)
-        status_column.addWidget(self.correction_status.dark, stretch=1)
-        status_column.addWidget(self.correction_status.smile, stretch=1)
-        status_column.addWidget(self.correction_status.wavelength, stretch=1)
+        for i, card in enumerate(self.status_cards):
+            status_column.addWidget(card, i // 2, i % 2)
+        status_column.setRowStretch(len(self.status_cards) // 2 + 1, 1)
         controls_body.addLayout(settings_column, stretch=1)
         controls_body.addLayout(status_column)
         controls_layout.addLayout(controls_body)
@@ -494,6 +521,15 @@ class ScanWindow(QWidget):
             QPushButton:pressed { background-color: #e65100; }
             QPushButton:disabled { background-color: #1a2a40; color: #555; }
         """)
+        self.save_flatfield_btn = QPushButton("Save as Flat-field Profile")
+        self.save_flatfield_btn.setEnabled(False)
+        self.save_flatfield_btn.setToolTip(
+            "Scan of a target that is uniform along the whole slit (a white strip; its reflectance "
+            "need not be known)? Store how the light and the optics fall off along the slit. A "
+            "radiometric reference made afterwards uses it, so a small Spectralon is enough.")
+        self.save_flatfield_btn.setStyleSheet(
+            self.save_reference_btn.styleSheet().replace("#ef6c00", "#00838f")
+            .replace("#fb8c00", "#0097a7").replace("#e65100", "#006064"))
         self.radiometric_status_label = QLabel("Auto radiometric: —")
         self.radiometric_status_label.setWordWrap(True)
         self.set_radiometric_status("off", "Auto radiometric: —")
@@ -508,6 +544,7 @@ class ScanWindow(QWidget):
             "tick after a scan to calibrate that scan, untick to drop its reflectance.")
         self.auto_radiometric_box.toggled.connect(self._on_auto_radiometric_toggled)
         ref_row = QHBoxLayout()
+        ref_row.addWidget(self.save_flatfield_btn)
         ref_row.addWidget(self.save_reference_btn)
         ref_row.addWidget(self.auto_radiometric_box)
         ref_row.addWidget(self.radiometric_status_label, 1)
@@ -564,6 +601,7 @@ class ScanWindow(QWidget):
         self.open_reflectance_btn.clicked.connect(self._on_open_reflectance)
         self.open_calibration_btn.clicked.connect(self._on_open_calibration)
         self.save_reference_btn.clicked.connect(self._on_save_reference)
+        self.save_flatfield_btn.clicked.connect(self._on_save_flatfield)
         self.open_spectrogram_btn.clicked.connect(self._on_open_spectrogram)
         self.save_frame_btn.clicked.connect(self.request_processed_frame)
         self.controller = None
@@ -659,6 +697,7 @@ class ScanWindow(QWidget):
         self.open_calibration_btn.setEnabled(True)
         self.open_calibration_btn.setText(f"Calibration  ({shape_str})")
         self.save_reference_btn.setEnabled(True)
+        self.save_flatfield_btn.setEnabled(True)
         if calibration is not None:
             self.open_reflectance_btn.setText(f"Open Reflectance Viewer  ({shape_str})")
             self.open_reflectance_btn.setVisible(True)
@@ -895,10 +934,44 @@ class ScanWindow(QWidget):
             return
         self.radiometric_reference_requested.emit(cube, self._pending_wavelengths)
 
+    def set_flatfield_status(self, state: str, text: str, tooltip: str = ""):
+        """Show the flat-field state on its status card.
+
+        Args:
+            state: ``"applied"`` (green *Applied*: the active radiometric reference holds the
+                profile), ``"on"`` (cyan *Ready*: a profile exists for this bin, no active reference
+                uses it yet) or anything else (orange *Off*: no profile). The card is clickable
+                (view the profile) for the first two.
+            text: Card detail, e.g. ``bin 4 - 505/512 rows - response 0.46-1.17``; a leading
+                ``Flat-field: `` is dropped (the card has that title).
+            tooltip: Further lines for the card's tooltip.
+        """
+        value, color = {"applied": ("Applied", "green"), "on": ("Ready", "cyan")}.get(state, ("Off", "orange"))
+        detail = text[len("Flat-field: "):] if text.startswith("Flat-field: ") else text
+        self.flatfield_card.set_content(value, detail, color)
+        has_profile = state in ("applied", "on")
+        self.flatfield_card.set_clickable(has_profile)
+        self.flatfield_card.setToolTip(f"FLAT-FIELD: {value}\n{detail}" + (f"\n\n{tooltip}" if tooltip else "")
+                                       + ("\n\nClick to view the profile." if has_profile else ""))
+
+    def _on_save_flatfield(self):
+        cube = self.counts_cube()                  # a flat-field profile is fitted on counts
+        if cube is None:
+            return
+        self.flatfield_profile_requested.emit(cube, self._pending_wavelengths)
+
     def set_radiometric_status(self, state: str, text: str):
         """Show the automatic radiometric calibration state: ``state`` ``"on"`` (green),
         ``"expired"`` (amber) or anything else (grey), with ``text``."""
         color = {"on": "#43a047", "expired": "#fb8c00"}.get(state, "#7a8699")
+        card = getattr(self, "radiometric_card", None)       # absent while the window is being built
+        if card is not None:
+            value, card_color = {"on": ("Applied", "green"), "expired": ("Expired", "red")}.get(
+                state, ("Off", "orange"))
+            detail = text[len("Auto radiometric: "):] if text.startswith("Auto radiometric: ") else text
+            card.set_content(value, detail, card_color)
+            card.set_clickable(state in ("on", "expired"))   # a reference to show
+            card.setToolTip(card.toolTip() + ("\n\nClick to view the reference." if card.is_clickable() else ""))
         self.radiometric_status_label.setText(text)
         self.radiometric_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
 
