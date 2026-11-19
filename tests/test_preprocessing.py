@@ -73,6 +73,37 @@ def test_gpu_failure_latches_safe_cpu_fallback():
     np.testing.assert_array_equal(output, expected)
     assert runtime.backend_name == 'cpu' and 'GPU lost' in runtime.fallback_reason
 
+def test_gpu_failure_stays_on_cpu_after_calibration_change():
+    frame, processor = fixture(); runtime = PreprocessingRuntime('cpu', CPU_CAPS)
+    class Broken:
+        name = 'cupy_cuda'
+        def process(self, *args): raise RuntimeError('GPU lost')
+    runtime._backend = Broken()
+    runtime.process(frame, processor, Calibration(frame.shape, 'cubic'))
+    runtime.process(frame, processor, Calibration(frame.shape, 'linear'))
+    assert runtime.backend_name == 'cpu' and 'GPU lost' in runtime.fallback_reason
+
+def test_unsupported_configuration_uses_cpu_until_it_changes():
+    frame, processor = fixture(); runtime = PreprocessingRuntime('cpu', CPU_CAPS)
+    cpu = runtime._cpu
+    class Gpu:
+        name = 'cupy_cuda'
+        calls = 0
+        def process(self, *args):
+            Gpu.calls += 1
+            return cpu.process(*args)
+    runtime._backend = Gpu()
+    lanczos = Calibration(frame.shape, 'lanczos')
+    for _ in range(2):
+        output, _ = runtime.process(frame, processor, lanczos, True)
+        assert runtime.backend_name == 'cpu' and 'linear/cubic' in runtime.fallback_reason
+    np.testing.assert_array_equal(output, reference(frame, processor, lanczos, True)[0])
+    assert Gpu.calls == 0
+    cubic = Calibration(frame.shape, 'cubic')
+    output, _ = runtime.process(frame, processor, cubic, True)
+    assert runtime.backend_name == 'cupy_cuda' and Gpu.calls == 1
+    np.testing.assert_array_equal(output, reference(frame, processor, cubic, True)[0])
+
 def test_wrong_gpu_result_is_rejected():
     frame, processor = fixture(); runtime = PreprocessingRuntime('cpu', CPU_CAPS)
     class Wrong:

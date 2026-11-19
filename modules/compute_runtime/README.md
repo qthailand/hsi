@@ -66,7 +66,7 @@ if caps.opencv_cuda.available:
     device_id = caps.opencv_cuda.device_id
 ```
 
-cuda_available is true when either supported provider passes its smoke test. It does not promise that arbitrary CUDA operations or the full correction pipeline are supported. processing_backend reports the active acquisition preprocessing backend (cpu, opencv_cuda or cupy_cuda). Capability alone does not select kernels; PreprocessingRuntime publishes the backend after initialization and on CPU fallback.
+cuda_available is true when either supported provider passes its smoke test. It does not promise that arbitrary CUDA operations or the full correction pipeline are supported. processing_backend reports the active acquisition preprocessing backend (cpu, opencv_cuda or cupy_cuda). Capability alone does not select kernels; PreprocessingRuntime publishes the backend after initialization, on CPU fallback and when it returns to the GPU after an unsupported configuration (for example a Lanczos Smile model) is replaced.
 
 OpenCV: check device count and CUDA remap availability, then upload a small uint16 image, perform identity remap, download and validate exact results. CuPy: check device count, allocate a small array, execute a kernel, synchronize, download and validate. Each probe tests device 0 and records its provider-specific identifier/name or failure reason. A failing device 0 is not automatically replaced with another device. Consumers must select the device in their own worker thread before creating CUDA resources.
 

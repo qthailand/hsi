@@ -213,9 +213,11 @@ class _QualityWorker(QThread):
 class SmileCorrectionWidget(QWidget):
     """Interactive smile correction widget for PyQt5 applications.
 
-    Provides file loading, analysis, visualisation (4 tabs), and
-    calibration save / load.  Can be embedded as a sub-widget or used
-    standalone.
+    Provides file loading, analysis, visualisation (the *Smile* tabs), and
+    calibration save / load.  The *Keystone* tab (:class:`~.keystone_view.KeystonePage`)
+    adds the along-slit geometry from a line-target frame; once attached, *Apply* and
+    *Save Matrix* write one combined smile + keystone model (format 4).  Can be embedded
+    as a sub-widget or used standalone.
 
     Signals:
         analysisComplete: Emitted with :class:`SmileAnalysis` after
@@ -290,10 +292,12 @@ class SmileCorrectionWidget(QWidget):
         self.btn_load.clicked.connect(self._on_load)
         ctrl.addWidget(self.btn_load)
         self._grab_request_id = None
+        self._grab_purpose = "lamp"        # what the pending grab is for: lamp | target | white
+        self._grab_available = False
         self.btn_grab = QPushButton("Grab from Scan")
         self.btn_grab.setEnabled(False)
         self.btn_grab.setToolTip("Request one frame after dark/hot-pixel correction and orientation")
-        self.btn_grab.clicked.connect(lambda: self.grabRequested.emit())
+        self.btn_grab.clicked.connect(lambda: self._request_grab("lamp"))
         ctrl.addWidget(self.btn_grab)
         self.btn_export_png = QPushButton("Export PNG…")
         self.btn_export_png.setEnabled(False)
@@ -316,7 +320,7 @@ class SmileCorrectionWidget(QWidget):
         self.btn_save_cal = QPushButton("📐 บันทึก Matrix")
         self.btn_save_cal.setEnabled(False)
         self.btn_save_cal.setToolTip(
-            "Save map_x for reuse without re-analysis."
+            "Save map_x (and map_y with keystone) for reuse without re-analysis."
         )
         self.btn_save_cal.clicked.connect(self._on_save_cal)
         ctrl.addWidget(self.btn_save_cal)
@@ -449,7 +453,17 @@ class SmileCorrectionWidget(QWidget):
             self.canvas_resid,
             self.canvas_surf,
         ) = self._canvases[:4]
-        root.addWidget(self.tabs, stretch=1)
+        # Outer level: the 8 smile tabs stay one QTabWidget (indices used by tests / quality code).
+        from .keystone_view import KeystonePage
+
+        self.keystone_page = KeystonePage(self, setting_for_file=self._setting_for_shape)
+        self.keystone_page.grabRequested.connect(self._request_grab)
+        self.keystone_page.keystoneReady.connect(self._on_keystone_ready)
+        self.keystone_page.statusChanged.connect(self._set_status)
+        self.outer_tabs = QTabWidget()
+        self.outer_tabs.addTab(self.tabs, "Smile")
+        self.outer_tabs.addTab(self.keystone_page, "Keystone")
+        root.addWidget(self.outer_tabs, stretch=1)
         self._clear_quality_plots()
 
         self.lbl_setting = QLabel("Camera setting: —")
@@ -469,7 +483,29 @@ class SmileCorrectionWidget(QWidget):
 
     def set_grab_available(self, available):
         """The host enables capture when a snapshot provider is connected."""
+        self._grab_available = bool(available)
         self.btn_grab.setEnabled(bool(available))
+        self.keystone_page.set_grab_enabled(bool(available))
+
+    def _request_grab(self, purpose: str = "lamp") -> None:
+        """Ask the host for one frame; ``purpose`` routes it in :meth:`accept_snapshot`."""
+        if self._grab_request_id is not None:
+            self._set_status("A grab is already pending")
+            return
+        self._grab_purpose = purpose if purpose in ("lamp", "target", "white") else "lamp"
+        self.grabRequested.emit()
+
+    def _grab_done(self) -> None:
+        """No grab pending any more: Grab buttons back on, next grab is a lamp unless asked otherwise."""
+        self._grab_request_id = None
+        self._grab_purpose = "lamp"
+        self.btn_grab.setEnabled(True)
+        self.keystone_page.set_grab_enabled(True)
+
+    def _setting_for_shape(self, shape):
+        """Camera setting for a frame loaded from disk (the camera's current one with that size)."""
+        current = self._camera_setting()
+        return current.with_frame(shape) if current is not None else None
 
     def set_calibration_source(self, store, setting_provider) -> None:
         """Where calibrations live per camera setting and how to read the camera's current setting.
@@ -533,7 +569,12 @@ class SmileCorrectionWidget(QWidget):
         """Apply needs an analysis, a known camera setting and a store."""
         self.btn_apply.setEnabled(self._result is not None and self._setting is not None and self._store is not None)
         if self._setting is not None:
-            self.btn_apply.setText(f"📌 Apply to camera (bin {self._setting.camera_bin})")
+            what = "Smile + keystone" if self._has_keystone() else "to camera"
+            self.btn_apply.setText(f"📌 Apply {what} (bin {self._setting.camera_bin})")
+
+    def _has_keystone(self) -> bool:
+        """True when the current corrector carries a keystone (Apply / Save write the combined model)."""
+        return self._corrector is not None and self._corrector.has_keystone
 
     def apply_to_camera(self) -> Optional[str]:
         """Store the current model for the frame's camera setting and ask the host to load it.
@@ -556,6 +597,16 @@ class SmileCorrectionWidget(QWidget):
         if tuple(self._result.frame_orig.shape) != tuple(self._setting.frame_shape or self._result.frame_orig.shape):
             self._set_status("Not applied: analysed frame size differs from the camera frame")
             return None
+        keystone = self._has_keystone()
+        if keystone:
+            target_setting = self.keystone_page.result_setting
+            problems = [] if target_setting is None else self._setting.mismatch(target_setting)
+            if problems:
+                from .keystone_view import _ascii
+                self._set_status("Not applied: the keystone target was taken at another camera setting than the "
+                                 "lamp (" + "; ".join(_ascii(p) for p in problems) + ")")
+                return None
+        what = "Smile + keystone" if keystone else "Smile"
         path = self._store.smile_path(self._setting)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -570,9 +621,9 @@ class SmileCorrectionWidget(QWidget):
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Apply failed: {exc}")
             return None
-        logger.info("Smile model stored for %s: %s%s", self._setting.label(), path,
+        logger.info("%s model stored for %s: %s%s", what, self._setting.label(), path,
                     f" (previous kept as {backup})" if backup else "")
-        self._set_status(f"Stored for {self._setting.label()}: {path}"
+        self._set_status(f"{what} model stored for {self._setting.label()}: {path}"
                          + (f" (previous → history/{backup.name})" if backup else ""))
         self._show_setting()
         self.applyRequested.emit(str(path))
@@ -586,7 +637,9 @@ class SmileCorrectionWidget(QWidget):
         """
         self._grab_request_id = request_id
         self.btn_grab.setEnabled(False)
-        self._set_status("Waiting for one camera frame…")
+        self.keystone_page.set_grab_enabled(False)
+        what = {"target": " (keystone line target)", "white": " (keystone white)"}.get(self._grab_purpose, "")
+        self._set_status(f"Waiting for one camera frame{what}…")
 
     def accept_snapshot(self, packet):
         """Receive the frame requested via ``grabRequested``.
@@ -597,10 +650,16 @@ class SmileCorrectionWidget(QWidget):
         """
         if packet.request_id != self._grab_request_id:
             return
-        self._grab_request_id = None
-        self.btn_grab.setEnabled(True)
+        purpose = self._grab_purpose
+        self._grab_done()
         # Snapshot already has the acquisition orientation; never flip twice.
         current = self._camera_setting()
+        if purpose in ("target", "white"):           # keystone frames do not replace the lamp frame
+            setting = current.with_frame(packet.image.shape, packet.camera_bin) if current is not None else None
+            self.keystone_page.set_frame(purpose, packet.image, setting,
+                                         source=f"grabbed, bin {packet.camera_bin}")
+            self._set_status(f"Grabbed keystone {purpose} frame, bin {packet.camera_bin}")
+            return
         if current is None:
             self.set_frame(packet.image)
         else:
@@ -616,8 +675,7 @@ class SmileCorrectionWidget(QWidget):
         """
         if request_id is not None and request_id != self._grab_request_id:
             return
-        self._grab_request_id = None
-        self.btn_grab.setEnabled(True)
+        self._grab_done()
         self._set_status(message)
 
     def set_frame(self, frame: Optional[np.ndarray], setting=None) -> None:
@@ -655,6 +713,9 @@ class SmileCorrectionWidget(QWidget):
             self._frame is not None and self._worker is None
         )
         self._show_preview(self._frame)
+        self.keystone_page.set_context(
+            None, None if self._frame is None else self._frame.shape, self._setting,
+            reason="New lamp frame: the previous keystone was dropped. Analyze the smile, then Analyze Keystone.")
         if self._frame is not None:
             h, w = self._frame.shape
             self._set_status(
@@ -845,6 +906,7 @@ class SmileCorrectionWidget(QWidget):
             f"In-sample RMSE {stats['rmse']:.3f} nm; "
             f"{stats['count']} paired fits; blends omitted; row step 8"
         )
+        self.outer_tabs.setCurrentWidget(self.tabs)
         self.tabs.setCurrentIndex(4)
 
     @staticmethod
@@ -863,6 +925,7 @@ class SmileCorrectionWidget(QWidget):
         for worker in [self._worker, self._quality_worker]:
             if worker is not None and worker.isRunning():
                 worker.wait()
+        self.keystone_page.wait_worker()
         super().closeEvent(event)
 
     def analyze_quality(self, references, *, m_nm_per_px, c_nm, **kwargs):
@@ -1028,7 +1091,31 @@ class SmileCorrectionWidget(QWidget):
         self._quality_report = None
         self._quality_uncertainty = None
         self._clear_quality_plots()
+        self.keystone_page.set_context(
+            r, r.frame_orig.shape, self._setting,
+            reason="New smile analysis: the previous keystone was dropped (the model is smile only). "
+                   "Run Analyze Keystone again.")
         self.analysisComplete.emit(r)
+
+    def _on_keystone_ready(self, k) -> None:
+        """Attach a keystone computed on the Keystone page: Apply / Save now write one combined model."""
+        if self._result is None:
+            return
+        if self._corrector is None or self._corrector.analysis is not self._result:
+            self._corrector = SmileCorrector.from_analysis(self._result)
+        try:
+            self._corrector.attach_keystone(k)
+        except Exception as exc:  # noqa: BLE001
+            self.keystone_page.clear_result(f"Keystone not attached: {exc}")
+            self._set_status(f"Keystone not attached: {exc}")
+            return
+        self._update_apply_state()
+        s = k.summary
+        self._set_status(
+            f"Smile + keystone ready: keystone max {s['keystone_max_px']:.2f} px, tilt {s['tilt_deg']:.3f} deg, "
+            f"border rows {tuple(k.row_margin)}, columns {tuple(k.margin)}"
+            + (f", {len(k.warnings)} warning(s) (Keystone tab)" if k.warnings else "")
+            + ". Apply / Save Matrix write the combined model.")
 
     def _on_export_png(self) -> None:
         """Handle 'Export PNG…': save the image as received, at its own bit depth."""
@@ -1059,9 +1146,13 @@ class SmileCorrectionWidget(QWidget):
         )
         if not path:
             return
-        img = self._result.frame_corr
-        if self.chk_crop.isChecked():
-            img = crop_margin(img, self._result.margin)
+        if self._has_keystone() and self._corrector.analysis is self._result:
+            # one remap with the combined smile + keystone map
+            img = self._corrector.transform(self._result.frame_orig, crop=self.chk_crop.isChecked())
+        else:
+            img = self._result.frame_corr
+            if self.chk_crop.isChecked():
+                img = crop_margin(img, self._result.margin)
         bits = 8 if self._result.sat_level <= 255 else 16
         save_frame(path, img, bits=bits)
         self._set_status(
@@ -1154,7 +1245,8 @@ class SmileCorrectionWidget(QWidget):
             cal = calibration_from_analysis(self._result)
             cal.camera_setting = setting
             save_calibration(path, cal)
-        self._set_status(f"Saved calibration: {path}")
+        what = "Smile + keystone" if self._has_keystone() else "Smile"
+        self._set_status(f"Saved {what} calibration: {path}")
 
     def _on_load_cal(self) -> None:
         """Handle the 'Load Matrix' button click."""
@@ -1166,6 +1258,15 @@ class SmileCorrectionWidget(QWidget):
         )
         if not path:
             return
+        self.load_calibration_file(path)
+
+    def load_calibration_file(self, path: str) -> bool:
+        """Load a saved model (smile, or smile + keystone) for *Apply* / *Save*; the Keystone tab
+        shows its stored keystone report.
+
+        Returns:
+            ``False`` when the file could not be loaded (reason in the status bar).
+        """
         try:
             self._calibration = load_calibration(path)
             self._corrector = SmileCorrector.load(path)
@@ -1174,6 +1275,12 @@ class SmileCorrectionWidget(QWidget):
             )
         except Exception as exc:
             self._set_status(f"Load failed: {exc}")
+            return False
+        cal = self._calibration
+        self.keystone_page.show_stored(cal.keystone if cal.has_keystone else None,
+                                       cal.map_y if cal.has_keystone else None, os.path.basename(path))
+        self._update_apply_state()
+        return True
 
     # -----------------------------------------------------------------
     #  Plotting

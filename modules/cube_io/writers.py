@@ -88,6 +88,13 @@ SCAN_HEADER_FIELDS = (
     ('smile_corrected', 'smile corrected', bool),
     ('smile_model', 'smile model', str),
     ('smile_model_created', 'smile model created', str),
+    # '[k0, k1, n_full]': bins kept of the full grid; the others touch the Smile border columns
+    # (zero-filled at the slit ends). Absent = every bin kept.
+    ('smile_border_bands', 'smile border bands kept', str),
+    # smile + keystone model (modules.smile.keystone): rows moved along the slit too; only
+    # written when on (absent = no keystone, as in files from before keystone existed)
+    ('keystone_corrected', 'keystone corrected', bool),
+    ('keystone_row_margin', 'keystone row margin top bottom (px)', str),   # '[top, bottom]', informational
     ('wavelength_source', 'wavelength calibration source', str),
     ('wavelength_profile', 'wavelength calibration', str),
     ('wavelength_profile_saved', 'wavelength calibration saved', str),
@@ -332,7 +339,7 @@ class HypercubeWriter:
                 start/end/min/max``, ``dark temperature`` and ``target temperature``; optional
                 scan settings and corrections (:data:`SCAN_HEADER_FIELDS`: camera model and
                 serial number, exposure, gain, frame
-                rate, bin, dark / hot-pixel / smile corrected, smile model, stage speeds).
+                rate, bin, dark / hot-pixel / smile / keystone corrected, smile model, stage speeds).
             fsync: Accepted for API symmetry; currently unused.
             hypercube: Band-first ``(wavelength, slit, scan)`` array, kept by
                 reference.  The header's ``data type`` and ``byte order`` follow its dtype.

@@ -1,7 +1,12 @@
 # Spectral quality analysis
 
 The quality layer has no Qt dependency. It measures an uncropped before/after
-pair on the same zero-based detector grid. Keystone is outside this release.
+pair on the same zero-based detector grid. It checks the spectral axis (smile and wavelength).
+The along-slit geometry (keystone) has its own QC in `modules.smile.keystone`: a re-trace of the
+lamp lines and the target bars on the corrected frames (per line / bar and the median, px RMS),
+leave-one-line-out residuals of both surfaces and the per-feature weights (`KeystoneAnalysis.qc`,
+`keystone_report`; see *Keystone* in `README.md`). For a smile + keystone model, run this
+quality analysis after the geometry model is built (calibration step 3).
 
 ## Python API
 

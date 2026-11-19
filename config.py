@@ -3,7 +3,7 @@ import os
 import json
 import logging
 import math
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from modules.acquisition.config import ProcessingConfig, parse_wavelength_ranges
@@ -50,10 +50,29 @@ def config_sections() -> dict:
     }
 
 
+def default_settings() -> dict:
+    """Flat default settings used to recreate deleted settings files.
+
+    The dataclass defaults, with the data folders written relative to the project (as the
+    shipped ``config/*.json`` have them) and tuples as JSON lists.
+    """
+    data = {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(AppConfig()).items()}
+    data.update(dark_frame_folder="dark_frames", smile_map_folder="smile_maps",
+                camera_profile_folder="camera_profiles")
+    return data
+
+
 def load_app_config(path: str | None = None) -> AppConfig:
-    """Read the split config directory; missing/invalid files fail explicitly."""
+    """Read the split config directory.
+
+    Deleted files (``app.json``, a section file, the wavelength base, the active wavelength
+    profile) are recreated from :func:`default_settings` with a warning; the messages are kept
+    in ``config._config_repairs`` for the window to show. Files that exist but are invalid
+    still fail explicitly.
+    """
     from modules.configuration import ConfigStore
     store = ConfigStore(path or str(Path(PROJECT_ROOT) / 'config'), sections=config_sections())
+    repairs = store.repair_missing(default_settings())
     data = store.read()
     missing = set(AppConfig.__dataclass_fields__) - set(data) - {"preprocessing_backend", "sensor_pixel_size", "profile_timing",
                                                                  "resolution_source", "fwhm_step_factor",
@@ -124,6 +143,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
         raise ValueError(f"free_duration_s must be {FREE_SCAN_MIN_S:g} to {FREE_SCAN_MAX_S:g} seconds, "
                          f"not {config.free_duration_s}")
     config._config_store = store
+    config._config_repairs = repairs
     config._wavelength_profile = data.get('_wavelength_profile')
     config.camera_profile = None      # set by the scan controller once the camera is open
     logger.info("Loaded config: %s", config)

@@ -373,7 +373,9 @@ class RadiometricReferenceDialog(QDialog):
     def _key_text(self) -> str:
         k = self.key
         temp = scan_temperature_c(self.metadata)
-        parts = [k.label(), f"Smile {'on' if k.smile_corrected else 'off'}",
+        smile = ("on + keystone" if k.smile_corrected and k.keystone_corrected
+                 else "on" if k.smile_corrected else "off")
+        parts = [k.label(), f"Smile {smile}",
                  f"dark {'on' if k.dark_corrected else 'off' if k.dark_corrected is False else 'unknown'}"]
         if temp is not None:
             parts.append(f"sensor {temp:.1f} °C")

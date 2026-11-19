@@ -19,7 +19,10 @@ Usage::
 Data conventions:
     A spectral image is a 2-D array ``(slit rows, spectral columns)``; rows and columns
     are zero-based pixels. ``smile`` is a curved-line distortion: a spectral line's
-    column shifts with the slit row. Corrections remap columns only (rows are unchanged).
+    column shifts with the slit row. A smile-only model remaps columns only (rows are
+    unchanged); a smile + keystone model (:mod:`modules.smile.keystone`, fitted from a
+    line-target frame) also moves rows along the slit, as one combined remap, and is
+    stored as format 4 (``map_x`` + ``map_y``).
     Analysis works in ``float32``; the runtime path (:class:`modules.smile.runtime.SmileRuntime`)
     keeps uint8/uint16/float32 input dtype. Invalid border columns are zero-filled or cropped
     (``margin = (left, right)`` px). Calibrations are stored as ``.npz`` (see the README).
@@ -67,6 +70,7 @@ from .calibration import (
     SmileCalibration,
     build_maps,
     calibration_from_analysis,
+    calibration_from_keystone,
     correct_smile,
     crop_margin,
     load_calibration,
@@ -79,6 +83,15 @@ from .analysis import (
     verify_on_frame,
 )
 from .corrector import SmileCorrector
+from .keystone import (
+    GeometryModel,
+    KeystoneAnalysis,
+    TargetLine,
+    analyze_keystone,
+    keystone_report,
+    normalize_target,
+    trace_target_lines,
+)
 
 _GUI_EXPORTS = {
     "HAVE_QT", "PlotCanvas", "SmileCorrectionWidget",
@@ -119,10 +132,13 @@ __all__ = [
     # Analysis
     "SmileAnalysis", "analyze_smile", "verify_on_frame",
     # Calibration
-    "SmileCalibration", "calibration_from_analysis",
+    "SmileCalibration", "calibration_from_analysis", "calibration_from_keystone",
     "save_calibration", "load_calibration",
     # Sklearn API
     "SmileCorrector",
+    # Keystone (joint smile + keystone geometry)
+    "GeometryModel", "KeystoneAnalysis", "TargetLine", "analyze_keystone",
+    "keystone_report", "normalize_target", "trace_target_lines",
     # Qt (optional)
     "SmileCorrectionWidget", "PlotCanvas", "HAVE_QT",
     "SmileMainWindow", "launch_gui",

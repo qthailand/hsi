@@ -71,6 +71,7 @@ class MainWindow(QMainWindow):
         from modules.compute_runtime import initialize_compute
         self.compute_capabilities = initialize_compute()
         self.config = load_app_config()
+        QTimer.singleShot(0, self._report_config_repairs)     # once the window is up
         from modules.frame_exchange import FrameExchange
         self.frame_exchange = FrameExchange(self)
         self.frame_exchange.capture_requested.connect(self._request_snapshot)
@@ -209,6 +210,15 @@ class MainWindow(QMainWindow):
         """Show a warning dialog."""
         QMessageBox.warning(self, title, text)
 
+    def _report_config_repairs(self) -> None:
+        """Tell the user which deleted settings files were recreated from defaults (if any)."""
+        repairs = getattr(self.config, "_config_repairs", None) or []
+        if repairs:
+            self.warn("Configuration repaired",
+                      "These settings files were missing and have been recreated:\n\n- "
+                      + "\n- ".join(repairs)
+                      + "\n\nCheck the settings (camera, scan, processing) before scanning.")
+
     def error(self, title: str, text: str) -> None:
         """Show an error dialog."""
         QMessageBox.critical(self, title, text)
@@ -307,6 +317,7 @@ class MainWindow(QMainWindow):
         if self.scan_window is None and getattr(self, "_scan_opened_once", False):
             try:
                 self.config = load_app_config()
+                self._report_config_repairs()
             except Exception as exc:
                 logger.exception("Cannot reload configuration")
                 QMessageBox.critical(self, "Configuration", f"Cannot reload config, keeping the previous one:\n{exc}")

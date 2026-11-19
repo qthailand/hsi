@@ -2,7 +2,8 @@
 
 app.json is published last;
 profile writes use unique names so a failed save cannot replace the active one.
-Paths are resolved against the project directory.
+Paths are resolved against the project directory. Missing files are recreated from
+defaults by :meth:`ConfigStore.repair_missing` (unreadable ones are never overwritten).
 
 Layout (project root = parent of the settings directory)::
 
@@ -112,6 +113,63 @@ class ConfigStore:
         base=self.root/'calibration'/'wavelength'/'base.json'
         self._atomic(base,{'m':data['m'],'c':data['c'],'units':'nm'})
         self._atomic(self.manifest,{'format_version':1,'sections':refs,'wavelength_base':str(base.relative_to(self.root)),'active_wavelength':None})
+
+    def repair_missing(self,defaults):
+        """Recreate the settings files that are missing, from ``defaults``; return what was done.
+
+        A deleted file must not stop the application from starting. Each of these is rebuilt
+        and logged as a warning (the returned messages are for the user):
+
+        * ``app.json``: a new manifest naming ``<section>.json`` and the base file, no active profile.
+        * ``<section>.json``: the section's keys from ``defaults`` (an existing file is kept).
+        * ``calibration/wavelength/base.json``: ``m``/``c`` from ``defaults``.
+        * The ``active_wavelength`` profile: not rebuilt; the manifest stops naming it, so the
+          base ``m``/``c`` (and the per-camera ``wavelength_bin<N>.json`` files) are used.
+
+        A file that exists but cannot be read (bad JSON, wrong format) is never overwritten:
+        :meth:`read` still raises for it, as it may hold edits the user wants back.
+
+        Args:
+            defaults: Flat dict holding every section key plus ``m`` (nm/px, unbinned) and ``c`` (nm).
+
+        Returns:
+            list[str]: One message per recreated file; empty when nothing was missing.
+        """
+        repaired=[]
+        def note(text):
+            logger.warning('Configuration repaired: %s',text);repaired.append(text)
+        if self.manifest.exists():
+            manifest=self._read(self.manifest);changed=False
+        else:
+            manifest={'format_version':1,'sections':{},'wavelength_base':'calibration/wavelength/base.json','active_wavelength':None}
+            changed=True;note(f'{self._show(self.manifest)} was missing; recreated')
+        if manifest.get('format_version')!=1:return repaired          # read() reports it
+        sections=manifest.setdefault('sections',{})
+        for section,keys in self.sections.items():
+            if section not in sections:
+                sections[section]=section+'.json';changed=True
+            path=self._section_path(manifest,section)
+            if not path.exists():
+                path=self.directory/(section+'.json')
+                if sections[section]!=path.name:sections[section]=path.name;changed=True
+                self._atomic(path,{k:defaults[k] for k in keys if k in defaults})
+                note(f'{self._show(path)} was missing; recreated with default {section} settings')
+        base=self.root/manifest.setdefault('wavelength_base','calibration/wavelength/base.json')
+        if not base.exists():
+            self._atomic(base,{'m':defaults['m'],'c':defaults['c'],'units':'nm'})
+            note(f"{self._show(base)} was missing; recreated with default m={defaults['m']}, c={defaults['c']} nm "
+                 '(per-camera wavelength files still take precedence)')
+        active=manifest.get('active_wavelength')
+        if active and not (self.root/active).exists():
+            manifest['active_wavelength']=None;changed=True
+            note(f'active wavelength profile {active} is missing; using the base m/c')
+        if changed:self._atomic(self.manifest,manifest)
+        return repaired
+
+    def _show(self,path):
+        """``path`` relative to the project root, for messages."""
+        try:return str(Path(path).relative_to(self.root)).replace('\\','/')
+        except ValueError:return str(path)
 
     def read(self):
         """Load all sections into one flat settings dict.

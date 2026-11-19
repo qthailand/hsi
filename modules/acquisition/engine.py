@@ -221,6 +221,7 @@ class AcquisitionEngine:
         # spectral binning
         self._binner = None
         self._binner_fitted = False
+        self._binner_border = (0, 0)        # Smile border columns the fitted binner leaves out
         self._binner_lock = threading.Lock()
 
         self._dark_capture_mode: bool = False
@@ -590,9 +591,14 @@ class AcquisitionEngine:
         Returns:
             dict: ``dark_corrected``, ``hot_pixel_corrected``, ``smile_corrected`` (bools),
             ``hot_pixel_count``, ``smile_model`` (file name) and ``smile_model_created`` when
-            they apply, ``frame_rate_hz``, and the wavelength provenance and calibration
-            warnings of :meth:`calibration_provenance`.  The correction keys are left out when
-            no frame was processed yet or the frame was a dark-capture frame (unknown).
+            they apply; ``smile_border_bands`` (``[k0, k1, n_full]``: the bins of the full grid
+            kept because the others average Smile border columns that are zero-filled at the
+            slit ends) when bins were left out; ``keystone_corrected`` (``True``) and ``keystone_row_margin``
+            (``[top, bottom]`` rows) only when the Smile model also corrects keystone (never
+            ``False``: scans without keystone keep the key of older references),
+            ``frame_rate_hz``, and the wavelength provenance and calibration warnings of
+            :meth:`calibration_provenance`.  The correction keys are left out when no frame
+            was processed yet or the frame was a dark-capture frame (unknown).
         """
         info = {} if self._camera_hz is None else {"frame_rate_hz": self._camera_hz}
         info.update(self.calibration_provenance())
@@ -611,6 +617,19 @@ class AcquisitionEngine:
             created = getattr(getattr(getattr(self, "_smile", None), "calibration", None), "created", None)
             if created:
                 info["smile_model_created"] = str(created)
+        if info["smile_corrected"]:
+            full = getattr(self, "_binner_full", None) if getattr(self, "_binner_fitted", False) else None
+            kept = getattr(full, "source_bins", None)          # a plain read, as the other fields
+            if kept is not None:
+                info["smile_border_bands"] = [int(v) for v in kept]
+            cal = getattr(getattr(self, "_smile", None), "calibration", None)
+            if getattr(cal, "has_keystone", False):
+                info["keystone_corrected"] = True
+                try:
+                    top, bottom = getattr(cal, "row_margin", (0, 0))
+                    info["keystone_row_margin"] = [int(top), int(bottom)]
+                except (TypeError, ValueError):
+                    pass
         return info
 
     def calibration_provenance(self) -> dict:
@@ -731,7 +750,8 @@ class AcquisitionEngine:
             return None
         if k1 - k0 == full.n_bins:
             return full
-        if current is not None and getattr(current, 'source_bins', None) == (k0, k1, full.n_bins):
+        offset, total = (0, full.n_bins) if full.source_bins is None else (full.source_bins[0], full.source_bins[2])
+        if current is not None and getattr(current, 'source_bins', None) == (offset + k0, offset + k1, total):
             return current
         return full.subset(k0, k1)
 
@@ -803,6 +823,8 @@ class AcquisitionEngine:
     def _range_info(full, binner, range_nm) -> dict:
         """The ``info`` dict of ``wavelength_range_applied``."""
         source = binner.source_bins if binner is not full else None
+        if source is not None and full.source_bins is not None:     # full: the Smile-trimmed grid
+            source = (source[0] - full.source_bins[0], source[1] - full.source_bins[0])
         lam = binner.lambda_out
         return {
             "range_nm": range_nm,
@@ -909,10 +931,11 @@ class AcquisitionEngine:
                 smile = ('Missing', 'Model for another setting')
             elif model is None:
                 smile = ('Missing', f'No model · bin {bin_value}')
-            elif 'smile' in warnings:
-                smile = ('Applied', f'{Path(self._smile.path).name} · setting unverified')
             else:
-                smile = ('Applied', Path(self._smile.path).name)
+                name = Path(self._smile.path).name
+                if getattr(model, 'has_keystone', False):
+                    name = f'Smile + keystone · {name}'
+                smile = ('Applied', f'{name} · setting unverified' if 'smile' in warnings else name)
         source = wavelength.get('wavelength_source', 'config')
         if source == 'stored':
             wl = ('Applied', wavelength.get('wavelength_profile', f'Stored · bin {bin_value}'))
@@ -1203,6 +1226,9 @@ class AcquisitionEngine:
         with self._binner_lock:
             binner = self._binner
             fitted = self._binner_fitted
+        border = self._smile_border(width)
+        if fitted and border != self._binner_border and not self._scanning:
+            fitted = False                          # another Smile model (or none): other valid columns
 
         if not fitted:
             camera_bin = getattr(self.backend, 'current_bin', 1)
@@ -1221,9 +1247,55 @@ class AcquisitionEngine:
                 mm, camera_bin, step, info["resolution_source"],
                 binner.lambda_out[0], binner.lambda_out[-1],
             )
+            binner = self._smile_trim(binner, border)
+            self._binner_border = border
             # Publishes the full binner, or the bins of the wavelength range cut from it.
             binner = self._publish_range(binner)
         return binner
+
+    def _smile_border(self, width: int) -> tuple:
+        """``(left, right)`` spectral columns the loaded Smile model zero-fills in some slit rows.
+
+        The remap reads past the sensor edge there (the smile is largest at the slit ends), so
+        those columns hold zeros or a partial interpolation in part of the slit. ``(0, 0)``
+        without a model, or for a model of another frame width.
+        """
+        cal = getattr(getattr(self, "_smile", None), "calibration", None)
+        if cal is None:
+            return (0, 0)
+        try:
+            if int(cal.image_shape[1]) != int(width):
+                return (0, 0)
+            left, right = (max(0, int(v)) for v in cal.margin)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return (0, 0)
+        return (left, right)
+
+    def _smile_trim(self, binner: LambdaBinner, border) -> LambdaBinner:
+        """The bins of ``binner`` whose every spectral pixel lies outside the Smile border.
+
+        A bin averaging zero-filled border columns is darker (down to a fraction of its level)
+        in the slit rows where the smile reaches past the sensor, and its effective wavelength
+        moves there, so no flat-field or row-wise factor can correct it for every target: such
+        bins are left out. The result is a :meth:`LambdaBinner.subset` (``source_bins`` on the
+        full grid, so a wavelength range cut from it is still recorded on that grid), or
+        ``binner`` itself when no bin touches the border.
+        """
+        left, right = border
+        if not (left or right):
+            return binner
+        keep = np.where((binner.iL >= left) & (binner.iR <= binner.v_ - right))[0]
+        if keep.size == binner.n_bins:
+            return binner
+        if keep.size < MIN_RANGE_BANDS:
+            logger.warning("Smile border %s leaves %d of %d bands; all bands kept", border, keep.size,
+                           binner.n_bins)
+            return binner
+        k0, k1 = int(keep[0]), int(keep[-1]) + 1
+        logger.info("Smile border: columns %d left / %d right are zero-filled at the slit ends; bands %d:%d of "
+                    "%d kept (%.1f-%.1f nm)", left, right, k0, k1, binner.n_bins,
+                    binner.lambda_out[k0], binner.lambda_out[k1 - 1])
+        return binner.subset(k0, k1)
 
     def _bin_frame(self, frame: np.ndarray) -> np.ndarray:
         """LambdaBinning. frame = (h, v) uint16"""

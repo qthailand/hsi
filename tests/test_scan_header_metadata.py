@@ -155,6 +155,59 @@ def test_correction_info_reports_what_the_last_frame_went_through():
     assert info['smile_corrected'] is False and 'smile_model' not in info
 
 
+@pytest.mark.parametrize('has_keystone', [False, True])
+def test_correction_info_marks_keystone_only_with_a_keystone_model(has_keystone):
+    """``keystone_corrected`` is written only when the model corrects keystone, never ``False``:
+    scans without keystone keep the key of references and flat-fields made before keystone."""
+    calibration = NS(has_keystone=has_keystone, row_margin=(3, 4), created='2026-11-18T09:00:00')
+    status = (False, True, 1, True, id(calibration), 'C:/maps/smile_model_bin2.npz', 2, False)
+    engine = _engine(status, np.zeros((5, 2), int))
+    engine._smile = NS(calibration=calibration)
+    info = engine.correction_info()
+    assert info['smile_corrected'] is True and info['smile_model_created'] == '2026-11-18T09:00:00'
+    if has_keystone:
+        assert info['keystone_corrected'] is True and info['keystone_row_margin'] == [3, 4]
+    else:
+        assert 'keystone_corrected' not in info and 'keystone_row_margin' not in info
+    # the smile model failed on the last frame: neither smile nor keystone was applied
+    failed = _engine(status[:-1] + (True,))
+    failed._smile = NS(calibration=calibration)
+    assert 'keystone_corrected' not in failed.correction_info()
+
+
+def test_keystone_fields_round_trip_through_the_header(tmp_path):
+    export(tmp_path / 'cube.img', {**SCAN, 'smile_corrected': True, 'keystone_corrected': True,
+                                   'keystone_row_margin': [3, 4]})
+    text = (tmp_path / 'cube.img.hdr').read_text()
+    assert 'keystone corrected = 1\n' in text
+    assert 'keystone row margin top bottom (px) = [3, 4]\n' in text
+    back = metadata_from_header(parse_envi_header(str(tmp_path / 'cube.img')))
+    assert back['keystone_corrected'] is True and back['keystone_row_margin'] == '[3, 4]'
+    export(tmp_path / 'plain.img', SCAN)
+    assert 'keystone' not in (tmp_path / 'plain.img.hdr').read_text()      # no keystone: left out
+
+
+def test_live_status_names_a_smile_keystone_model():
+    from modules.acquisition import AcquisitionEngine, AcquisitionSink
+    events = []
+
+    class Sink(AcquisitionSink):
+        def correction_status(self, status):
+            events.append(status)
+
+    engine = AcquisitionEngine.__new__(AcquisitionEngine)
+    engine.backend = NS(current_bin=2, _dark_mean=None, _dark_enabled=False)
+    engine._last_correction_status = None
+    engine.sink = Sink()
+    frame = NS(shape=(4, 6))
+    engine._smile = NS(calibration=NS(has_keystone=False), path='C:/maps/smile_model_bin2.npz')
+    engine._report_corrections(frame)
+    assert events[-1]['smile'] == ('Applied', 'smile_model_bin2.npz')
+    engine._smile = NS(calibration=NS(has_keystone=True), path='C:/maps/smile_model_bin2.npz')
+    engine._report_corrections(frame)
+    assert events[-1]['smile'] == ('Applied', 'Smile + keystone · smile_model_bin2.npz')
+
+
 @pytest.mark.parametrize('status', [None, (True, True, 1, True, 1, 'x', 2, False)])
 def test_correction_state_is_unknown_without_a_processed_scan_frame(status):
     assert _engine(status, hz=None).correction_info() == {}

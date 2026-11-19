@@ -24,6 +24,21 @@ stage type), the reference target was scanned at most 4 h before the scan and th
 temperature is within 2 °C; scan length and speed may differ. Every key field is also an ENVI
 header field, so a scan reopened from its file gives the same key.
 
+References and flat-field profiles (`modules.flatfield`, which compares the same key without
+exposure, stage type and full scale) are tied to the geometry model: their rows and bands are
+pixels *after* the Smile (and keystone) remap. The key holds the Smile model file and its creation
+time, so re-fitting the model refuses the old ones, and `keystone_corrected`: `True` when the
+model is a smile + keystone model (`modules.smile.keystone`; rows moved along the slit), absent
+(`None`) otherwise. `None` and `False` are the same "no keystone", so `reference.json` /
+`flatfield.json` written before keystone existed still match scans without it; a reference or
+flat-field made with one geometry is refused for scans of the other (`geometry: scan has keystone
+correction, reference was made without it - make a new one with the smile + keystone model`, and
+the reverse). Make the flat-field and then the radiometric reference again after every new
+geometry model. A keystone model leaves the top/bottom rows it cannot fill (`keystone row margin
+top bottom (px)` in the header) zero-filled: they hold 0 counts and come out as 0 after
+calibration (rows outside the ROI take the nearest ROI row's factors). Keep the ROI off them, and
+crop them before analysis.
+
 A reference is made from the scan just finished with *Save as Radiometric Reference* (Scan
 window): `RadiometricReferenceDialog` (`reference_dialog.py`, Qt) shows the cube, offers five ROI
 tools - **Rect**, **Ellipse**, **Freehand** (all with handles afterwards: edge handles stretch one

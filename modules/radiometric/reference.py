@@ -199,6 +199,10 @@ class ReferenceKey:
         smile_corrected: Whether the Smile correction was applied.
         smile_model: Smile model file (compared when Smile correction is on).
         smile_model_created: Creation time of that model: a re-fitted model keeps its file name.
+        keystone_corrected: Whether the Smile model also corrected keystone (rows moved along
+            the slit, :mod:`modules.smile.keystone`). ``None`` and ``False`` both mean "no
+            keystone" (keys written before keystone existed have no value); a reference made
+            with one geometry does not fit scans of the other.
         dark_corrected: Whether dark subtraction was applied (required: factors need it).
         hot_pixel_corrected: Whether hot pixels were repaired.
         stage_type: ``"linear"``, ``"rotation"`` or ``"free"`` (no stage).
@@ -220,6 +224,7 @@ class ReferenceKey:
     smile_corrected: Optional[bool] = None
     smile_model: Optional[str] = None
     smile_model_created: Optional[str] = None
+    keystone_corrected: Optional[bool] = None
     dark_corrected: Optional[bool] = None
     hot_pixel_corrected: Optional[bool] = None
     stage_type: Optional[str] = None
@@ -254,6 +259,7 @@ class ReferenceKey:
             smile_corrected=_bool(metadata.get("smile_corrected")),
             smile_model=_text(metadata.get("smile_model")),
             smile_model_created=_text(metadata.get("smile_model_created")),
+            keystone_corrected=_bool(metadata.get("keystone_corrected")),
             dark_corrected=_bool(metadata.get("dark_corrected")),
             hot_pixel_corrected=_bool(metadata.get("hot_pixel_corrected")),
             stage_type=_text(metadata.get("stage_type")),
@@ -287,6 +293,7 @@ class ReferenceKey:
             smile_corrected=_bool(data.get("smile_corrected")),
             smile_model=_text(data.get("smile_model")),
             smile_model_created=_text(data.get("smile_model_created")),
+            keystone_corrected=_bool(data.get("keystone_corrected")),
             dark_corrected=_bool(data.get("dark_corrected")),
             hot_pixel_corrected=_bool(data.get("hot_pixel_corrected")),
             stage_type=_text(data.get("stage_type")),
@@ -351,10 +358,24 @@ class ReferenceKey:
         if self.smile_corrected and scan.smile_corrected:
             compare("smile model", self.smile_model, scan.smile_model)
             compare("smile model created", self.smile_model_created, scan.smile_model_created)
+        problems.extend(self._keystone_mismatch(scan))
         compare("dark correction", self.dark_corrected, scan.dark_corrected)
         compare("hot-pixel correction", self.hot_pixel_corrected, scan.hot_pixel_corrected)
         compare("stage type", self.stage_type, scan.stage_type, lambda a, b: a.lower() == b.lower())
         return problems
+
+    def _keystone_mismatch(self, scan: "ReferenceKey") -> List[str]:
+        """Keystone correction moves pixels along the slit, so row-wise factors (and flat-field
+        profiles) made with one geometry do not fit scans of the other. ``None`` = ``False``.
+        The texts say "a new one" since flat-field profiles use the same comparison."""
+        ref_ks, scan_ks = bool(self.keystone_corrected), bool(scan.keystone_corrected)
+        if ref_ks == scan_ks:
+            return []
+        if scan_ks:
+            return ["geometry: scan has keystone correction, reference was made without it"
+                    " - make a new one with the smile + keystone model"]
+        return ["geometry: scan has no keystone correction, reference was made with it"
+                " - load the smile + keystone model or make a new one"]
 
     def _band_mismatch(self, scan: "ReferenceKey") -> List[str]:
         if not self.wavelengths and not scan.wavelengths:
