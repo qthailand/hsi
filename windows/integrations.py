@@ -640,6 +640,33 @@ class SpectralResolutionIntegration(Integration):
         self.host.show_status(f"FWHM saved: {path}")
 
 
+class FocusMapIntegration(Integration):
+    """Live focus map of the bar target (``modules.focus_map``), fed with one-shot frames."""
+
+    def menu_entries(self):
+        return [("Focus Map (bar target)", self.open)]
+
+    def open(self, *_):
+        """Open the focus map; *Live* keeps asking for frames, labelled in nm when a calibration is stored."""
+        from modules.focus_map import FocusMapWidget, linear_wavelength
+        widget = FocusMapWidget()
+        widget.set_grab_available(True)
+
+        def wavelength(camera_bin):
+            controller = self.host.scan_controller
+            if controller is None:
+                return None
+            profile = controller._stored_wavelength_profile()
+            bin_now = int(camera_bin or controller.camera_bin)
+            return linear_wavelength(profile.base_m * bin_now, profile.c)
+
+        widget.set_wavelength_provider(wavelength)
+        widget.grabRequested.connect(lambda: self.host.grab_for(widget))
+        self.host.frame_exchange.frame_ready.connect(widget.accept_snapshot)
+        self.host.frame_exchange.failed.connect(widget.snapshot_failed)
+        self.host.open_widget(widget, "Focus Map", (1250, 760))
+
+
 class ReferenceROIIntegration(Integration):
     """Visual reference-ROI selection: a preview scan feeds the widget, the saved profile drives the live overlay."""
 

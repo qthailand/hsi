@@ -82,6 +82,25 @@ class Surface2D:
                 k += 1
         return out
 
+    def grid(self, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+        """Values on the grid ``ys`` (rows) x ``xs`` (columns): ``(len(ys), len(xs))``.
+
+        Same numbers as ``self(Y, X)`` on the meshgrid, but separable
+        (``By @ C @ Bx.T``): a full-frame map costs two small matrix products
+        instead of one full-frame array per coefficient.
+        """
+        y0, y1 = self.y_rng
+        x0, x1 = self.x_rng
+        Y = 2.0 * (np.asarray(ys, dtype=float).ravel() - y0) / (y1 - y0) - 1.0
+        X = 2.0 * (np.asarray(xs, dtype=float).ravel() - x0) / (x1 - x0) - 1.0
+        if self.clamp:
+            Y = np.clip(Y, -1.0, 1.0)
+            X = np.clip(X, -1.0, 1.0)
+        By = np.stack([Y ** i for i in range(self.deg_y + 1)], axis=1)
+        Bx = np.stack([X ** j for j in range(self.deg_x + 1)], axis=1)
+        C = np.asarray(self.coef, dtype=float).reshape(self.deg_y + 1, self.deg_x + 1)
+        return By @ C @ Bx.T
+
     def __repr__(self) -> str:
         """Short description with degrees and clamp flag."""
         return (

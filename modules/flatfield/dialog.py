@@ -34,6 +34,7 @@ from matplotlib.figure import Figure
 from PyQt5.QtWidgets import QApplication, QDialog, QDoubleSpinBox, QFormLayout, QLabel, QVBoxLayout
 
 from modules.radiometric import roi_tools as rt
+from modules.radiometric.reference import scan_temperature_c
 from modules.radiometric.reference_dialog import RadiometricReferenceDialog, _escape
 
 from .core import DEFAULT_MIN_COVERAGE, compute_flatfield
@@ -199,7 +200,8 @@ class FlatFieldDialog(RadiometricReferenceDialog):
                 "response_min": round(float(row_profile.min()), 4), "response_max": round(float(row_profile.max()), 4)}
         try:
             saved = self.store.save(result["profile"], self.key, mask=mask, coverage=result["coverage"],
-                                    info=info, acquired_at=started)
+                                    info=info, acquired_at=started,
+                                    sensor_temperature_c=scan_temperature_c(self.metadata))
         except Exception as exc:
             logger.exception("Flat-field profile could not be stored")
             self._report_error("Create flat-field profile", f"The profile could not be stored: {exc}")
@@ -233,6 +235,7 @@ class FlatFieldViewDialog(QDialog):
             f"{profile.key.label()} · rows {profile.span[0]}-{profile.span[1]} of {lines} measured "
             f"({profile.coverage:.0%}) · response {float(values.min()):.2f}-{float(values.max()):.2f} · "
             f"{len(joints)} joint rows · scanned {profile.acquired_at}"
+            + (f" at {profile.sensor_temperature_c:.1f} °C" if profile.sensor_temperature_c is not None else "")
             + (f"\nWARNING: brightness steps at {_step_text(steps)}: the pieces of the target did not lie "
                "alike, and scans calibrated with this profile carry the opposite steps" if steps else ""))
         self.summary_label.setWordWrap(True)

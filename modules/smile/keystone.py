@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import copy
 import math
+import datetime as _dt
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -56,18 +57,22 @@ from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import find_peaks
 
 from .core import _INTERP, _centroid_row, auto_sat_level, estimate_noise, robust_sigma, trace_line
+from .debug_log import logged_analysis
 
 __all__ = [
     "KEYSTONE_SCHEMA", "TargetLine", "GeometrySurface", "GeometryModel", "KeystoneAnalysis",
-    "normalize_target", "trace_target_lines", "lamp_points_from_analysis", "fit_geometry",
-    "analyze_keystone", "row_margin_from_map", "keystone_report",
+    "normalize_target", "detect_polarity", "frames_same_scene", "trace_target_lines", "bar_coverage",
+    "coverage_warnings", "lamp_points_from_analysis", "fit_geometry",
+    "analyze_keystone", "analyze_keystone_from_smile", "row_margin_from_map", "keystone_report",
 ]
 
 KEYSTONE_SCHEMA = "hsi-smile-keystone/1"
 #: Target bars must span at least this share of the slit (rows).
 MIN_SLIT_COVERAGE = 0.5
-#: A bar is kept when it is followed over at least this share of the columns.
-MIN_BAR_COVERAGE = 0.4
+#: A bar is kept when it is followed over at least this share of the columns (first to last traced
+#: column). 0.25 keeps the slit-end bars of an optic with a curved focus, which are sharp over only
+#: part of the spectrum; where they are missing the per-zone coverage warning still reports it.
+MIN_BAR_COVERAGE = 0.25
 #: A lamp line enters the joint fit when it is traced over this share of the rows (and spans y_ref).
 MIN_LAMP_COVERAGE = 0.5
 #: Re-traced straightness (px RMS of the median line / bar) above which the result carries a warning.
@@ -83,16 +88,21 @@ class GeometrySurface:
 
     Evaluation outside the measured box: ``X`` is clamped to ``[xlo, xhi]`` (edge value held along
     the spectrum); ``Y`` outside ``[ylo, yhi]`` continues linearly from the edge (value + slope),
-    so a magnification term keeps scaling the rows instead of a cubic blowing up.
+    so a magnification term keeps scaling the rows instead of a cubic blowing up
+    (``y_rule="linear"``), or is clamped too (``y_rule="hold"``, the rule of a stored smile-only
+    :class:`~modules.smile.surface.Surface2D`).
     """
 
-    def __init__(self, xpows, ypows, x0, sx, y0, sy, coef=None, box=None):
+    def __init__(self, xpows, ypows, x0, sx, y0, sy, coef=None, box=None, y_rule="linear"):
         self.xpows = [int(v) for v in xpows]
         self.ypows = [int(v) for v in ypows]
         self.x0, self.sx, self.y0, self.sy = float(x0), float(sx), float(y0), float(sy)
         n = (len(self.ypows), len(self.xpows))
         self.C = np.zeros(n) if coef is None else np.asarray(coef, float).reshape(n)
         self.box = None if box is None else [float(v) for v in box]     # [xlo, xhi, ylo, yhi]
+        if y_rule not in ("linear", "hold"):
+            raise ValueError("y_rule must be 'linear' or 'hold'")
+        self.y_rule = y_rule
 
     # -- basis
     def _bx(self, X, deriv=False):
@@ -141,7 +151,7 @@ class GeometrySurface:
             return X, Y, np.zeros_like(Y)
         Xc = np.clip(X, self.box[0], self.box[1])
         Yc = np.clip(Y, self.box[2], self.box[3])
-        return Xc, Yc, Y - Yc
+        return Xc, Yc, (Y - Yc) if self.y_rule == "linear" else np.zeros_like(Y)
 
     def at(self, X, Y):
         """Value at points with the box rule."""
@@ -161,11 +171,26 @@ class GeometrySurface:
 
     def to_json(self) -> dict:
         return dict(xpows=self.xpows, ypows=self.ypows, x0=self.x0, sx=self.sx, y0=self.y0, sy=self.sy,
-                    coef=self.C.tolist(), box=self.box)
+                    coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
 
     @classmethod
     def from_json(cls, d: dict) -> "GeometrySurface":
-        return cls(d["xpows"], d["ypows"], d["x0"], d["sx"], d["y0"], d["sy"], d["coef"], d.get("box"))
+        return cls(d["xpows"], d["ypows"], d["x0"], d["sx"], d["y0"], d["sy"], d["coef"], d.get("box"),
+                   d.get("y_rule", "linear"))
+
+    @classmethod
+    def from_smile(cls, s) -> "GeometrySurface":
+        """The same function as a smile-only :class:`~modules.smile.surface.Surface2D` ``s(y, x)``.
+
+        ``Surface2D`` normalises ``Y = 2 (y - y0) / (y1 - y0) - 1`` (the same for ``x``) and clamps
+        to ``[-1, 1]``: centre / half-range here, and a box that holds the edge value on both axes.
+        """
+        y0, y1 = (float(v) for v in s.y_rng)
+        x0, x1 = (float(v) for v in s.x_rng)
+        coef = np.asarray(s.coef, float).reshape(s.deg_y + 1, s.deg_x + 1)
+        box = [x0, x1, y0, y1] if getattr(s, "clamp", True) else None
+        return cls(range(0, s.deg_x + 1), range(0, s.deg_y + 1), 0.5 * (x0 + x1), max(1e-9, 0.5 * (x1 - x0)),
+                   0.5 * (y0 + y1), max(1e-9, 0.5 * (y1 - y0)), coef, box, y_rule="hold")
 
 
 @dataclass
@@ -180,6 +205,9 @@ class GeometryModel:
         dy: Keystone surface (rows), anchored at ``x_ref``.
         lamp_X: Destination column of every lamp line used.
         target_Y: Destination row of every target bar used.
+        dx_rows: ``"destination"``: ``dx(X, Y)`` of the joint fit (lamp + target in one solve);
+            ``"source"``: ``dx(X, y)`` over the RAW row, as a stored smile-only model measures it
+            (keystone fitted later onto a stored smile): ``x = X + dx(X, Y + dy(X, Y))``.
     """
 
     shape: Tuple[int, int]
@@ -189,33 +217,40 @@ class GeometryModel:
     dy: GeometrySurface
     lamp_X: List[float] = field(default_factory=list)
     target_Y: List[float] = field(default_factory=list)
+    dx_rows: str = "destination"
 
     def maps(self) -> Tuple[np.ndarray, np.ndarray]:
         """``(map_x, map_y)`` float32 ``(H, W)`` destination -> source maps."""
         h, w = self.shape
         xs = np.arange(w, dtype=float); ys = np.arange(h, dtype=float)
-        mx = xs[None, :] + self.dx.grid(xs, ys)
         my = ys[:, None] + self.dy.grid(xs, ys)
+        if self.dx_rows == "source":
+            X = np.broadcast_to(xs[None, :], my.shape)
+            mx = X + self.dx.at(X, my)                  # the smile at the row the pixel is read from
+        else:
+            mx = xs[None, :] + self.dx.grid(xs, ys)
         return np.ascontiguousarray(mx, np.float32), np.ascontiguousarray(my, np.float32)
 
     def source(self, X, Y):
         """Raw (source) coordinates of destination points: ``(x, y)``."""
         X = np.asarray(X, float); Y = np.asarray(Y, float)
-        return X + self.dx.at(X, Y), Y + self.dy.at(X, Y)
+        y = Y + self.dy.at(X, Y)
+        return X + self.dx.at(X, y if self.dx_rows == "source" else Y), y
 
     def destination(self, x, y, iterations: int = 8):
         """Destination coordinates of raw points (fixed-point inverse of :meth:`source`)."""
         x = np.asarray(x, float); y = np.asarray(y, float)
         X, Y = x.copy(), y.copy()
         for _ in range(iterations):
-            X = x - self.dx.at(X, Y)
+            X = x - self.dx.at(X, y if self.dx_rows == "source" else Y)
             Y = y - self.dy.at(X, Y)
         return X, Y
 
     def to_json(self) -> dict:
         return dict(schema=KEYSTONE_SCHEMA, shape=[int(v) for v in self.shape], y_ref=float(self.y_ref),
                     x_ref=float(self.x_ref), dx=self.dx.to_json(), dy=self.dy.to_json(),
-                    lamp_X=[float(v) for v in self.lamp_X], target_Y=[float(v) for v in self.target_Y])
+                    lamp_X=[float(v) for v in self.lamp_X], target_Y=[float(v) for v in self.target_Y],
+                    dx_rows=self.dx_rows)
 
     @classmethod
     def from_json(cls, d: dict) -> "GeometryModel":
@@ -223,7 +258,8 @@ class GeometryModel:
             raise ValueError(f"Not a smile + keystone geometry model ({d.get('schema')!r}).")
         return cls(shape=tuple(int(v) for v in d["shape"]), y_ref=float(d["y_ref"]), x_ref=float(d["x_ref"]),
                    dx=GeometrySurface.from_json(d["dx"]), dy=GeometrySurface.from_json(d["dy"]),
-                   lamp_X=list(d.get("lamp_X", [])), target_Y=list(d.get("target_Y", [])))
+                   lamp_X=list(d.get("lamp_X", [])), target_Y=list(d.get("target_Y", [])),
+                   dx_rows=d.get("dx_rows", "destination"))
 
 
 # ----------------------------------------------------------------------------------------------- target
@@ -340,16 +376,21 @@ def _column_noise(img: np.ndarray) -> np.ndarray:
     return np.maximum(sig, 1e-6)
 
 
-def _merge_close(peaks: np.ndarray, near: float = 0.6):
+def _merge_close(peaks: np.ndarray, near: float = 0.6, spacing: Optional[float] = None):
     """Group dips closer than ``near`` x the median spacing into one feature.
 
     A pair of thin lines that the optics resolve in one part of the spectrum and blur together in
     another would make a centroid locked on one of them jump; the centroid of the whole pair
     stays put. Returns a list of ``(centre, half_span)`` (``half_span`` 0 for a single dip) and
     the list of merged groups (rows) for the report.
+
+    *spacing* (the bar period) replaces the median spacing of *peaks*: a column where only a few,
+    scattered bars are found has a median spacing far above the period, which would group two
+    neighbouring bars as one pair.
     """
     peaks = np.sort(np.asarray(peaks, float))
-    spacing = float(np.median(np.diff(peaks))) if len(peaks) > 1 else 0.0
+    if spacing is None:
+        spacing = float(np.median(np.diff(peaks))) if len(peaks) > 1 else 0.0
     groups = [[peaks[0]]] if len(peaks) else []
     for p in peaks[1:]:
         if p - groups[-1][-1] < near * spacing:
@@ -380,19 +421,198 @@ def _neighbour_halfwins(rows: np.ndarray, halfwin: int) -> List[int]:
     return _feature_halfwins([(float(r), 0.0) for r in rows], halfwin)
 
 
-def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, band: int = 5, step: Optional[int] = None,
-                       snr_min: float = 5.0, sat_level: Optional[float] = None, seed_column: Optional[float] = None,
-                       max_gap: Optional[int] = None, min_coverage: float = MIN_BAR_COVERAGE, normalized=None
-                       ) -> Tuple[List[TargetLine], dict]:
-    """Follow the bars of a line-target frame across the spectrum.
+#: Dark-area share within this distance of 50 % counts as ambiguous: both polarities are traced and compared.
+POLARITY_AMBIGUOUS = 0.08
 
-    Each bar is located per sampled column as the intensity centroid of the (inverted, for dark
-    bars) slit profile in a window of ~0.45 bar periods, re-centred iteratively, starting from the
-    brightest part of the spectrum and walking outward with a jump limit.
+
+def detect_polarity(target, white=None, dark=None, normalized=None, band: int = 5, snr_min: float = 5.0
+                    ) -> Tuple[str, dict]:
+    """Are the target's bars darker or brighter than the background? Decided from the image.
+
+    The bars are the narrow features: on a target of thin dark lines on white, the pixels darker
+    than the middle level (between the 5th and 95th percentile of the lit, normalised middle 60 %
+    of the spectrum) cover less than half of the area; on bright lines on black, more. When the
+    share is within ``POLARITY_AMBIGUOUS`` of 50 % (bars and gaps about as wide), both polarities
+    are traced and the one with more bars followed further and scattering less is taken; either
+    then gives the same geometry within a few hundredths of a pixel.
 
     Args:
         target: Line-target frame ``(H, W)`` (raw counts).
-        polarity: ``"dark"`` (bars darker than the background) or ``"bright"``.
+        white, dark: See :func:`normalize_target`.
+        normalized: Pre-computed :func:`normalize_target` output.
+        band, snr_min: Passed to the tracing of the ambiguous case.
+
+    Returns:
+        ``(polarity, info)``: ``"dark"`` or ``"bright"``; ``info`` has ``dark_fraction``,
+        ``method`` (``"area"`` or ``"trace"``) and, for ``"trace"``, the score of each polarity.
+    """
+    raw = np.asarray(target, np.float32)
+    norm = normalize_target(raw, white, dark) if normalized is None else np.asarray(normalized, np.float32)
+    h, w = norm.shape
+    c0, c1 = int(0.2 * w), max(int(0.2 * w) + 1, int(0.8 * w))
+    v = norm[:, c0:c1]
+    v = v[v > 0]
+    if v.size < 100:
+        return "dark", dict(dark_fraction=None, method="default", reason="no lit pixels")
+    lo, hi = np.percentile(v, (5, 95))
+    dark_fraction = float(np.mean(v < 0.5 * (lo + hi)))
+    info = dict(dark_fraction=dark_fraction, method="area")
+    if abs(dark_fraction - 0.5) >= POLARITY_AMBIGUOUS:
+        return ("dark" if dark_fraction < 0.5 else "bright"), info
+    scores = {}
+    for pol in ("dark", "bright"):
+        try:
+            bars, _ = trace_target_lines(raw, polarity=pol, band=band, snr_min=snr_min, normalized=norm)
+        except ValueError:
+            scores[pol] = 0.0
+            continue
+        xn = lambda b: (b.x - (w - 1) / 2.0) / max(1.0, (w - 1) / 2.0)
+        scatter = float(np.median([np.sqrt(np.mean((b.y - np.polynomial.polynomial.polyval(xn(b), b.coef)) ** 2))
+                                   for b in bars]))
+        cover = float(np.median([b.coverage for b in bars]))
+        scores[pol] = len(bars) * cover / (1.0 + scatter / 0.1)
+    info.update(method="trace", scores=scores)
+    return max(scores, key=scores.get) if any(scores.values()) else "dark", info
+
+
+#: Most seed columns :func:`trace_target_lines` starts bars from.
+MAX_SEED_COLUMNS = 4
+#: An extra seed column is added only when it finds at least this many bars no earlier seed found.
+MIN_SEED_GAIN = 2
+
+
+def _seed_peaks(img: np.ndarray, lit: np.ndarray, noise_col: np.ndarray, col: int, snr_min: float) -> np.ndarray:
+    """Rows of the bars (peaks of the signed profile) at column *col*, inside the lit slit."""
+    sm = gaussian_filter1d(img[:, col], 1.0)
+    peaks, props = find_peaks(sm, prominence=snr_min * float(noise_col[col]))
+    if len(peaks) >= 2:
+        prom = props["prominences"]
+        peaks = peaks[prom >= 0.25 * float(np.percentile(prom, 90))]
+    return peaks[lit[peaks, col]] if len(peaks) else peaks
+
+
+def _extra_seeds(img, lit, lit_cols, noise_col, seed: int, peaks, period: float, snr_min: float,
+                 max_seeds: int) -> List[int]:
+    """The first seed plus, greedily, the columns that find the most bars no earlier seed found.
+
+    Candidates are 19 columns spread over the lit spectrum; a candidate counts the bars it finds
+    farther than half a period (by row) from every bar already found. Row is close enough: the
+    keystone moves a bar by a few pixels across the spectrum, much less than half a period on a
+    useful target. Stops at *max_seeds* or when no candidate adds :data:`MIN_SEED_GAIN` bars.
+    """
+    seeds = [int(seed)]
+    if max_seeds <= 1:
+        return seeds
+    full = np.flatnonzero(lit_cols.mean(axis=0) > 0.5)
+    if full.size < 2:
+        return seeds
+    lo, hi = int(full[0]), int(full[-1])
+    cand = np.unique(np.linspace(lo + 0.03 * (hi - lo), hi - 0.03 * (hi - lo), 19).round().astype(int))
+    found = {int(c): _seed_peaks(img, lit, noise_col, int(c), snr_min) for c in cand}
+    known = np.asarray(peaks, float)
+    while len(seeds) < max_seeds:
+        best, gain = None, MIN_SEED_GAIN - 1
+        for c, rows in found.items():
+            if c in seeds or len(rows) == 0:
+                continue
+            if known.size:
+                new = int(np.sum(np.min(np.abs(rows[:, None] - known[None, :]), axis=1) > 0.5 * period))
+            else:
+                new = len(rows)
+            if new > gain:
+                best, gain = c, new
+        if best is None:
+            break
+        seeds.append(best)
+        known = np.r_[known, found[best]]
+    return seeds
+
+
+def _track_near(tracks: List[dict], col: int, row: float, step: int, tol: float) -> bool:
+    """Whether a traced bar passes within *tol* rows of ``(col, row)`` (at a point within two steps)."""
+    for t in tracks:
+        for c in (col, col - step, col + step, col - 2 * step, col + 2 * step):
+            y = t["pts"].get(int(c))
+            if y is not None and abs(y - row) <= tol:
+                return True
+    return False
+
+
+def _end_fit(pts: Dict[int, float], side: str, n: int = 12):
+    """Line through the *n* points at one end (``"lo"``/``"hi"``) of a track: ``(coef, end column)``."""
+    xs = np.array(sorted(pts), float)
+    sel = xs[:n] if side == "lo" else xs[-n:]
+    ys = np.array([pts[int(c)] for c in sel])
+    coef = np.polynomial.polynomial.polyfit(sel, ys, 1) if sel.size >= 3 else np.array([ys.mean(), 0.0])
+    return coef, float(sel[0] if side == "lo" else sel[-1])
+
+
+def _same_bar(a: dict, b: dict, period: float, w: int) -> bool:
+    """Whether two traced point sets belong to one bar.
+
+    Overlapping tracks: their rows agree (median over the shared columns within a quarter period).
+    Tracks with a gap no wider than a quarter of the frame: each one's end line, extended to the
+    middle of the gap, meets the other's within 0.3 periods.
+    """
+    pa, pb = a["pts"], b["pts"]
+    shared = sorted(set(pa) & set(pb))
+    if len(shared) >= 3:
+        return float(np.median([abs(pa[c] - pb[c]) for c in shared])) < 0.25 * period
+    if shared:
+        return False
+    (alo, ahi), (blo, bhi) = (min(pa), max(pa)), (min(pb), max(pb))
+    if ahi < blo:
+        left, right = pa, pb
+    elif bhi < alo:
+        left, right = pb, pa
+    else:
+        return False                                    # interleaved columns without shared ones: not one bar
+    cl, xl = _end_fit(left, "hi")
+    cr, xr = _end_fit(right, "lo")
+    if xr - xl > 0.25 * w:
+        return False
+    xm = 0.5 * (xl + xr)
+    yl = float(np.polynomial.polynomial.polyval(xm, cl))
+    yr = float(np.polynomial.polynomial.polyval(xm, cr))
+    return abs(yl - yr) < 0.3 * period
+
+
+def _merge_tracks(tracks: List[dict], period: float, w: int) -> List[dict]:
+    """Merge tracks of the same bar (found from different seeds); the earlier track's points win
+    where both have one. A track that matches two different earlier tracks joins neither."""
+    out: List[dict] = []
+    for t in tracks:
+        hits = [m for m in out if _same_bar(m, t, period, w)]
+        if len(hits) == 1:
+            m = hits[0]
+            for c, y in t["pts"].items():
+                m["pts"].setdefault(c, y)
+            m["hw"] = min(m["hw"], t["hw"])
+        elif not hits:
+            out.append(dict(t, pts=dict(t["pts"])))
+    return out
+
+
+def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, band: int = 5, step: Optional[int] = None,
+                       snr_min: float = 5.0, sat_level: Optional[float] = None, seed_column: Optional[float] = None,
+                       max_gap: Optional[int] = None, min_coverage: float = MIN_BAR_COVERAGE, normalized=None,
+                       max_seeds: int = MAX_SEED_COLUMNS) -> Tuple[List[TargetLine], dict]:
+    """Follow the bars of a line-target frame across the spectrum.
+
+    Each bar is located per sampled column as the intensity centroid of the (inverted, for dark
+    bars) slit profile in a window of ~0.45 bar periods, re-centred iteratively, starting from a
+    seed column and walking outward with a jump limit.
+
+    Bars are found first at the seed column with the most bar contrast. When the focus varies
+    across the frame (field curvature with a focus that moves with wavelength), bars near the slit
+    ends may be too blurred there to be found at all, although they are sharp elsewhere in the
+    spectrum. Further seed columns are therefore added (up to *max_seeds*), each where the most
+    bars appear that no earlier seed found; bars found from several seeds are merged into one.
+
+    Args:
+        target: Line-target frame ``(H, W)`` (raw counts).
+        polarity: ``"dark"`` (bars darker than the background), ``"bright"``, or ``"auto"``
+            (:func:`detect_polarity`; the choice is in ``info["polarity"]`` / ``info["polarity_auto"]``).
         white, dark: See :func:`normalize_target`.
         band: Columns averaged per sample (noise).
         step: Column step between samples; ``None`` = *band*.
@@ -403,10 +623,14 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
             about 4 % of the width (crosses a dim stripe of the target or the light).
         min_coverage: Minimum share of the width a bar must be followed over.
         normalized: Pre-computed :func:`normalize_target` output (skips normalisation).
+        max_seeds: Most seed columns (1 = the single-seed tracing of earlier versions).
 
     Returns:
-        ``(lines, info)``; lines sorted by row. ``info``: ``seed_column``, ``period``, ``halfwin``,
-        ``noise``, ``rejected`` (bars dropped and why).
+        ``(lines, info)``; lines sorted by row. ``info``: ``seed_column`` (the first seed; each
+        line's ``y_seed`` is its row there, from its fit when it was traced from another seed),
+        ``seed_columns`` (all seeds used), ``period``, ``halfwin``, ``noise``, ``polarity`` (the one
+        used), ``polarity_auto`` (detection details or ``None``), ``rejected`` (bars dropped and
+        why), ``merged`` (close pairs), ``from_extra_seeds`` (bars that only extra seeds found).
 
     Raises:
         ValueError: Fewer than three bars, or bars spanning less than ``MIN_SLIT_COVERAGE`` of the slit.
@@ -415,13 +639,16 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
     if raw.ndim != 2 or min(raw.shape) < 16:
         raise ValueError("Use a 2-D target frame of at least 16 x 16 pixels.")
     h, w = raw.shape
-    if polarity not in ("dark", "bright"):
-        raise ValueError("polarity must be 'dark' or 'bright'")
+    if polarity not in ("dark", "bright", "auto"):
+        raise ValueError("polarity must be 'dark', 'bright' or 'auto'")
+    norm = normalize_target(raw, white, dark) if normalized is None else np.asarray(normalized, np.float32)
+    polarity_auto = None
+    if polarity == "auto":
+        polarity, polarity_auto = detect_polarity(raw, normalized=norm, band=band, snr_min=snr_min)
     sign = -1.0 if polarity == "dark" else 1.0
     if sat_level is None or sat_level <= 0:
         sat_level = auto_sat_level(raw)
     clipped = raw >= 0.98 * float(sat_level)
-    norm = normalize_target(raw, white, dark) if normalized is None else np.asarray(normalized, np.float32)
     lit = norm > 0
     band = max(1, int(band))
     step = max(1, int(step or band))
@@ -429,23 +656,21 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
     clip_cols = _band_columns(clipped.astype(np.float32), band) > 0
     lit_cols = _band_columns(lit.astype(np.float32), band) > 0.99
 
-    level = np.median(np.where(lit, norm, 0.0), axis=0)
     if seed_column is None:
+        # the column with the most bar contrast over the lit slit (where the most bars are present);
+        # not the brightest one: after a white frame every column is equally bright
         lo, hi = int(0.2 * w), max(int(0.2 * w) + 1, int(0.8 * w))
-        seed = int(lo + np.argmax(gaussian_filter1d(level[lo:hi], 5)))
+        lit_any = lit.any(axis=1)
+        sub = np.where(lit[lit_any], norm[lit_any], np.nan)
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            contrast = np.nan_to_num(np.nanstd(sub, axis=0) * np.mean(lit[lit_any], axis=0))
+        seed = int(lo + np.argmax(gaussian_filter1d(contrast[lo:hi], 7)))
     else:
         seed = int(np.clip(round(seed_column), 0, w - 1))
     noise_col = _column_noise(img)                      # bar contrast and noise change along the spectrum
-    prof = img[:, seed]
     noise = float(noise_col[seed])
-    sm = gaussian_filter1d(prof, 1.0)
-    peaks, props = find_peaks(sm, prominence=snr_min * noise)
-    prom = props["prominences"] if len(peaks) else np.zeros(0)
-    if len(peaks) >= 2:
-        keep = prom >= 0.25 * float(np.percentile(prom, 90))
-        peaks, prom = peaks[keep], prom[keep]
-    inside = lit[peaks, seed] if len(peaks) else np.zeros(0, bool)
-    peaks = peaks[inside]
+    peaks = _seed_peaks(img, lit, noise_col, seed, snr_min)
     if len(peaks) < 3:
         raise ValueError("Fewer than three target bars found at the seed column. Check the halogen light, the "
                          "bar polarity (dark / bright) and the exposure.")
@@ -453,25 +678,19 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
     centres = np.array([c for c, _ in feats])
     period = float(np.median(np.diff(centres))) if len(centres) > 1 else float(np.median(np.diff(peaks)))
     halfwin = int(max(2, math.floor(0.45 * period)))
-    halfwins = _feature_halfwins(feats, halfwin)
     if max_gap is None:
         max_gap = max(6, int(math.ceil(0.04 * w / step)))
     cols = np.arange(seed % step, w, step)
     cols = cols[(cols >= band // 2) & (cols <= w - 1 - band // 2)]
-    if seed not in cols:
-        cols = np.unique(np.r_[cols, seed])
-    rejected = []
-    lines: List[TargetLine] = []
-    for p, hw in zip(centres, halfwins):
+    seeds = _extra_seeds(img, lit, lit_cols, noise_col, seed, peaks, period, snr_min, max(1, int(max_seeds)))
+    cols = np.unique(np.r_[cols, seeds])
+
+    def follow(sd, c0, hw):
+        """Points ``{column: row}`` of one bar followed both ways from seed column *sd*."""
         max_jump = max(1.0, 0.5 * hw)
-        pts: Dict[int, float] = {}
-        c0, ok = _centroid_row(img[:, seed], float(p), hw, np.inf, snr_min * noise)
-        if not ok or abs(c0 - p) > max_jump:
-            rejected.append((float(p), "no centroid at the seed column"))
-            continue
-        pts[seed] = c0
+        pts: Dict[int, float] = {int(sd): c0}
         for direction in (-1, 1):
-            chosen = cols[cols < seed][::-1] if direction < 0 else cols[cols > seed]
+            chosen = cols[cols < sd][::-1] if direction < 0 else cols[cols > sd]
             yc, gap = c0, 0
             for c in chosen:
                 r0, r1 = int(round(yc)) - hw, int(round(yc)) + hw + 1
@@ -486,16 +705,48 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
                     continue
                 pts[int(c)] = yy
                 yc, gap = yy, 0
-        xs = np.array(sorted(pts), float)
-        ys = np.array([pts[int(c)] for c in xs], float)
+        return pts
+
+    rejected = []                                       # (row at the first seed, why)
+    tracks: List[dict] = []                             # dict(pts, hw, span, seed, y0)
+    for k, sd in enumerate(seeds):
+        if k == 0:
+            s_feats = feats
+        else:
+            # group with the first seed's period: this column may show only a few scattered bars
+            s_feats, s_merged = _merge_close(_seed_peaks(img, lit, noise_col, sd, snr_min), spacing=period)
+            merged += [g for g in s_merged if all(abs(g[0] - m[0]) > 0.5 * period for m in merged)]
+        for (p, sp), hw in zip(s_feats, _feature_halfwins(s_feats, halfwin)):
+            max_jump = max(1.0, 0.5 * hw)
+            c0, ok = _centroid_row(img[:, sd], float(p), hw, np.inf, snr_min * float(noise_col[sd]))
+            if not ok or abs(c0 - p) > max_jump:
+                if k == 0:
+                    rejected.append((float(p), "no centroid at the seed column"))
+                continue
+            if k > 0 and _track_near(tracks, sd, c0, step, max(1.0, 0.5 * hw)):
+                continue                                # already followed through this column from an earlier seed
+            tracks.append(dict(pts=follow(sd, c0, hw), hw=int(hw), span=float(sp), seed=int(sd), y0=float(c0)))
+    tracks = _merge_tracks(tracks, period, w)
+
+    lines: List[TargetLine] = []
+    from_extra = 0
+    for t in tracks:
+        xs = np.array(sorted(t["pts"]), float)
+        ys = np.array([t["pts"][int(c)] for c in xs], float)
         cov = float(np.ptp(xs) / max(1, w - 1)) if xs.size else 0.0
         if xs.size < 8 or cov < min_coverage:
-            rejected.append((float(p), "followed over %.0f %% of the width only" % (100 * cov)))
+            if t["seed"] == seed:
+                rejected.append((t["y0"], "followed over %.0f %% of the width only" % (100 * cov)))
             continue
         xn = (xs - (w - 1) / 2.0) / max(1.0, (w - 1) / 2.0)
         coef, keep = _robust_poly(xn, ys, 3)
-        lines.append(TargetLine(y_seed=float(c0), x=xs[keep], y=ys[keep], coef=coef, coverage=cov,
-                                halfwin=int(hw), span=float(dict(feats).get(float(p), 0.0))))
+        if seed in t["pts"]:
+            y_seed = float(t["pts"][seed])
+        else:                                           # traced from another seed: its row at the first seed
+            y_seed = float(np.polynomial.polynomial.polyval((seed - (w - 1) / 2.0) / max(1.0, (w - 1) / 2.0), coef))
+        from_extra += t["seed"] != seed
+        lines.append(TargetLine(y_seed=y_seed, x=xs[keep], y=ys[keep], coef=coef, coverage=cov,
+                                halfwin=t["hw"], span=t["span"]))
     lines.sort(key=lambda t: t.y_seed)
     # drop bars that merged with a neighbour (same track)
     out: List[TargetLine] = []
@@ -504,6 +755,9 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
             rejected.append((t.y_seed, "duplicate of the bar at row %.1f" % out[-1].y_seed))
             continue
         out.append(t)
+    # a bar rejected at the first seed but followed from another one is not rejected
+    rejected = [(r, why) for r, why in rejected
+                if why.startswith("duplicate") or all(abs(t.y_seed - r) > 0.5 * period for t in out)]
     if len(out) < 3:
         raise ValueError("Fewer than three target bars could be followed across the spectrum. Check the halogen "
                          "light, the focus and the bar polarity.")
@@ -511,9 +765,106 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
     if span < MIN_SLIT_COVERAGE * (h - 1):
         raise ValueError("The target bars span only %.0f %% of the slit (minimum %.0f %%). Place the line target "
                          "across the whole slit." % (100 * span / max(1, h - 1), 100 * MIN_SLIT_COVERAGE))
-    info = dict(seed_column=seed, period=period, halfwin=halfwin, noise=noise, band=band, step=step,
-                polarity=polarity, rejected=rejected, merged=merged)
+    info = dict(seed_column=seed, seed_columns=[int(c) for c in seeds], period=period, halfwin=halfwin, noise=noise,
+                band=band, step=step, polarity=polarity, polarity_auto=polarity_auto, rejected=rejected,
+                merged=merged, from_extra_seeds=int(from_extra))
     return out, info
+
+
+# ----------------------------------------------------------------------------------------------- coverage
+#: A spectral zone is covered when its bars span at least this share of the bars' full span along the slit.
+ZONE_SPAN_MIN = 0.9
+#: Lit slit rows beyond the outermost bars (at either end), as a share of the lit rows, above which a warning is given.
+SLIT_END_MAX = 0.06
+
+
+def bar_coverage(bars: List[TargetLine], shape, normalized=None, n_zones: int = 8, step: int = 5) -> dict:
+    """Where along the slit the target bars were followed, zone by zone across the spectrum.
+
+    The keystone's magnification at a wavelength comes from the outermost bars measured there. When
+    the bars near the slit ends are lost toward one end of the spectrum (dim, vignetted, blurred
+    corners), the model is extrapolated along the slit there although the bars' overall column span
+    looks complete; a single QC median does not show it.
+
+    Args:
+        bars: Traced bars (:func:`trace_target_lines`).
+        shape: ``(H, W)``.
+        normalized: :func:`normalize_target` output (its lit area sets the zones and the slit ends).
+        n_zones: Spectral zones across the lit columns.
+        step: Column step of the tracing (sets how many samples a zone should have).
+
+    Returns:
+        dict: ``zones`` (list of ``{c0, c1, n_bars, rows: [lo, hi] or None, share}``), ``bar_rows``
+        (rows of the outermost bars), ``lit_rows`` / ``lit_columns`` (``None`` without *normalized*).
+    """
+    h, w = (int(v) for v in shape)
+    out = dict(zones=[], bar_rows=None, lit_rows=None, lit_columns=None)
+    if not bars:
+        return out
+    lit_rows = lit_cols = None
+    if normalized is not None:
+        lit = np.asarray(normalized) > 0
+        rows_lit = np.flatnonzero(lit[:, int(0.3 * w):max(int(0.3 * w) + 1, int(0.7 * w))].mean(axis=1) > 0.5)
+        cols_lit = np.flatnonzero(lit[int(0.3 * h):max(int(0.3 * h) + 1, int(0.7 * h)), :].mean(axis=0) > 0.5)
+        if rows_lit.size:
+            lit_rows = [int(rows_lit[0]), int(rows_lit[-1])]
+        if cols_lit.size:
+            lit_cols = [int(cols_lit[0]), int(cols_lit[-1])]
+    c_lo, c_hi = lit_cols if lit_cols else (0, w - 1)
+    full = [float(min(b.y.min() for b in bars)), float(max(b.y.max() for b in bars))]
+    span = max(1.0, full[1] - full[0])
+    edges = np.linspace(c_lo, c_hi + 1, n_zones + 1)
+    zones = []
+    for c0, c1 in zip(edges[:-1], edges[1:]):
+        need = max(3, int(0.3 * (c1 - c0) / max(1, step)))
+        ys = [float(np.mean(b.y[(b.x >= c0) & (b.x < c1)])) for b in bars if np.count_nonzero((b.x >= c0) & (b.x < c1)) >= need]
+        rows = [min(ys), max(ys)] if len(ys) >= 2 else None
+        share = (rows[1] - rows[0]) / span if rows else 0.0
+        zones.append(dict(c0=int(c0), c1=int(c1) - 1, n_bars=len(ys), rows=rows, share=float(share)))
+    out.update(zones=zones, bar_rows=full, lit_rows=lit_rows, lit_columns=lit_cols)
+    return out
+
+
+def coverage_warnings(cov: dict, wavelength=None) -> List[str]:
+    """Readable warnings for :func:`bar_coverage`: spectral zones whose outermost bars are missing,
+    and lit slit ends without bars. ``wavelength(column)`` (optional) adds nm to the column ranges."""
+    def cols(c0, c1):
+        text = "columns %d-%d" % (c0, c1)
+        if wavelength is not None:
+            try:
+                text += " (%.0f-%.0f nm)" % (float(wavelength(c0)), float(wavelength(c1)))
+            except Exception:  # noqa: BLE001
+                pass
+        return text
+    warn = []
+    bad = [z for z in cov.get("zones", []) if z["share"] < ZONE_SPAN_MIN]
+    groups = []
+    for z in bad:
+        if groups and z["c0"] <= groups[-1][-1]["c1"] + 1:
+            groups[-1].append(z)
+        else:
+            groups.append([z])
+    full = cov.get("bar_rows") or [0, 0]
+    for g in groups:
+        rows = [z["rows"] for z in g if z["rows"]]
+        where = ("rows %.0f-%.0f only" % (min(r[0] for r in rows), max(r[1] for r in rows))) if rows else "no bars"
+        warn.append("%s: the bars cover %s (all bars: rows %.0f-%.0f), so the keystone there is extrapolated along "
+                    "the slit. Raise the exposure (the centre may come close to full scale), average frames of the "
+                    "static target, or add a white reference, so the bars near the slit ends are followed there too."
+                    % (cols(g[0]["c0"], g[-1]["c1"]).capitalize(), where, full[0], full[1]))
+    lit = cov.get("lit_rows")
+    if lit and cov.get("bar_rows"):
+        n = max(1, lit[1] - lit[0])
+        top, bottom = full[0] - lit[0], lit[1] - full[1]
+        ends = []
+        if top > SLIT_END_MAX * n:
+            ends.append("rows %d-%.0f" % (lit[0], full[0]))
+        if bottom > SLIT_END_MAX * n:
+            ends.append("rows %.0f-%d" % (full[1], lit[1]))
+        if ends:
+            warn.append("The lit slit has no bars at %s: the keystone there is extrapolated. Use a target whose bars "
+                        "reach the slit ends." % " and ".join(ends))
+    return warn
 
 
 # ----------------------------------------------------------------------------------------------- lamp points
@@ -686,8 +1037,9 @@ def _loo(data: _Data, sol: dict, make, which: str):
         except np.linalg.LinAlgError:
             return None, []
         sel = (idx == i) & (w > 0)
-        per.append(_rms(s.raw(X[sel], Y[sel]) - v[sel]))
-    return _rms(per), per
+        if sel.any():                       # a line / bar the robust weights dropped entirely has nothing to predict
+            per.append(_rms(s.raw(X[sel], Y[sel]) - v[sel]))
+    return (_rms(per) if per else None), per
 
 
 def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: float, x_ref: Optional[float] = None,
@@ -739,7 +1091,7 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
     if len(cand) > 1:
         res = {d: _loo(data, sol, lambda d=d: _surfaces((h, w), y_ref, x_ref, dx_deg, (d, dy_xdeg))[1], "y")[0]
                for d in cand}
-        valid = {d: v for d, v in res.items() if v is not None}
+        valid = {d: v for d, v in res.items() if v is not None and np.isfinite(v)}
         if valid:
             best = min(valid, key=valid.get)
             for d in sorted(valid):
@@ -809,7 +1161,7 @@ def _retrace(model: GeometryModel, lamp_corr, target_norm_corr, valid, lamp_half
     h, w = model.shape
     out = dict(lamp=[], target=[])
     per = dict(lamp=[], target=[])
-    lo, hi = model.dx.box[2], model.dx.box[3]
+    lo, hi = (model.dx.box[2], model.dx.box[3]) if model.dx.box else (0, h - 1)
     for X, hw in zip(model.lamp_X, lamp_halfwins):
         c = trace_line(lamp_corr, X, hw, sat_level, noise, snr_min)
         rows = np.flatnonzero(np.isfinite(c))
@@ -939,10 +1291,11 @@ def _jsonable(v):
     return v
 
 
-def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "dark", x_ref: Optional[float] = None,
+@logged_analysis("keystone (joint smile + keystone)")
+def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "auto", x_ref: Optional[float] = None,
                      dy_xdeg: int = 3, dy_ydeg="auto", band: int = 5, step: Optional[int] = None,
-                     snr_min: Optional[float] = None, interp: Optional[str] = None, inputs: Optional[dict] = None
-                     ) -> KeystoneAnalysis:
+                     snr_min: Optional[float] = None, interp: Optional[str] = None, inputs: Optional[dict] = None,
+                     wavelength=None) -> KeystoneAnalysis:
     """Joint smile + keystone geometry from a smile analysis and a line-target frame.
 
     Args:
@@ -951,13 +1304,14 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "d
         white: Optional white frame (target removed) for normalisation; strongly recommended.
         dark: Optional dark frame subtracted from target and white (not from the lamp, which the
             smile analysis already used as given).
-        polarity: ``"dark"`` or ``"bright"`` bars.
+        polarity: ``"dark"`` or ``"bright"`` bars, or ``"auto"`` (decided from the image).
         x_ref: Reference column (dy = 0); ``None``: frame centre within the bars' span.
         dy_xdeg, dy_ydeg: Keystone degrees (see :func:`fit_geometry`).
         band, step: Column averaging / step of the bar tracing.
         snr_min: Bar / line detection threshold; ``None``: the smile analysis value (5).
         interp: Remap interpolation for the check images; ``None``: the smile analysis's.
         inputs: Free description of the input files (stored in the model).
+        wavelength: Optional ``callable(column) -> nm`` to name the spectral range in coverage warnings.
 
     Returns:
         :class:`KeystoneAnalysis`.
@@ -980,6 +1334,8 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "d
     norm = normalize_target(t, white, dark)
     bars, tinfo = trace_target_lines(t, polarity=polarity, band=band, step=step, snr_min=snr,
                                      normalized=norm, sat_level=None)
+    polarity = tinfo["polarity"]
+    notes.append(_polarity_note(tinfo))
     for y, why in tinfo["rejected"]:
         notes.append("target bar near row %.0f not used: %s" % (y, why))
     sm = analysis.surface
@@ -1026,6 +1382,9 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "d
         elif v > RETRACE_WARN_PX:
             warn.append("The median of the %s is %.2f px RMS from straight after correction (limit %.2f px)."
                         % (label, v, RETRACE_WARN_PX))
+    cov = bar_coverage(bars, (h, w), normalized=norm, step=tinfo["step"])
+    qc["coverage"] = cov
+    warn.extend(coverage_warnings(cov, wavelength))
     if white is None:
         warn.append("No white frame: the illumination was flattened with a running mean along the slit only.")
     if summ["extrapolated_columns"] > 0.25:
@@ -1034,7 +1393,250 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "d
     return KeystoneAnalysis(model=model, map_x=mx, map_y=my, margin=margin, row_margin=row_margin,
                             target_lines=bars, qc=qc, summary=summ, warnings=warn, target_corr=target_corr,
                             lamp_corr=lamp_corr, target_norm=norm, interp=interp, polarity=polarity,
-                            created=time.strftime("%Y-%m-%dT%H:%M:%S"), inputs=dict(inputs or {}))
+                            created=_dt.datetime.now().isoformat(timespec="milliseconds"), inputs=dict(inputs or {}))
+
+
+def _solve_dy(bars: List[TargetLine], dx: GeometrySurface, sdy: GeometrySurface, x_ref: float, w: int,
+              iterations: int = 8) -> dict:
+    """Keystone alone, with the smile known over RAW rows (``dx_rows="source"``).
+
+    A bar point measured at raw ``(x, y)`` belongs to the destination column ``X = x - dx(X, y)``
+    (the row is the raw row, so this does not involve dy); its destination row is the bar's ``Ym``,
+    fixed by ``dy(x_ref, Ym) = 0``: ``Ym = bar_y(x_ref + dx(x_ref, Ym))``.
+    """
+    tx = np.concatenate([t.x for t in bars]); ty = np.concatenate([t.y for t in bars])
+    tm = np.concatenate([np.full(t.x.size, i) for i, t in enumerate(bars)])
+    Xt = tx.copy()
+    for _ in range(6):
+        Xt = tx - dx.at(Xt, ty)
+    Ym = np.array([float(b.y_at([x_ref], w)[0]) for b in bars])
+    for _ in range(6):
+        Ym = np.array([float(b.y_at([x_ref + float(dx.at(x_ref, y))], w)[0]) for b, y in zip(bars, Ym)])
+    Yt = Ym[tm]
+    wt = np.ones(tx.size)
+    for it in range(iterations):
+        sdy.fit(Xt, Yt, ty - Yt, wt)
+        rt = ty - (Yt + sdy.raw(Xt, Yt))
+        ht = _huber_weights(rt, wt > 0)
+        ft, _ = _feature_weights(rt, ht > 0, tm, len(bars))
+        new = ht * ft[tm]
+        if it >= 2 and np.array_equal(new > 0, wt > 0) and np.allclose(new, wt, rtol=1e-3, atol=1e-6):
+            wt = new
+            break
+        wt = new
+    sdy.fit(Xt, Yt, ty - Yt, wt)
+    rt = ty - (Yt + sdy.raw(Xt, Yt))
+    ft, st = _feature_weights(rt, wt > 0, tm, len(bars))
+    return dict(Ym=Ym, Xt=Xt, Yt=Yt, ty=ty, tm=tm, rt=rt, wt=wt, bar_weight=ft, bar_sigma=st)
+
+
+def _loo_dy(sol: dict, make, n: int):
+    """Leave-one-bar-out RMS (px) of the keystone surface."""
+    if n < 3:
+        return None, []
+    per = []
+    v = sol["ty"] - sol["Yt"]
+    for i in range(n):
+        s = make()
+        m = (sol["tm"] != i) & (sol["wt"] > 0)
+        try:
+            s.fit(sol["Xt"][m], sol["Yt"][m], v[m], sol["wt"][m])
+        except np.linalg.LinAlgError:
+            return None, []
+        sel = (sol["tm"] == i) & (sol["wt"] > 0)
+        if sel.any():                       # a bar the robust weights dropped entirely has nothing to predict
+            per.append(_rms(s.raw(sol["Xt"][sel], sol["Yt"][sel]) - v[sel]))
+    return (_rms(per) if per else None), per
+
+
+def _lamp_check(lamp_corr: np.ndarray, valid: np.ndarray, sat_level=None) -> dict:
+    """Straightness of the lamp lines on a corrected lamp frame (deviation from each line's median column)."""
+    from .core import detect_lines
+    a = np.asarray(lamp_corr, np.float32)
+    sat = auto_sat_level(a) if sat_level is None else float(sat_level)
+    noise = estimate_noise(a)
+    per, allv = [], []
+    for ln in detect_lines(a, sat):
+        if ln.saturated:
+            continue
+        c = trace_line(a, ln.column, max(3, int(round(1.2 * ln.fwhm))), sat, noise)
+        rows = np.flatnonzero(np.isfinite(c))
+        cx = int(np.clip(round(ln.column), 0, a.shape[1] - 1))
+        rows = rows[valid[rows, cx]]
+        if rows.size < 20:
+            continue
+        v = c[rows] - np.median(c[rows])
+        allv.extend(v.tolist())
+        per.append(dict(X=float(np.median(c[rows])), rms_px=_rms(v), max_px=float(np.max(np.abs(v))), n=int(v.size)))
+    allv = np.asarray(allv)
+    return dict(lamp_rms_px=_rms(allv), lamp_max_px=float(np.max(np.abs(allv))) if allv.size else float("nan"),
+                lamp_p95_px=float(np.percentile(np.abs(allv), 95)) if allv.size else float("nan"),
+                lamp_per_line=per)
+
+
+@logged_analysis("keystone (onto the stored smile)")
+def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=None, polarity: str = "auto",
+                                x_ref: Optional[float] = None, dy_xdeg: int = 3, dy_ydeg="auto", band: int = 5,
+                                step: Optional[int] = None, snr_min: float = 5.0, interp: str = "cubic",
+                                inputs: Optional[dict] = None, smile_info: Optional[dict] = None,
+                                lamp=None, wavelength=None) -> KeystoneAnalysis:
+    """Keystone from a line-target frame onto a STORED smile (no lamp frame needed).
+
+    For a spectrograph whose fore-lens is taken off to measure the smile (lamp at the slit) and put
+    back for the line target: the smile belongs to the spectrograph and detector, so the smile
+    model already stored for this camera setting is reused, and only the keystone is fitted. The
+    smile is defined over the raw row (as the lamp lines were measured), so the combined map reads
+    the smile at the row the pixel comes from: ``src_y = Y + dy(X, Y)``, ``src_x = X + S(src_y, X)``.
+    The smile stays exactly as stored (``S(y_ref, X) = 0``: the wavelength axis is unchanged).
+
+    Args:
+        smile: The stored smile-only :class:`~modules.smile.surface.Surface2D` ``S(y, x)``
+            (``SmileCalibration.surface()``), anchored at *y_ref*.
+        y_ref: Its reference row.
+        target: Line-target frame ``(H, W)`` taken with the lens on (same camera setting).
+        white, dark, polarity, x_ref, dy_xdeg, dy_ydeg, band, step, snr_min: As :func:`analyze_keystone`.
+        interp: Remap interpolation of the model.
+        inputs: Free description of the input files.
+        smile_info: Where the smile came from (file, created, ...), stored in the result.
+        lamp: Optional lamp frame of the same setting to CHECK the stored smile (not fitted).
+        wavelength: Optional ``callable(column) -> nm`` to name the spectral range in coverage warnings.
+
+    Returns:
+        :class:`KeystoneAnalysis` with ``model.dx_rows == "source"`` (``lamp_corr`` only with *lamp*).
+
+    Raises:
+        ValueError: Unusable target, or a lamp frame of another size.
+    """
+    t = np.asarray(target, np.float32)
+    if t.ndim != 2:
+        raise ValueError("The target frame must be 2-D (slit rows, spectral columns).")
+    h, w = t.shape
+    y0, y1 = (float(v) for v in smile.y_rng)
+    x0, x1 = (float(v) for v in smile.x_rng)
+    if y1 > h - 1 + 0.5 or x1 > w - 1 + 0.5:
+        raise ValueError(f"The stored smile was measured on a larger frame (rows to {y1:.0f}, columns to {x1:.0f}) "
+                         f"than this target {t.shape}: use the smile model of this camera setting / bin.")
+    notes: List[str] = []
+    norm = normalize_target(t, white, dark)
+    bars, tinfo = trace_target_lines(t, polarity=polarity, band=band, step=step, snr_min=snr_min,
+                                     normalized=norm, sat_level=None)
+    polarity = tinfo["polarity"]
+    notes.append(_polarity_note(tinfo))
+    for y, why in tinfo["rejected"]:
+        notes.append("target bar near row %.0f not used: %s" % (y, why))
+    t_lo = float(np.median([b.x.min() for b in bars])); t_hi = float(np.median([b.x.max() for b in bars]))
+    x_ref = float(np.clip((w - 1) / 2.0, t_lo, t_hi)) if x_ref is None else float(x_ref)
+    dx = GeometrySurface.from_smile(smile)
+    dy_xdeg = max(1, int(dy_xdeg))
+    sx, sy = max(1.0, (w - 1) / 2.0), max(1.0, (h - 1) / 2.0)
+    make = lambda d: GeometrySurface(range(1, dy_xdeg + 1), range(0, d + 1), x_ref, sx, (h - 1) / 2.0, sy)
+    if dy_ydeg == "auto":
+        cand = [d for d in range(0, MAX_DY_YDEG + 1) if d <= max(0, len(bars) - 3)]
+        d_y = min(1, cand[-1])
+    else:
+        cand = [max(0, min(int(dy_ydeg), len(bars) - 2))]
+        d_y = cand[0]
+    sol = _solve_dy(bars, dx, make(d_y), x_ref, w)
+    choice = {}
+    if len(cand) > 1:
+        res = {d: _loo_dy(sol, lambda d=d: make(d), len(bars))[0] for d in cand}
+        valid_res = {d: v for d, v in res.items() if v is not None and np.isfinite(v)}
+        if valid_res:
+            best = min(valid_res, key=valid_res.get)
+            for d in sorted(valid_res):
+                if valid_res[d] <= 1.1 * valid_res[best]:
+                    best = d
+                    break
+            d_y = best
+        choice = {str(k): v for k, v in res.items()}
+    sdy = make(d_y)
+    sol = _solve_dy(bars, dx, sdy, x_ref, w)
+    sdy.box = [float(np.percentile(sol["Xt"], 0.5)), float(np.percentile(sol["Xt"], 99.5)),
+               float(sol["Ym"].min()), float(sol["Ym"].max())]
+    loo_y, per_y = _loo_dy(sol, lambda: make(d_y), len(bars))
+    kt = sol["wt"] > 0
+    model = GeometryModel(shape=(h, w), y_ref=float(y_ref), x_ref=x_ref, dx=dx, dy=sdy, lamp_X=[],
+                          target_Y=[float(v) for v in sol["Ym"]], dx_rows="source")
+    mx, my = model.maps()
+    from .calibration import margin_from_map
+    margin = margin_from_map(mx, interp)
+    row_margin = row_margin_from_map(my, interp, (margin[0], w - 1 - margin[1]))
+    target_corr = _remap(norm, mx, my, interp)
+    valid = (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
+    rt = _retrace(model, np.zeros((h, w), np.float32), target_corr, valid, [], None, None, snr_min, polarity,
+                  tinfo["band"], [b.halfwin or tinfo["halfwin"] for b in bars], tinfo["step"])
+    med = lambda per: (float(np.nanmedian([p["rms_px"] for p in per])) if per else float("nan"))
+    qc = dict(
+        smile_source="stored", lamp_lines=0, target_bars=len(bars),
+        degrees=dict(dx=[smile.deg_y, smile.deg_x], dy=[d_y, dy_xdeg]), dy_ydeg_loo=choice,
+        before_lamp_rms_px=None, before_target_rms_px=_rms(sol["ty"] - sol["Yt"]),
+        fit_lamp_rms_px=None, fit_target_rms_px=_rms(sol["rt"][kt]),
+        fit_lamp_max_px=None, fit_target_max_px=float(np.max(np.abs(sol["rt"][kt]))) if kt.any() else float("nan"),
+        loo_lamp_rms_px=None, loo_target_rms_px=loo_y, loo_lamp_per_line_px=[], loo_target_per_bar_px=per_y,
+        rejected_points=int((~kt).sum()), fit_lamp_per_line_px=[], fit_target_per_bar_px=[float(v) for v in sol["bar_sigma"]],
+        lamp_weight=[], bar_weight=[float(v) for v in sol["bar_weight"]],
+        retrace_lamp_rms_px=None, retrace_lamp_max_px=None, retrace_lamp_p95_px=None, retrace_lamp_per_line=[],
+        retrace_lamp_median_line_px=None,
+        retrace_target_rms_px=rt["target_rms_px"], retrace_target_max_px=rt["target_max_px"],
+        retrace_target_p95_px=rt["target_p95_px"], retrace_target_per_bar=rt["target_per_bar"],
+        retrace_target_median_bar_px=med(rt["target_per_bar"]),
+        bar_period_px=tinfo["period"], bar_halfwin_px=tinfo["halfwin"], seed_column=tinfo["seed_column"],
+        normalised_with_white=white is not None, notes=notes, merged_bar_pairs=tinfo.get("merged", []),
+        smile_info=dict(smile_info or {}))
+    lamp_corr = None
+    if lamp is not None:
+        la = np.asarray(lamp, np.float32)
+        if la.shape != (h, w):
+            raise ValueError(f"The check lamp frame {la.shape} differs from the target {(h, w)}.")
+        lamp_corr = _remap(la, mx, my, interp)
+        lc = _lamp_check(lamp_corr, valid)
+        qc.update(retrace_lamp_rms_px=lc["lamp_rms_px"], retrace_lamp_max_px=lc["lamp_max_px"],
+                  retrace_lamp_p95_px=lc["lamp_p95_px"], retrace_lamp_per_line=lc["lamp_per_line"],
+                  retrace_lamp_median_line_px=med(lc["lamp_per_line"]), lamp_lines=len(lc["lamp_per_line"]))
+    weak = [p for p in rt["target_per_bar"] if np.isfinite(p["rms_px"]) and p["rms_px"] > 2 * RETRACE_WARN_PX]
+    if weak:
+        notes.append("%d target bars scatter over %.2f px RMS after correction (asymmetric profile or weak signal; "
+                     "the fit weights them down), rows %s" % (len(weak), 2 * RETRACE_WARN_PX,
+                                                            ", ".join("%.0f" % p["Y"] for p in weak[:12])))
+    summ = _summary(model, mx, my)
+    warn: List[str] = []
+    created = (smile_info or {}).get("created")
+    warn.append("Smile taken from the stored model%s: it was not re-measured here. Check it with a lamp frame "
+                "now and then (lens off is fine)." % (" of %s" % created if created else ""))
+    v = qc["retrace_target_median_bar_px"]
+    if not np.isfinite(v):
+        warn.append("The target bars could not be re-measured on the corrected frame.")
+    elif v > RETRACE_WARN_PX:
+        warn.append("The median of the target bars is %.2f px RMS from straight after correction (limit %.2f px)."
+                    % (v, RETRACE_WARN_PX))
+    lv = qc.get("retrace_lamp_median_line_px")
+    if lv is not None and np.isfinite(lv) and lv > RETRACE_WARN_PX:
+        warn.append("The check lamp frame is %.2f px RMS from straight with the stored smile: measure the smile "
+                    "again for this bin." % lv)
+    cov = bar_coverage(bars, (h, w), normalized=norm, step=tinfo["step"])
+    qc["coverage"] = cov
+    warn.extend(coverage_warnings(cov, wavelength))
+    if white is None:
+        warn.append("No white frame: the illumination was flattened with a running mean along the slit only.")
+    if summ["extrapolated_columns"] > 0.25:
+        warn.append("%.0f %% of the columns lie outside the lamp lines of the stored smile (held at the edge "
+                    "value)." % (100 * summ["extrapolated_columns"]))
+    return KeystoneAnalysis(model=model, map_x=mx, map_y=my, margin=margin, row_margin=row_margin,
+                            target_lines=bars, qc=qc, summary=summ, warnings=warn, target_corr=target_corr,
+                            lamp_corr=lamp_corr, target_norm=norm, interp=interp, polarity=polarity,
+                            created=_dt.datetime.now().isoformat(timespec="milliseconds"), inputs=dict(inputs or {}))
+
+
+def _polarity_note(tinfo: dict) -> str:
+    """One line saying which bar polarity was used and why."""
+    pol, auto = tinfo.get("polarity"), tinfo.get("polarity_auto")
+    if not auto:
+        return "Bar polarity: %s (set)" % pol
+    df = auto.get("dark_fraction")
+    share = "" if df is None else ", dark area %.0f %% of the lit target" % (100 * df)
+    how = {"area": "from the area of the narrow features", "trace": "both traced, the better kept",
+           "default": "default"}.get(auto.get("method"), auto.get("method"))
+    return "Bar polarity: %s (auto: %s%s)" % (pol, how, share)
 
 
 def keystone_report(k) -> str:
@@ -1044,7 +1646,11 @@ def keystone_report(k) -> str:
     f = lambda v: "-" if v is None else "%.3f px" % v
     lines = [
         "Smile + keystone geometry (%s)" % d.get("created", ""),
-        "Lamp lines %d, target bars %d, degrees dx %s dy %s" % (q["lamp_lines"], q["target_bars"],
+        *(["Smile: stored model %s (not re-fitted; keystone fitted onto it)"
+           % ((q.get("smile_info") or {}).get("created") or "")] if q.get("smile_source") == "stored" else []),
+        "Lamp lines %s, target bars %d, degrees dx %s dy %s" % (
+            ("%d (check frame)" % q["lamp_lines"] if q["lamp_lines"] else "- (stored smile)")
+            if q.get("smile_source") == "stored" else "%d" % q["lamp_lines"], q["target_bars"],
                                                                q["degrees"]["dx"], q["degrees"]["dy"]),
         "Before: lamp %s, target %s" % (f(q["before_lamp_rms_px"]), f(q["before_target_rms_px"])),
         "Fit RMS: lamp %s, target %s" % (f(q["fit_lamp_rms_px"]), f(q["fit_target_rms_px"])),
@@ -1064,37 +1670,118 @@ def keystone_report(k) -> str:
 
 
 # ----------------------------------------------------------------------------------------------- CLI
+#: Frames to be averaged must agree to this many rows (slit shift) ...
+SAME_SCENE_MAX_SHIFT = 0.5
+#: ... and this correlation of their slit profiles.
+SAME_SCENE_MIN_CORR = 0.95
+
+
+def frames_same_scene(frames: Sequence[np.ndarray], band: int = 41) -> Tuple[bool, List[dict]]:
+    """Do several target (or white) frames show the same scene, so they may be averaged?
+
+    Averaging frames of a target that moved, or of another part / distance of it, mixes two bar
+    patterns into doubled, asymmetric bars (a real GigE pair: period 21 px vs 14 px; each frame alone
+    re-traced to 0.06-0.07 px, their mean to 0.20 px). Each frame's slit profile (median of ``band``
+    columns in the middle of the spectrum) is compared with the first: the shift along the slit
+    (sub-pixel, from the cross-correlation peak) and the correlation.
+
+    Returns:
+        ``(ok, details)``: per frame after the first ``{"index", "shift_rows", "correlation"}``.
+    """
+    frames = [np.asarray(f, np.float32) for f in frames]
+    if len(frames) < 2:
+        return True, []
+    h, w = frames[0].shape
+    c0, c1 = max(0, w // 2 - band // 2), min(w, w // 2 + band // 2 + 1)
+
+    def prof(f):
+        p = np.median(f[:, c0:c1], axis=1).astype(np.float64)
+        p = p - uniform_filter1d(p, size=max(31, h // 8), mode="nearest")       # slow light trend out
+        return (p - p.mean()) / (p.std() + 1e-12)
+    ref = prof(frames[0])
+    details, ok = [], True
+    for i, f in enumerate(frames[1:], start=1):
+        if f.shape != (h, w):
+            return False, details + [dict(index=i, shift_rows=None, correlation=None, reason="other size")]
+        p = prof(f)
+        cc = np.correlate(p, ref, "full") / len(p)
+        k = int(np.argmax(cc))
+        sub = 0.0
+        if 0 < k < len(cc) - 1:
+            a, b, c = cc[k - 1], cc[k], cc[k + 1]
+            den = a - 2 * b + c
+            sub = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
+        shift = (k - (len(p) - 1)) + sub
+        corr = float(np.corrcoef(p, ref)[0, 1])
+        same = abs(shift) <= SAME_SCENE_MAX_SHIFT and corr >= SAME_SCENE_MIN_CORR
+        ok = ok and bool(same)
+        details.append(dict(index=i, shift_rows=float(shift), correlation=corr))
+    return bool(ok), details
+
+
 def _read(paths: Sequence[str]) -> np.ndarray:
     from .core import load_frame
     frames = [load_frame(p) for p in paths]
     if any(f.shape != frames[0].shape for f in frames):
         raise SystemExit("All frames of one kind must have the same size.")
+    if len(frames) > 1:
+        same, det = frames_same_scene(frames)
+        if not same:
+            bad = "; ".join("%s: shift %s rows, correlation %s" % (
+                paths[d["index"]], "?" if d.get("shift_rows") is None else "%.2f" % d["shift_rows"],
+                "?" if d.get("correlation") is None else "%.3f" % d["correlation"]) for d in det)
+            raise SystemExit("These frames do not show the same scene and must not be averaged (the target moved, "
+                             "or another part / distance of it was imaged): %s. Use one frame, or several frames "
+                             "of a target that does not move." % bad)
     return np.mean(np.stack(frames), axis=0).astype(np.float32) if len(frames) > 1 else frames[0]
 
 
 def main(argv=None) -> int:
-    """``python -m modules.smile.keystone --lamp L.tif --target T1.tif T2.tif [--white W.tif] [--out model.npz]``"""
+    """``python -m modules.smile.keystone (--lamp L.tif | --smile-model M.npz) --target T1.tif T2.tif [--white W.tif] [--out model.npz]``
+
+    With ``--lamp`` the smile and the keystone are fitted jointly; with ``--smile-model`` the
+    keystone is fitted onto that stored smile (fore-lens off for the smile, on for the target).
+    """
     import argparse
     from .corrector import SmileCorrector
-    ap = argparse.ArgumentParser(description="Smile + keystone model from a lamp frame and a line-target frame.")
-    ap.add_argument("--lamp", nargs="+", required=True)
+    ap = argparse.ArgumentParser(description="Smile + keystone model from a lamp frame (or a stored smile model) "
+                                             "and a line-target frame.")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--lamp", nargs="+", help="lamp frame(s): fit smile and keystone jointly")
+    src.add_argument("--smile-model", help="stored smile model (.npz) of this camera setting: fit the keystone onto it")
+    ap.add_argument("--check-lamp", nargs="+", help="with --smile-model: lamp frame(s) to check the stored smile")
     ap.add_argument("--target", nargs="+", required=True)
     ap.add_argument("--white", nargs="+")
     ap.add_argument("--dark", nargs="+")
-    ap.add_argument("--polarity", choices=("dark", "bright"), default="dark")
+    ap.add_argument("--polarity", choices=("auto", "dark", "bright"), default="auto")
     ap.add_argument("--deg-y", type=int, default=2); ap.add_argument("--deg-x", type=int, default=1)
     ap.add_argument("--dy-xdeg", type=int, default=3)
     ap.add_argument("--interp", default="cubic", choices=sorted(_INTERP))
     ap.add_argument("--out", help="model .npz to write (no camera setting is stored)")
+    ap.add_argument("--no-log", action="store_true", help="do not write a debug log to modules/smile/logs")
     a = ap.parse_args(argv)
-    lamp = _read(a.lamp); target = _read(a.target)
+    from . import debug_log
+    if not a.no_log:
+        debug_log.enable()
+    target = _read(a.target)
     white = _read(a.white) if a.white else None
     dark = _read(a.dark) if a.dark else None
-    if dark is not None:
-        lamp = lamp - dark
-    c = SmileCorrector(deg_y=a.deg_y, deg_x=a.deg_x, interp=a.interp).fit(lamp)
-    k = c.fit_keystone(target, white=white, dark=dark, polarity=a.polarity, dy_xdeg=a.dy_xdeg,
-                       inputs=dict(lamp=a.lamp, target=a.target, white=a.white, dark=a.dark))
+    inputs = dict(lamp=a.lamp, smile_model=a.smile_model, target=a.target, white=a.white, dark=a.dark)
+    if a.smile_model:
+        c = SmileCorrector.load(a.smile_model)
+        if a.interp != c.interp:
+            c.set_params(interp=a.interp)
+        check = _read(a.check_lamp) if a.check_lamp else None
+        if check is not None and dark is not None:
+            check = check - dark
+        k = c.fit_keystone(target, white=white, dark=dark, polarity=a.polarity, dy_xdeg=a.dy_xdeg,
+                           inputs=inputs, lamp=check)
+    else:
+        lamp = _read(a.lamp)
+        if dark is not None:
+            lamp = lamp - dark
+        c = SmileCorrector(deg_y=a.deg_y, deg_x=a.deg_x, interp=a.interp).fit(lamp)
+        k = c.fit_keystone(target, white=white, dark=dark, polarity=a.polarity, dy_xdeg=a.dy_xdeg, inputs=inputs)
     print(keystone_report(k))
     if a.out:
         c.save(a.out)

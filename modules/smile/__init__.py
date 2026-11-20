@@ -88,6 +88,7 @@ from .keystone import (
     KeystoneAnalysis,
     TargetLine,
     analyze_keystone,
+    analyze_keystone_from_smile,
     keystone_report,
     normalize_target,
     trace_target_lines,
@@ -137,7 +138,7 @@ __all__ = [
     # Sklearn API
     "SmileCorrector",
     # Keystone (joint smile + keystone geometry)
-    "GeometryModel", "KeystoneAnalysis", "TargetLine", "analyze_keystone",
+    "GeometryModel", "KeystoneAnalysis", "TargetLine", "analyze_keystone", "analyze_keystone_from_smile",
     "keystone_report", "normalize_target", "trace_target_lines",
     # Qt (optional)
     "SmileCorrectionWidget", "PlotCanvas", "HAVE_QT",

@@ -2,6 +2,7 @@
 """Sklearn-style fit / transform API for smile correction."""
 from __future__ import annotations
 
+import datetime as _dt
 import time
 from typing import Optional, Tuple
 
@@ -121,33 +122,57 @@ class SmileCorrector:
         return obj
 
     def fit_keystone(self, target: np.ndarray, white: Optional[np.ndarray] = None,
-                     dark: Optional[np.ndarray] = None, polarity: str = "dark", **kwargs):
+                     dark: Optional[np.ndarray] = None, polarity: str = "auto", **kwargs):
         """Add the keystone from a line-target frame: the maps become one smile + keystone map.
 
-        The smile part is re-fitted jointly from the lamp traces of :meth:`fit` (it must have
-        been called in this session; a loaded model has no traces).
+        After :meth:`fit` (lamp frame in this session) the smile is re-fitted jointly with the
+        keystone from the lamp traces. After :meth:`load` (a stored model, e.g. the smile measured
+        with the fore-lens off) the stored smile is kept as it is and only the keystone is fitted
+        (:func:`modules.smile.keystone.analyze_keystone_from_smile`); pass ``lamp=`` to check that
+        smile on a lamp frame.
 
         Args:
             target: Line-target frame (same camera setting as the lamp frame).
             white: Optional white frame (target removed) to divide out the illumination.
             dark: Optional dark frame for *target* and *white*.
-            polarity: ``"dark"`` or ``"bright"`` bars.
+            polarity: ``"dark"`` or ``"bright"`` bars, or ``"auto"`` (decided from the image).
             **kwargs: Passed to :func:`modules.smile.keystone.analyze_keystone`.
 
         Returns:
             The :class:`~modules.smile.keystone.KeystoneAnalysis`.
 
         Raises:
-            RuntimeError: No lamp analysis (not fitted, or loaded from a file).
-            ValueError: Unusable target frame (see ``analyze_keystone``).
+            RuntimeError: Not fitted and not loaded.
+            ValueError: Unusable target frame, or one of another size than the model.
         """
-        from .keystone import analyze_keystone
-        if self._analysis is None:
-            raise RuntimeError("Keystone needs the lamp analysis: call fit(lamp_frame) first "
-                               "(a model loaded from a file has no lamp traces).")
-        k = analyze_keystone(self._analysis, target, white=white, dark=dark, polarity=polarity,
-                             interp=self.interp, **kwargs)
+        from .keystone import analyze_keystone, analyze_keystone_from_smile
+        self._check_fitted()
+        if self._analysis is not None:
+            kwargs.pop("lamp", None)
+            k = analyze_keystone(self._analysis, target, white=white, dark=dark, polarity=polarity,
+                                 interp=self.interp, **kwargs)
+        else:
+            if tuple(np.shape(target)) != tuple(self._image_shape):
+                raise ValueError(f"The target frame {np.shape(target)} differs from the smile model "
+                                 f"{self._image_shape}: use the model of this camera setting / bin.")
+            y_ref = self.y_ref
+            if y_ref is None:
+                from .analysis import _default_reference_row
+                y_ref = float(_default_reference_row(self._image_shape[0]))
+            k = analyze_keystone_from_smile(self._surface, y_ref, target, white=white, dark=dark,
+                                            polarity=polarity, interp=self.interp,
+                                            smile_info=self.smile_info, **kwargs)
         return self.attach_keystone(k)
+
+    @property
+    def smile_info(self) -> dict:
+        """Where the smile came from: ``{"source": "fit"}`` or the loaded file's path / created / notes."""
+        cal = getattr(self, "_source_cal", None)
+        if self._analysis is not None or cal is None:
+            return {"source": "fit"}
+        return {"source": "stored", "path": getattr(self, "_source_path", None), "created": cal.created,
+                "notes": cal.notes, "camera_setting": cal.camera_setting, "fit_rms": cal.fit_rms,
+                "cv_rms": cal.cv_rms, "rms_after": cal.rms_after, "n_lines_used": cal.n_lines_used}
 
     def attach_keystone(self, k):
         """Use a :class:`~modules.smile.keystone.KeystoneAnalysis` computed elsewhere (e.g. in a
@@ -236,6 +261,7 @@ class SmileCorrector:
         )
         self._map_y = None                      # a new lamp fit invalidates a previous keystone
         self._keystone = self._keystone_json = self._geometry = None
+        self._source_cal = self._source_path = None
         self._margin = self._analysis.margin
         self._image_shape = tuple(self._analysis.frame_orig.shape)
         return self
@@ -340,7 +366,8 @@ class SmileCorrector:
 
     # ─── Persistence ───
 
-    def save(self, path: str, camera_setting: Optional[dict] = None) -> None:
+    def save(self, path: str, camera_setting: Optional[dict] = None, frames: Optional[dict] = None,
+             frames_info: Optional[dict] = None) -> None:
         """Save the fitted model to a compressed ``.npz`` file.
 
         Args:
@@ -348,6 +375,10 @@ class SmileCorrector:
             camera_setting: Camera configuration the model belongs to
                 (``CameraSetting.to_dict()``), stored in the file so a model of another
                 camera setting can be refused; ``None`` stores none.
+            frames: Source frames to store with the model (``{kind: (H, W)}``, kinds
+                ``lamp`` / ``target`` / ``white`` / ``dark``; see
+                :attr:`~modules.smile.calibration.SmileCalibration.frames`), or ``None``.
+            frames_info: Provenance per frame kind (source, dark_applied, ...).
         """
         self._check_fitted()
         if self._analysis is not None and self._keystone is not None:
@@ -357,7 +388,13 @@ class SmileCorrector:
         elif self._analysis is not None:
             cal = calibration_from_analysis(self._analysis)
         else:
-            # Reconstruct from fitted state (loaded from file).
+            # Reconstruct from fitted state (loaded from file), keeping the stored smile's numbers.
+            src = getattr(self, "_source_cal", None)
+            stat = (lambda name, default: getattr(src, name) if src is not None else default)
+            if self._map_y is not None and self._keystone is not None:
+                note = "keystone fitted onto the stored smile model of %s" % stat("created", "?")
+            else:
+                note = "re-saved from loaded model"
             cal = SmileCalibration(
                 map_x=self._map_x,
                 margin=self._margin,
@@ -368,20 +405,25 @@ class SmileCorrector:
                 y_rng=self._surface.y_rng,
                 x_rng=self._surface.x_rng,
                 interp=self.interp,
-                fit_rms=float("nan"),
-                cv_rms=float("nan"),
-                rms_before=float("nan"),
-                rms_after=float("nan"),
-                n_lines_used=0,
-                n_lines_total=0,
-                created=time.strftime("%Y-%m-%dT%H:%M:%S"),
-                notes="re-saved from loaded model",
+                fit_rms=stat("fit_rms", float("nan")),
+                cv_rms=stat("cv_rms", float("nan")),
+                rms_before=stat("rms_before", float("nan")),
+                rms_after=stat("rms_after", float("nan")),
+                n_lines_used=stat("n_lines_used", 0),
+                n_lines_total=stat("n_lines_total", 0),
+                created=_dt.datetime.now().isoformat(timespec="milliseconds"),
+                notes=note,
                 y_ref=self.y_ref,
                 map_y=self._map_y,
                 keystone=self._keystone_json if self._map_y is not None else None,
             )
         if camera_setting is not None:
             cal.camera_setting = dict(camera_setting)
+        elif self._analysis is None and getattr(self, "_source_cal", None) is not None:
+            cal.camera_setting = self._source_cal.camera_setting      # keep the stored model's setting
+        if frames:
+            cal.frames = {k: v for k, v in frames.items() if v is not None}
+            cal.frames_info = {k: dict((frames_info or {}).get(k) or {}) for k in cal.frames}
         save_calibration(path, cal)
 
     @classmethod
@@ -405,6 +447,8 @@ class SmileCorrector:
         obj._margin = cal.margin
         obj._image_shape = tuple(cal.image_shape)
         obj._surface = cal.surface()
+        obj._source_cal = cal
+        obj._source_path = str(path)
         if cal.map_y is not None:
             obj._map_y = cal.map_y
             obj._keystone_json = cal.keystone

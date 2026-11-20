@@ -63,6 +63,7 @@ from .calibration import (
     calibration_from_analysis,
     crop_margin,
     load_calibration,
+    load_frames,
     save_calibration,
 )
 from .corrector import SmileCorrector
@@ -108,6 +109,15 @@ class PlotCanvas(FigureCanvasQTAgg):
         self.fig = Figure(figsize=figsize, dpi=100)
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def draw(self) -> None:
+        """Draw with the colours of the application theme (dark app: dark figure)."""
+        try:
+            from .ui_theme import is_dark, theme_figure
+            theme_figure(self.fig, is_dark(self))
+        except Exception:  # noqa: BLE001 - a theme problem must never stop a plot
+            pass
+        super().draw()
 
     def clear(self) -> None:
         """Remove all axes and artists from the figure."""
@@ -259,12 +269,18 @@ class SmileCorrectionWidget(QWidget):
                 "PyQt5 and matplotlib are required for the widget."
             )
         super().__init__(parent)
+        from . import debug_log
+        debug_log.enable()                  # every smile / keystone analysis writes modules/smile/logs/YYYYMMDD-HH-MM-SS.txt
         self._frame: Optional[np.ndarray] = None
         self._source_frame: Optional[np.ndarray] = None   # frame as received (dtype kept) for Export PNG
         self._result: Optional[SmileAnalysis] = None
         self._calibration: Optional[SmileCalibration] = None
         self._corrector: Optional[SmileCorrector] = None
         self._worker: Optional[_AnalyzeWorker] = None
+        self._lamp_source = ""               # where the lamp frame came from (stored with the model)
+        self._lamp_dark: Optional[bool] = None   # host dark subtraction of a grabbed lamp frame
+        self._frame_gen = 0                  # bumped by set_frame; a result of an older frame is dropped
+        self._analyze_gen = 0                # _frame_gen when the running analysis started
         self._quality_worker = None
         self._wavelength_config = None
         self._wavelength_path = None
@@ -288,7 +304,7 @@ class SmileCorrectionWidget(QWidget):
         # -- control row --
         ctrl = QHBoxLayout()
 
-        self.btn_load = QPushButton("📂 โหลดภาพ")
+        self.btn_load = QPushButton("📂 Load lamp image…")
         self.btn_load.clicked.connect(self._on_load)
         ctrl.addWidget(self.btn_load)
         self._grab_request_id = None
@@ -306,18 +322,18 @@ class SmileCorrectionWidget(QWidget):
         ctrl.addWidget(self.btn_export_png)
 
 
-        self.btn_analyze = QPushButton("🔍 วิเคราะห์ Smile")
+        self.btn_analyze = QPushButton("🔍 Analyze smile")
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setStyleSheet("font-weight:bold;")
         self.btn_analyze.clicked.connect(self._on_analyze)
         ctrl.addWidget(self.btn_analyze)
 
-        self.btn_save = QPushButton("💾 บันทึก")
+        self.btn_save = QPushButton("💾 Save corrected image…")
         self.btn_save.setEnabled(False)
         self.btn_save.clicked.connect(self._on_save)
         ctrl.addWidget(self.btn_save)
 
-        self.btn_save_cal = QPushButton("📐 บันทึก Matrix")
+        self.btn_save_cal = QPushButton("📐 Save model…")
         self.btn_save_cal.setEnabled(False)
         self.btn_save_cal.setToolTip(
             "Save map_x (and map_y with keystone) for reuse without re-analysis."
@@ -325,7 +341,7 @@ class SmileCorrectionWidget(QWidget):
         self.btn_save_cal.clicked.connect(self._on_save_cal)
         ctrl.addWidget(self.btn_save_cal)
 
-        self.btn_load_cal = QPushButton("📥 โหลด Matrix")
+        self.btn_load_cal = QPushButton("📥 Load model…")
         self.btn_load_cal.setToolTip(
             "Load a previously saved calibration matrix."
         )
@@ -375,18 +391,18 @@ class SmileCorrectionWidget(QWidget):
         )
         ctrl.addWidget(self.spin_sat)
 
-        self.chk_crop = QCheckBox("ตัดขอบ (หายจริง)")
+        self.chk_crop = QCheckBox("Crop invalid border (data discarded)")
         self.chk_crop.setChecked(True)
         ctrl.addWidget(self.chk_crop)
 
         root.addLayout(ctrl)
 
         quality_controls = QHBoxLayout()
-        self.btn_wavelength = QPushButton("โหลด Wavelength Calibration…")
+        self.btn_wavelength = QPushButton("Load wavelength calibration…")
         self.btn_wavelength.setToolTip("Override the wavelength profile stored for this camera setting")
         self.btn_wavelength.clicked.connect(self._on_load_wavelength)
         quality_controls.addWidget(self.btn_wavelength)
-        self.btn_quality = QPushButton("วิเคราะห์ Spectral Quality")
+        self.btn_quality = QPushButton("Analyze spectral quality")
         self.btn_quality.clicked.connect(self.run_quality_analysis)
         self.btn_quality.setEnabled(False)
         quality_controls.addWidget(self.btn_quality)
@@ -407,8 +423,8 @@ class SmileCorrectionWidget(QWidget):
         self.tabs = QTabWidget()
         self._canvases: List[PlotCanvas] = []
         tab_names = [
-            "ภาพ  Before / After",
-            "เส้น  Traces",
+            "Before / after",
+            "Line traces",
             "Residual",
             "Shift Map",
             "Wavelength",
@@ -432,7 +448,7 @@ class SmileCorrectionWidget(QWidget):
             page_layout.setContentsMargins(2, 2, 2, 2)
             export_row = QHBoxLayout()
             export_row.addStretch()
-            button = QPushButton("ส่งออก PNG")
+            button = QPushButton("Export PNG")
             button.setToolTip(
                 "Export this plot as a presentation-quality PNG (300 dpi)."
             )
@@ -459,10 +475,19 @@ class SmileCorrectionWidget(QWidget):
         self.keystone_page = KeystonePage(self, setting_for_file=self._setting_for_shape)
         self.keystone_page.grabRequested.connect(self._request_grab)
         self.keystone_page.keystoneReady.connect(self._on_keystone_ready)
+        self.keystone_page.keystoneCleared.connect(self._on_keystone_cleared)
+        self.keystone_page.applyKeystoneRequested.connect(self.apply_keystone)
+        self.keystone_page.saveKeystoneRequested.connect(self._on_save_keystone_matrix)
         self.keystone_page.statusChanged.connect(self._set_status)
         self.outer_tabs = QTabWidget()
         self.outer_tabs.addTab(self.tabs, "Smile")
         self.outer_tabs.addTab(self.keystone_page, "Keystone")
+        from .result_view import ResultView
+        self.result_page = ResultView(self._session_model, self,
+                                      session_frames_key=lambda: (self._frame_gen, self.keystone_page._frame_gen))
+        self.result_page.statusChanged.connect(self._set_status)
+        self.outer_tabs.addTab(self.result_page, "Result")
+        self.outer_tabs.currentChanged.connect(self._on_outer_tab)
         root.addWidget(self.outer_tabs, stretch=1)
         self._clear_quality_plots()
 
@@ -472,7 +497,7 @@ class SmileCorrectionWidget(QWidget):
         root.addWidget(self.lbl_setting)
 
         # -- status bar --
-        self.lbl_status = QLabel("พร้อมใช้งาน")
+        self.lbl_status = QLabel("Ready")
         self.lbl_status.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.lbl_status.setMinimumHeight(24)
         root.addWidget(self.lbl_status)
@@ -515,6 +540,8 @@ class SmileCorrectionWidget(QWidget):
             setting_provider: Callable returning the current ``modules.contracts.CameraSetting`` or ``None``.
         """
         self._store, self._setting_provider = store, setting_provider
+        self.keystone_page.set_calibration_source(store, self._camera_setting)
+        self._update_keystone_actions()
 
     def _camera_setting(self):
         """The camera's current setting from the host, or ``None``."""
@@ -571,6 +598,28 @@ class SmileCorrectionWidget(QWidget):
         if self._setting is not None:
             what = "Smile + keystone" if self._has_keystone() else "to camera"
             self.btn_apply.setText(f"📌 Apply {what} (bin {self._setting.camera_bin})")
+        self._update_keystone_actions()
+
+    def _update_keystone_actions(self) -> None:
+        """Apply / Save Matrix on the Keystone page follow its result.
+
+        Keystone onto the stored smile: Apply needs the store and the target's camera setting.
+        Joint fit with this session's analysis: the same conditions as the Smile tab's Apply.
+        """
+        page = self.keystone_page
+        if page.result is None:
+            page.set_actions(False, False)
+            return
+        if page.result_mode == "stored":
+            setting = page.result_setting
+            bin_text = f" (bin {setting.camera_bin})" if setting is not None else ""
+            page.set_actions(self._store is not None and setting is not None, True,
+                             f"📌 Apply smile + keystone{bin_text}")
+            return
+        ok = self._has_keystone() and self._corrector.keystone is page.result
+        bin_text = f" (bin {self._setting.camera_bin})" if self._setting is not None else ""
+        page.set_actions(ok and self.btn_apply.isEnabled(), ok and self._result is not None,
+                         f"📌 Apply smile + keystone{bin_text}")
 
     def _has_keystone(self) -> bool:
         """True when the current corrector carries a keystone (Apply / Save write the combined model)."""
@@ -607,27 +656,184 @@ class SmileCorrectionWidget(QWidget):
                                  "lamp (" + "; ".join(_ascii(p) for p in problems) + ")")
                 return None
         what = "Smile + keystone" if keystone else "Smile"
-        path = self._store.smile_path(self._setting)
+        path = self._store_model(self._setting, what, self._corrector, self._result)
+        if path is not None and keystone and self._corrector.keystone is self.keystone_page.result:
+            self.keystone_page.mark_applied(path)
+        return path
+
+    def _session_model(self):
+        """This session's model for the Result tab: ``(corrector, frames, frames_info, label)``.
+
+        A keystone fitted onto the stored smile (Keystone tab) wins over the Smile tab's model.
+        """
+        page = self.keystone_page
+        if page.result is not None and page.result_mode == "stored" and page.result_corrector is not None:
+            corrector, label = page.result_corrector, "Keystone fitted onto the stored smile (this session)"
+        elif self._corrector is not None:
+            corrector = self._corrector
+            label = "This session: smile + keystone" if corrector.has_keystone else "This session: smile only"
+        elif page.stored_ok:
+            corrector = page.stored["corrector"]
+            label = "Stored model " + os.path.basename(str(page.stored.get("path", "")))
+        else:
+            return None, {}, {}, ""
+        frames, info = self._model_frames(corrector, self._result)
+        return corrector, frames, info, label
+
+    def _session_lamp_for(self, corrector) -> Optional[np.ndarray]:
+        """This session's lamp frame when it fits a stored model (same size, no setting mismatch), else ``None``.
+
+        Used to check (never re-fit) a stored smile that was saved without its lamp frame.
+        """
+        if self._frame is None or corrector is None or self._setting is None:
+            return None                                     # an unknown camera setting is never stored
+        if tuple(self._frame.shape) != tuple(getattr(corrector, "_image_shape", ()) or ()):
+            return None
+        recorded = getattr(getattr(corrector, "_source_cal", None), "camera_setting", None)
+        if recorded:
+            try:
+                from modules.contracts import CameraSetting
+                if CameraSetting.from_dict(recorded).mismatch(self._setting):
+                    return None
+            except Exception:  # noqa: BLE001 - an odd record: do not trust the match
+                return None
+        page = self.keystone_page
+        other = page.result_setting if page.result is not None else page.target_setting
+        if self._setting is not None and other is not None and self._setting.mismatch(other):
+            return None
+        return self._frame
+
+    def _on_outer_tab(self, _index: int) -> None:
+        """Opening the Result tab measures this session's model when it changed since the last look."""
+        page = self.result_page
+        if self.outer_tabs.currentWidget() is page and not page.running:
+            if page.result is None or page.session_changed():
+                page.show_session_model()
+
+    def _model_frames(self, corrector=None, analysis=None) -> Tuple[dict, dict]:
+        """Source frames to store with a model (:attr:`SmileCalibration.frames`) and their provenance.
+
+        Lamp: the analysis the model's smile was fitted on (this session), else the lamp stored
+        in the model file the corrector was loaded from. Target / white: the Keystone page's,
+        when the model's keystone is the page's result, else those stored in the loaded file.
+        """
+        frames, info = {}, {}
+
+        def put(kind, frame, source, dark=None):
+            if frame is not None:
+                frames[kind] = np.asarray(frame)
+                info[kind] = {"source": source or "array", "dark_applied": dark}
+
+        stored, stored_info = {}, {}
+        src_path = getattr(corrector, "_source_path", None) if corrector is not None else None
+        if src_path:
+            try:
+                stored, stored_info, _setting = load_frames(src_path)
+            except Exception as exc:  # noqa: BLE001 - a missing / odd file only drops its frames
+                logger.warning("Frames of %s not carried over: %s", src_path, exc)
+
+        def carry(kind):
+            if kind in stored:
+                i = stored_info.get(kind) or {}
+                put(kind, stored[kind], i.get("source"), i.get("dark_applied"))
+
+        base = corrector.analysis if corrector is not None else analysis
+        if base is not None:
+            mine = base is self._result
+            put("lamp", base.frame_orig, self._lamp_source if mine else "", self._lamp_dark if mine else None)
+        else:
+            carry("lamp")
+            lamp = self._session_lamp_for(corrector)
+            if "lamp" not in frames and lamp is not None:          # older stored smile without its lamp frame
+                put("lamp", lamp, f"{self._lamp_source} (check only: the stored smile was not re-fitted)",
+                    self._lamp_dark)
+        if corrector is not None and corrector.has_keystone:
+            page = self.keystone_page
+            if page.result is not None and corrector.keystone is page.result and page.target is not None:
+                put("target", page.target, page._target_source, getattr(page, "_target_dark", None))
+                if page.white is not None:
+                    put("white", page.white, page._white_source, getattr(page, "_white_dark", None))
+            else:
+                for kind in ("target", "white", "dark"):
+                    carry(kind)
+        return frames, info
+
+    def _store_model(self, setting, what: str, corrector=None, analysis=None) -> Optional[str]:
+        """Write a model to ``store.smile_path(setting)`` (old file to history/), emit ``applyRequested``.
+
+        Args:
+            setting: ``CameraSetting`` the model belongs to (stored in the file).
+            what: ``"Smile"`` or ``"Smile + keystone"`` (status texts).
+            corrector: :class:`SmileCorrector` to save, or ``None`` to save *analysis*.
+            analysis: :class:`SmileAnalysis` used when *corrector* is ``None``.
+
+        Returns:
+            The path written, or ``None`` on failure (reason in the status bar).
+        """
+        path = self._store.smile_path(setting)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            frames, frames_info = self._model_frames(corrector, analysis)    # before the old file is replaced
             backup = self._store.backup(path)
-            setting = self._setting.to_dict()           # lets the app refuse it on another camera
-            if self._corrector is not None:
-                self._corrector.save(str(path), setting)
+            data = setting.to_dict()                    # lets the app refuse it on another camera
+            if corrector is not None:
+                corrector.save(str(path), data, frames, frames_info)
             else:
-                cal = calibration_from_analysis(self._result)
-                cal.camera_setting = setting
+                cal = calibration_from_analysis(analysis)
+                cal.camera_setting = data
+                cal.frames, cal.frames_info = frames, frames_info
                 save_calibration(str(path), cal)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Apply failed: {exc}")
             return None
-        logger.info("%s model stored for %s: %s%s", what, self._setting.label(), path,
+        logger.info("%s model stored for %s: %s%s", what, setting.label(), path,
                     f" (previous kept as {backup})" if backup else "")
-        self._set_status(f"{what} model stored for {self._setting.label()}: {path}"
+        self._set_status(f"{what} model stored for {setting.label()}: {path}"
                          + (f" (previous → history/{backup.name})" if backup else ""))
-        self._show_setting()
+        if self._setting is not None:                   # the Smile tab's lamp frame (none in a stored-smile apply)
+            self._show_setting()
+        self.keystone_page.refresh_stored()             # step 1 shows the new file; older stored-mode results go stale
         self.applyRequested.emit(str(path))
         return str(path)
+
+    def apply_keystone(self) -> Optional[str]:
+        """Store the Keystone page's smile + keystone model for the target's camera setting.
+
+        Keystone fitted onto the stored smile: no smile analysis of this session is needed; the
+        model is written for the setting the target was taken at (it must equal the camera's
+        current one). Joint fit: the same as :meth:`apply_to_camera`.
+
+        Returns:
+            The path written, or ``None`` when it was refused (reason in the status bar).
+        """
+        page = self.keystone_page
+        if page.result is None:
+            self._set_status("Not applied: run Analyze Keystone first")
+            return None
+        if page.result_mode != "stored":
+            return self.apply_to_camera()
+        from .keystone_view import _ascii
+        setting = page.result_setting
+        if self._store is None or setting is None:
+            self._set_status("Not applied: the target's camera setting is unknown (grab it from the connected "
+                             "camera) - use Save Matrix instead")
+            return None
+        current = self._camera_setting()
+        if current is not None:
+            problems = current.mismatch(setting)
+            if problems:
+                self._set_status("Not applied: the camera is now at a different setting ("
+                                 + "; ".join(_ascii(p) for p in problems) + "). Grab a new target.")
+                return None
+        stale = page.stored_result_problem()           # never write back an older smile over a newer one
+        if stale:
+            self._set_status("Not applied: " + _ascii(stale) + ". Run Analyze Keystone again.")
+            page.refresh_stored()
+            return None
+        path = self._store_model(setting, "Smile + keystone", page.result_corrector)
+        if path is not None:
+            page.mark_applied(path)
+        return path
 
     def begin_grab(self, request_id):
         """Mark a snapshot request as pending and disable the Grab button.
@@ -645,8 +851,10 @@ class SmileCorrectionWidget(QWidget):
         """Receive the frame requested via ``grabRequested``.
 
         Args:
-            packet: Object with ``request_id``, ``image`` (2-D, oriented, post-dark; never flipped
-                again here) and ``camera_bin``. Ignored if the id does not match the pending request.
+            packet: Object with ``request_id``, ``image`` (2-D, oriented; never flipped again
+                here), ``camera_bin`` and ``dark_applied`` (whether the host subtracted its dark; a
+                frame without it is labelled "NO dark subtracted"). Ignored if the id does not match
+                the pending request.
         """
         if packet.request_id != self._grab_request_id:
             return
@@ -654,17 +862,21 @@ class SmileCorrectionWidget(QWidget):
         self._grab_done()
         # Snapshot already has the acquisition orientation; never flip twice.
         current = self._camera_setting()
+        dark = getattr(packet, "dark_applied", None)
+        dark_tag = "" if dark is None else (", dark subtracted" if dark else ", NO dark subtracted")
+        dark_hint = (" (the host's dark correction was off or had no dark for this bin)" if dark is False else "")
         if purpose in ("target", "white"):           # keystone frames do not replace the lamp frame
             setting = current.with_frame(packet.image.shape, packet.camera_bin) if current is not None else None
             self.keystone_page.set_frame(purpose, packet.image, setting,
-                                         source=f"grabbed, bin {packet.camera_bin}")
-            self._set_status(f"Grabbed keystone {purpose} frame, bin {packet.camera_bin}")
+                                         source=f"grabbed, bin {packet.camera_bin}{dark_tag}", dark_applied=dark)
+            self._set_status(f"Grabbed keystone {purpose} frame, bin {packet.camera_bin}{dark_tag}{dark_hint}")
             return
         if current is None:
             self.set_frame(packet.image)
         else:
             self.set_frame(packet.image, setting=current.with_frame(packet.image.shape, packet.camera_bin))
-        self._set_status(f"Grabbed oriented post-dark frame, bin {packet.camera_bin}")
+        self._lamp_source, self._lamp_dark = f"grabbed, bin {packet.camera_bin}{dark_tag}", dark
+        self._set_status(f"Grabbed oriented frame, bin {packet.camera_bin}{dark_tag}{dark_hint}")
 
     def snapshot_failed(self, request_id, message):
         """Report a failed snapshot request and re-enable Grab.
@@ -689,6 +901,8 @@ class SmileCorrectionWidget(QWidget):
             setting: ``CameraSetting`` the frame was taken with (``None`` = unknown; *Apply* is
                 then unavailable).
         """
+        self._frame_gen += 1                 # a running analysis of the old frame is discarded
+        self._lamp_source, self._lamp_dark = "array", None   # callers that know better set them after
         self._result = None
         self._corrector = None
         self._quality_report = None
@@ -727,11 +941,32 @@ class SmileCorrectionWidget(QWidget):
         """Load a calibration image from disk.
 
         Args:
-            path: Image file path.
+            path: Image file path, or a model file (``.npz``) saved with its frames: its lamp
+                frame is used, with the camera setting recorded in the model.
+
+        Raises:
+            ValueError: A model file without a lamp frame.
         """
+        if str(path).lower().endswith(".npz"):
+            from .keystone_view import model_setting
+            frames, info, recorded = load_frames(path)
+            if "lamp" not in frames:
+                raise ValueError(f"{os.path.basename(path)} holds no lamp frame (saved without frames, or a "
+                                 "keystone fitted onto a stored smile without its lamp)")
+            frame = frames["lamp"]
+            current = self._camera_setting()
+            self.set_frame(frame, setting=model_setting(
+                recorded, frame.shape, (lambda shape: current.with_frame(shape)) if current else None))
+            lamp_info = info.get("lamp") or {}
+            self._lamp_source = f"{lamp_info.get('source') or 'lamp'} [from {os.path.basename(path)}]"
+            self._lamp_dark = lamp_info.get("dark_applied")
+            h, w = self._frame.shape
+            self._set_status(f"Lamp frame {w}x{h} from model {os.path.basename(path)}")
+            return
         frame = load_frame(path)
         current = self._camera_setting()
         self.set_frame(frame, setting=current.with_frame(frame.shape) if current else None)
+        self._lamp_source, self._lamp_dark = os.path.basename(path), None
         h, w = self._frame.shape
         self._set_status(
             f"{os.path.basename(path)}  {w}x{h}  "
@@ -1023,9 +1258,10 @@ class SmileCorrectionWidget(QWidget):
         """Handle the 'Load Image' button click."""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "เลือกภาพ calibration",
+            "Select calibration-lamp image (or a model saved with its frames)",
             "",
-            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;All (*.*)",
+            "Images or a model with frames (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.npz);;"
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp);;Model with frames (*.npz);;All (*.*)",
         )
         if path:
             try:
@@ -1045,6 +1281,7 @@ class SmileCorrectionWidget(QWidget):
         )
         self._set_status("Analyzing ...")
         self.btn_analyze.setEnabled(False)
+        self._analyze_gen = self._frame_gen
         worker = _AnalyzeWorker(self._frame.copy(), kwargs)
         worker.done.connect(self._on_analysis_done)
         worker.failed.connect(self._on_analysis_failed)
@@ -1064,7 +1301,11 @@ class SmileCorrectionWidget(QWidget):
         self._set_status(f"Error: {msg}")
 
     def _on_analysis_done(self, r: SmileAnalysis) -> None:
-        """Handle successful analysis result."""
+        """Handle successful analysis result (dropped when the frame changed while it ran)."""
+        if self._worker is not None and self._analyze_gen != self._frame_gen:
+            self._set_status("Lamp frame changed while the smile was analysed: result discarded. "
+                             "Press Analyze for the new frame.")
+            return
         self._result = r
 
         # Reuse the completed analysis through the corrector's public factory.
@@ -1097,8 +1338,40 @@ class SmileCorrectionWidget(QWidget):
                    "Run Analyze Keystone again.")
         self.analysisComplete.emit(r)
 
+    def _detach_session_keystone(self) -> bool:
+        """Drop a joint-fit keystone from this session's corrector (its smile stays).
+
+        Only a corrector built from this session's analysis is touched; a model loaded with
+        *Load Matrix* is left as it is. Returns ``True`` when a keystone was detached.
+        """
+        c = self._corrector
+        if c is None or self._result is None or not c.has_keystone or c.analysis is not self._result:
+            return False
+        self._corrector = SmileCorrector.from_analysis(self._result)
+        return True
+
+    def _on_keystone_cleared(self) -> None:
+        """The Keystone page dropped its result: detach a joint-fit keystone, keep this session's smile."""
+        if self._detach_session_keystone():
+            self._set_status("Keystone dropped (frames changed): the model is smile only until Analyze Keystone.")
+        self._update_apply_state()
+
     def _on_keystone_ready(self, k) -> None:
-        """Attach a keystone computed on the Keystone page: Apply / Save now write one combined model."""
+        """Attach a keystone computed on the Keystone page: Apply / Save now write one combined model.
+
+        A keystone fitted onto the stored smile stays with the page's own corrector (Apply on the
+        Keystone tab); a joint fit is attached to this session's corrector (Apply on either tab).
+        """
+        if self.keystone_page.result_mode == "stored":
+            if self._detach_session_keystone():         # an older joint fit must not be applied from the Smile tab
+                self._update_apply_state()
+            self._update_keystone_actions()
+            s = k.summary
+            self._set_status(
+                f"Keystone fitted onto the stored smile: max {s['keystone_max_px']:.2f} px, tilt "
+                f"{s['tilt_deg']:.3f} deg" + (f", {len(k.warnings)} warning(s)" if k.warnings else "")
+                + ". Apply on the Keystone tab writes the combined model.")
+            return
         if self._result is None:
             return
         if self._corrector is None or self._corrector.analysis is not self._result:
@@ -1140,7 +1413,7 @@ class SmileCorrectionWidget(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "บันทึกภาพที่แก้ smile แล้ว",
+            "Save smile-corrected image",
             "Corrected.png",
             "PNG (*.png);;TIFF (*.tif);;All (*.*)",
         )
@@ -1186,7 +1459,7 @@ class SmileCorrectionWidget(QWidget):
         if self._result is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "ส่งออกผล Smile เป็น Excel", "smile_report.xlsx", "Excel workbook (*.xlsx)")
+            self, "Export smile report to Excel", "smile_report.xlsx", "Excel workbook (*.xlsx)")
         if not path:
             return
         try:
@@ -1204,7 +1477,7 @@ class SmileCorrectionWidget(QWidget):
         default_name = self._plot_export_names[index]
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "ส่งออกกราฟเป็น PNG",
+            "Export plot as PNG",
             default_name,
             "PNG image (*.png)",
         )
@@ -1218,11 +1491,50 @@ class SmileCorrectionWidget(QWidget):
                 format="png",
                 dpi=300,
                 bbox_inches="tight",
-                facecolor="white",
+                facecolor=self._canvases[index].fig.get_facecolor(),     # as shown (theme)
             )
             self._set_status(f"Exported plot PNG: {path} (300 dpi)")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Plot export failed: {exc}")
+
+    def save_keystone_matrix(self, path: str) -> Optional[str]:
+        """Write the Keystone page's smile + keystone model to *path* (``.npz`` appended if missing).
+
+        Returns:
+            The path written, or ``None`` (no keystone result; reason in the status bar).
+        """
+        page = self.keystone_page
+        if page.result is None:
+            self._set_status("Nothing to save: run Analyze Keystone first")
+            return None
+        if not path.endswith(".npz"):
+            path += ".npz"
+        if page.result_mode == "stored":
+            corrector, setting = page.result_corrector, page.result_setting
+        else:
+            if not self._has_keystone():
+                self._set_status("Nothing to save: the keystone is not attached")
+                return None
+            corrector, setting = self._corrector, self._setting
+        try:
+            frames, frames_info = self._model_frames(corrector)
+            corrector.save(path, setting.to_dict() if setting is not None else None, frames, frames_info)
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Save failed: {exc}")
+            return None
+        self._set_status(f"Saved Smile + keystone calibration: {path}")
+        return path
+
+    def _on_save_keystone_matrix(self) -> None:
+        """'Save Matrix...' on the Keystone page."""
+        if self.keystone_page.result is None:
+            return
+        setting = self.keystone_page.result_setting
+        name = f"smile_keystone_bin{setting.camera_bin}.npz" if setting is not None else "smile_keystone.npz"
+        path, _ = QFileDialog.getSaveFileName(self, "Save smile + keystone model", name,
+                                              "Smile Calibration (*.npz);;All (*.*)")
+        if path:
+            self.save_keystone_matrix(path)
 
     def _on_save_cal(self) -> None:
         """Handle the 'Save Matrix' button click."""
@@ -1230,7 +1542,7 @@ class SmileCorrectionWidget(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "บันทึก Smile Calibration Matrix",
+            "Save smile correction model",
             "smile_calibration.npz",
             "Smile Calibration (*.npz);;All (*.*)",
         )
@@ -1239,12 +1551,18 @@ class SmileCorrectionWidget(QWidget):
         if not path.endswith(".npz"):
             path += ".npz"
         setting = self._setting.to_dict() if self._setting is not None else None
-        if self._corrector is not None:
-            self._corrector.save(path, setting)
-        else:
-            cal = calibration_from_analysis(self._result)
-            cal.camera_setting = setting
-            save_calibration(path, cal)
+        try:
+            frames, frames_info = self._model_frames(self._corrector, self._result)
+            if self._corrector is not None:
+                self._corrector.save(path, setting, frames, frames_info)
+            else:
+                cal = calibration_from_analysis(self._result)
+                cal.camera_setting = setting
+                cal.frames, cal.frames_info = frames, frames_info
+                save_calibration(path, cal)
+        except Exception as exc:  # noqa: BLE001 - the previous file (if any) is kept by the atomic save
+            self._set_status(f"Save failed: {exc}")
+            return
         what = "Smile + keystone" if self._has_keystone() else "Smile"
         self._set_status(f"Saved {what} calibration: {path}")
 
@@ -1252,7 +1570,7 @@ class SmileCorrectionWidget(QWidget):
         """Handle the 'Load Matrix' button click."""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "โหลด Smile Calibration Matrix",
+            "Load smile correction model",
             "",
             "Smile Calibration (*.npz);;All (*.*)",
         )

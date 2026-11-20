@@ -4,7 +4,8 @@ Layout of a store folder (in the application: the camera profile's ``flatfield/`
 
     <folder>/
         flat_<YYYYMMDD>_<HHMMSS>[_<n>]/   one profile, never modified after it is written
-            flatfield.json             format_version, id, created_at, acquired_at, key, ROI, info
+            flatfield.json             format_version, id, created_at, acquired_at, key, ROI,
+                                       sensor_temperature_c, info
             profile.npy                (lines, bands) float32   (save_factor_profile)
             profile.wavelength.npy     (bands,) float64 band centres, nm
             roi_mask.npy               bool (lines, samples) ROI of the flat-field scan
@@ -43,7 +44,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from modules.radiometric.core import load_factor_profile, save_factor_profile
-from modules.radiometric.reference import ReferenceKey, _aware, _sync_files
+from modules.radiometric.reference import ReferenceKey, _aware, _sync_files, _temperature
 
 from .core import check_profile
 
@@ -98,6 +99,8 @@ class FlatFieldProfile:
         key: Camera setting of the flat-field scan.
         span: First and last slit row measured.
         coverage: Share of the slit rows measured (the rest is interpolated or held).
+        sensor_temperature_c: Mean sensor temperature of the flat-field scan (degrees C), or
+            ``None`` when the camera gave none (or the profile predates the field).
         info: Further JSON data given when it was saved (target, seam rows, source, ...).
     """
 
@@ -108,6 +111,7 @@ class FlatFieldProfile:
     key: ReferenceKey
     span: Tuple[int, int]
     coverage: float
+    sensor_temperature_c: Optional[float] = None
     info: dict = field(default_factory=dict)
 
     @property
@@ -151,7 +155,8 @@ class FlatFieldProfile:
             raise ValueError("'roi.span' is not [first, last]")
         return cls(id=folder.name, folder=folder, created_at=created_at, acquired_at=acquired_at,
                    key=ReferenceKey.from_dict(key), span=(int(span[0]), int(span[1])),
-                   coverage=float(roi.get("coverage") or 0.0), info=dict(info))
+                   coverage=float(roi.get("coverage") or 0.0),
+                   sensor_temperature_c=_temperature(data.get("sensor_temperature_c")), info=dict(info))
 
 
 @dataclass(frozen=True)
@@ -194,6 +199,7 @@ class FlatFieldStore:
 
     def save(self, profile, key: ReferenceKey, *, mask, coverage: Optional[float] = None,
              info: Optional[dict] = None, acquired_at=None,
+             sensor_temperature_c: Optional[float] = None,
              created_at: Optional[datetime.datetime] = None) -> FlatFieldProfile:
         """Store a new profile.
 
@@ -205,6 +211,9 @@ class FlatFieldStore:
             coverage: Share of the slit rows measured; default: the rows of ``mask``.
             info: Further JSON-serialisable data (target, seam rows, source cube, ...).
             acquired_at: When the target was scanned (ISO text or datetime). Default: ``created_at``.
+            sensor_temperature_c: Mean sensor temperature of the flat-field scan (degrees C,
+                :func:`~modules.radiometric.reference.scan_temperature_c`); ``None`` or a camera
+                "no reading" value (-999) is stored as ``null``.
             created_at: Save time (default: now, local time); names the folder.
 
         Raises:
@@ -238,6 +247,7 @@ class FlatFieldStore:
             "roi": {"span": [int(rows.min()), int(rows.max())], "pixels": int(mask.sum()),
                     "coverage": float(rows.size / mask.shape[0] if coverage is None else coverage),
                     "samples": int(mask.shape[1])},
+            "sensor_temperature_c": _temperature(sensor_temperature_c),
             "info": info,
         }
         self.folder.mkdir(parents=True, exist_ok=True)

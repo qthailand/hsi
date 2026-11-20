@@ -2,8 +2,10 @@
 """Full multi-line smile analysis pipeline."""
 from __future__ import annotations
 
+import logging
+import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -18,8 +20,36 @@ from .core import (
 )
 from .surface import Surface2D, cross_validate_lines, fit_surface_2d
 from .calibration import correct_smile, crop_margin
+from .debug_log import logged_analysis
 
-__all__ = ["SmileAnalysis", "analyze_smile", "verify_on_frame"]
+__all__ = ["SmileAnalysis", "analyze_smile", "verify_on_frame", "anchor_surface"]
+
+logger = logging.getLogger(__name__)
+
+
+def anchor_surface(surface: Surface2D, y_ref: float) -> Surface2D:
+    """``surface(y, x) - surface(y_ref, x)`` as a :class:`Surface2D`, exactly.
+
+    Only the ``y**0`` coefficients change (``C'[0, j] = C[0, j] - sum_i C[i, j] * Yr**i`` with
+    ``Yr`` the normalised, clamped ``y_ref``); the fitted ranges and the clamping are kept, so the
+    shift is unchanged inside the measured lines and still held at the edge value outside them.
+    (Re-fitting the difference on a coarse grid over the whole frame, as before, bent the surface
+    inside the measured span by ~0.1 px RMS / 0.5 px max when the lines did not span the width.)
+
+    Args:
+        surface: Fitted displacement surface.
+        y_ref: Reference row (px); the result is exactly 0 there for every column.
+
+    Returns:
+        A new :class:`Surface2D` with the same degrees, ranges and clamp.
+    """
+    y0, y1 = surface.y_rng
+    yr = 2.0 * (float(y_ref) - y0) / (y1 - y0) - 1.0 if y1 != y0 else 0.0
+    if surface.clamp:
+        yr = float(np.clip(yr, -1.0, 1.0))
+    coef = np.asarray(surface.coef, dtype=float).reshape(surface.deg_y + 1, surface.deg_x + 1).copy()
+    coef[0] -= sum(coef[i] * yr ** i for i in range(surface.deg_y + 1))
+    return Surface2D(coef.ravel(), surface.deg_y, surface.deg_x, surface.y_rng, surface.x_rng, surface.clamp)
 
 
 def _default_reference_row(height: int) -> int:
@@ -54,6 +84,8 @@ class SmileAnalysis:
         interp: Interpolation method used.
         sat_level: Effective saturation threshold.
         noise: Estimated per-pixel noise level.
+        timings: Seconds spent per stage (``detect``, ``trace``, ``fit``, ``cross_validate``,
+            ``remap``, ``retrace``, ``total``), to see where a slow computer spends its time.
     """
 
     frame_orig: np.ndarray
@@ -78,8 +110,10 @@ class SmileAnalysis:
     sat_level: float
     noise: float
     y_ref: float
+    timings: Dict[str, float] = field(default_factory=dict)
 
 
+@logged_analysis("smile")
 def analyze_smile(
     frame: np.ndarray,
     sat_level: Optional[float] = None,
@@ -117,8 +151,18 @@ def analyze_smile(
         sat_level = auto_sat_level(frame)
     noise = estimate_noise(frame)
 
+    tick = time.perf_counter()
+    timings: Dict[str, float] = {}
+
+    def lap(name: str) -> None:
+        nonlocal tick
+        now = time.perf_counter()
+        timings[name] = timings.get(name, 0.0) + (now - tick)
+        tick = now
+
     # Step 1: Detect emission lines.
     lines = detect_lines(frame, sat_level)
+    lap("detect")
     if not lines:
         raise ValueError(
             "No emission lines detected. Check image brightness."
@@ -132,6 +176,7 @@ def analyze_smile(
             frame, ln.column, halfwin, sat_level, noise, snr_min
         )
 
+    lap("trace")
     # Step 3: Collect measurement points.
     #   Reference = median of the trace (sub-pixel).
     ys, xs, vs, ids, used = [], [], [], [], []
@@ -191,31 +236,22 @@ def analyze_smile(
         meas_y, meas_x, meas_v, deg_y, deg_x_eff
     )
     residuals = meas_v - surface(meas_y, meas_x)
+    lap("fit")
     cv_rms = cross_validate_lines(
         meas_y, meas_x_orig, meas_v, meas_id, deg_y, deg_x_eff
     )
 
     # Anchor the fitted displacement at the requested physical reference row.
-    # The fit range must include that row so Surface2D does not clamp it.
     if y_ref is None:
         y_ref = float(_default_reference_row(n_rows))
     if not np.isfinite(y_ref) or not 0 <= y_ref < n_rows:
         raise ValueError(f"y_ref must be within image rows [0, {n_rows - 1}]")
-    x_grid = np.arange(frame.shape[1], dtype=float)
-    ref_shift = surface(np.full_like(x_grid, y_ref), x_grid)
-    yy, xx = np.meshgrid(
-        np.linspace(0, n_rows - 1, max(surface.deg_y + 2, 4)),
-        np.linspace(0, frame.shape[1] - 1, max(surface.deg_x + 2, 4)),
-        indexing="ij",
-    )
-    vals = surface(yy, xx) - surface(np.full_like(xx, y_ref), xx)
-    surface, _ = fit_surface_2d(
-        yy.ravel(), xx.ravel(), vals.ravel(), surface.deg_y, surface.deg_x,
-        n_iter=0,
-    )
+    surface = anchor_surface(surface, y_ref)
 
+    lap("cross_validate")
     # Step 5: Remap (zero-valued borders).
     frame_corr, margin, _, _ = correct_smile(frame, surface, interp)
+    lap("remap")
 
     # Step 6: Re-trace on the corrected image.
     traces_corr: Dict[float, np.ndarray] = {}
@@ -225,6 +261,10 @@ def analyze_smile(
             frame_corr, refs[ln.column], halfwin, sat_level, noise, snr_min
         )
 
+    lap("retrace")
+    timings["total"] = sum(timings.values())
+    logger.info("Smile analysis %dx%d: %s", frame.shape[1], frame.shape[0],
+                ", ".join("%s %.2f s" % kv for kv in timings.items()))
     # Step 7: Straightness metrics (reuse existing traces).
     rms_before = _traces_rms([traces_orig[ln.column] for ln in used])
     rms_after = _traces_rms([traces_corr[ln.column] for ln in used])
@@ -263,6 +303,7 @@ def analyze_smile(
         sat_level=float(sat_level),
         noise=float(noise),
         y_ref=float(y_ref),
+        timings=timings,
     )
 
 

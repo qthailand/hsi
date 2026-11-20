@@ -30,7 +30,7 @@ profile; the file the HSI runtime loads for that bin; the previous one is copied
 models in the older `smile_maps/<backend>/` are still read when the profile has none) and emits `applyRequested(path)` so the host loads it into
 the live session. It is refused when the camera has moved to another bin/size since the frame was
 grabbed. The wavelength calibration for Spectral Quality is loaded automatically from the store
-for the same setting; *โหลด Wavelength Calibration…* overrides it.
+for the same setting; *Load wavelength calibration…* overrides it.
 
 ## Requirements
 
@@ -96,7 +96,7 @@ hardware bin, ROI; average several frames of each):
 2. **Line target**: a target whose bars (dark on a bright background, or bright on dark:
    `polarity`) cross the slit, lit by halogen so every bar is seen at every wavelength. The bars
    must span at least half of the slit (better: all of it), and at least three must be followed
-   over 40 % of the spectrum. Use the same focus and working distance as for scanning: both
+   over 25 % of the spectrum (`MIN_BAR_COVERAGE`). Use the same focus and working distance as for scanning: both
    change the keystone. The rotation of the target in its plane does not matter (each bar still
    crosses the slit at one point, which is all the fit uses).
 3. **White** (optional, recommended): the same light, distance and exposure with the target
@@ -138,13 +138,45 @@ print(keystone_report(k))
 c.save("smile_model_bin2.npz", camera_setting)                  # ONE file, format 4
 ```
 
-`fit_keystone` needs the lamp analysis of this session (a model loaded from a file has no lamp
-traces: `RuntimeError`); a new `fit()` drops a previous keystone. In a worker thread, compute
-`analyze_keystone(c.analysis, target, ...)` there and hand the result to `c.attach_keystone(k)`.
+After `fit(lamp)` the smile and the keystone are fitted jointly; a new `fit()` drops a previous
+keystone. In a worker thread, compute `analyze_keystone(c.analysis, target, ...)` there and hand the
+result to `c.attach_keystone(k)`.
+
+**Keystone onto a stored smile (fore-lens off / on).** The smile belongs to the spectrograph and
+the detector (slit, grating, camera lens): taking the fore-lens off and on again does not change it,
+as long as the camera body and the spectrograph do not move. The keystone must be measured with the
+fore-lens on, at the scanning focus and working distance, because the lens's lateral colour is part
+of it. So:
+
+1. fore-lens **off**, lamp at the slit: measure the smile of **each hardware bin** and Apply it
+   (`smile_model_bin<N>.npz`, the bin's default model);
+2. fore-lens **on**: for each bin, take the line target (+ white) and fit the keystone onto the
+   stored smile of that bin (no lamp frame needed), then Apply: one combined model replaces the
+   bin's default (the previous file goes to `history/`).
+
+```python
+c = SmileCorrector.load("smile_model_bin2.npz")                 # the stored smile of this bin
+k = c.fit_keystone(target, white=white, dark=dark, lamp=None)  # lamp=... only to CHECK the smile
+c.save("smile_model_bin2.npz", camera_setting)                  # format 4; smile part unchanged
+```
+
+A stored smile is a function of the **raw** row (that is how the lamp lines were measured), so the
+combined map reads it at the row the pixel comes from: `source_y = Y + dy(X, Y)`,
+`source_x = X + S(source_y, X)` (`GeometryModel.dx_rows == "source"`). The keystone fit then does
+not involve the smile fit at all (a bar point's destination column is `X = x - S(y, X)`), only dy
+is fitted, and the stored smile is kept exactly, including `S(y_ref, X) = 0`. Fit numbers, the
+camera setting and the smile's surface are carried over; the file gets a new creation time (so
+flat-fields and references made with the old one are refused). Without a lamp frame the QC covers
+the target bars only, and the result always carries a reminder that the smile was not re-measured:
+pass `lamp=` (any lamp frame of that bin) now and then; a warning asks to measure the smile again
+when the lamp lines are more than 0.25 px RMS from straight with the stored smile. A keystone can
+also be re-fitted onto a combined model (its smile part is used).
 
 ```
 python -m modules.smile.keystone --lamp L.png --target T1.png T2.png [--white W.png] [--dark D.png] \
        [--polarity dark|bright] [--deg-y 2] [--deg-x 1] [--dy-xdeg 3] [--interp cubic] --out model.npz
+python -m modules.smile.keystone --smile-model smile_model_bin2.npz [--check-lamp L.png] \
+       --target T1.png T2.png [--white W.png] --out smile_model_bin2_keystone.npz
 ```
 
 Several files per option are averaged. The CLI prints the report and writes the model without a
@@ -171,7 +203,9 @@ lamp lines.
 **Calibration order** (each step is measured on the output of the previous ones):
 
 1. dark
-2. lamp -> smile and line target (+ white) -> keystone, joined into one map (this module)
+2. smile per hardware bin (fore-lens off, lamp at the slit), then keystone per bin (fore-lens on,
+   line target + white) onto that stored smile, joined into one map (this module); or both from a
+   lamp + line target taken in one optical state
 3. check the wavelength calibration again (Spectral Quality / `quality_cmd`)
 4. flat-field (scan of a white strip, `modules/flatfield`)
 5. radiometric reference (Spectralon, `modules/radiometric`)
@@ -268,7 +302,22 @@ cross-validation and the 100-repeat bootstrap. `analyze_quality` fits and cross-
 sampled rows of a line in one batch (see `QUALITY.md`, *Computation*). On a 1104 × 1608 frame: Smile
 analysis ≈ 2.1 s, Spectral Quality ≈ 7 s (was 3.2 s and ≈ 14 s). Line tracing stays row by row
 (each row's window follows the previous row; vectorising over lines with different window widths was
-slower and could not keep the float32 sums bit-identical).
+slower and could not keep the float32 sums bit-identical; a vectorised all-rows tracer was also
+tried: 4-6x faster, but on weak, noisy lines its centroids land differently and moved the bin-2 map
+by up to 0.1 px, so it was not adopted). Full-frame maps evaluate the surface separably
+(`Surface2D.grid`: two small matrix products instead of one full-frame array per coefficient);
+`SmileAnalysis.timings` holds the seconds per stage (detect, trace, fit, cross-validate, remap,
+re-trace). On a 2048 × 2560 frame (desktop CPU): analysis ≈ 1.2 s, result plots ≈ 1.2 s.
+
+The remap engine probes a GPU (OpenCL context, CUDA device count) only for a backend that may be
+used: never for `"cpu"` (the live runtime), and for `"auto"` only above 8 Mpx, the only size at
+which it would pick CUDA. On a Jetson the first OpenCL / CUDA call can build kernels for minutes.
+
+**Slow computer?** `python -m modules.smile.profile_cmd LAMP.png [--gui]` runs the steps of
+Analyze / Apply on a saved lamp frame and prints the seconds of each (analysis stages, model
+build, save / load, runtime remap, the GPU probes by themselves, and with `--gui` the widget's
+plots). Run it on the machine that is slow, with the app closed and again while it previews:
+a big difference points at the live preview competing for the CPU / the Python interpreter.
 
 ## Tests
 
