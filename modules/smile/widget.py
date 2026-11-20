@@ -11,7 +11,7 @@ import numpy as np
 
 # --- Qt imports (guarded) ---
 try:
-    from PyQt5.QtCore import QThread, Qt, pyqtSignal
+    from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
     from PyQt5.QtWidgets import (
         QCheckBox,
         QFileDialog,
@@ -220,6 +220,17 @@ class _QualityWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class _AveragedSnapshot:
+    """A snapshot packet whose ``image`` is the mean of several grabbed frames (other fields from the last)."""
+
+    def __init__(self, last, image, n: int):
+        self.request_id = last.request_id
+        self.image = image
+        self.camera_bin = getattr(last, "camera_bin", None)
+        self.dark_applied = getattr(last, "dark_applied", None)
+        self.frames_averaged = int(n)
+
+
 class SmileCorrectionWidget(QWidget):
     """Interactive smile correction widget for PyQt5 applications.
 
@@ -315,6 +326,16 @@ class SmileCorrectionWidget(QWidget):
         self.btn_grab.setToolTip("Request one frame after dark/hot-pixel correction and orientation")
         self.btn_grab.clicked.connect(lambda: self._request_grab("lamp"))
         ctrl.addWidget(self.btn_grab)
+        self._grab_sum = None              # running sum of the frames of an averaged grab
+        self._grab_count = 0
+        self.spin_grab_average = QSpinBox()
+        self.spin_grab_average.setRange(1, 256)
+        self.spin_grab_average.setValue(1)
+        self.spin_grab_average.setPrefix("Avg ×")
+        self.spin_grab_average.setToolTip(
+            "Frames averaged per grab (lamp, keystone target and white). The scene is static, so N frames "
+            "give sqrt(N) times the signal-to-noise: e.g. 16 frames make up for 4 stops of aperture.")
+        ctrl.addWidget(self.spin_grab_average)
         self.btn_export_png = QPushButton("Export PNG…")
         self.btn_export_png.setEnabled(False)
         self.btn_export_png.setToolTip("Save the current image (as grabbed) as an 8/16-bit PNG, values unscaled")
@@ -518,12 +539,23 @@ class SmileCorrectionWidget(QWidget):
             self._set_status("A grab is already pending")
             return
         self._grab_purpose = purpose if purpose in ("lamp", "target", "white") else "lamp"
+        self._grab_sum, self._grab_count = None, 0
         self.grabRequested.emit()
+
+    @property
+    def grab_average(self) -> int:
+        """Frames averaged per grab (the *Avg* box)."""
+        return int(self.spin_grab_average.value())
+
+    def set_grab_average(self, n: int) -> None:
+        """Set the number of frames averaged per grab (1..256)."""
+        self.spin_grab_average.setValue(int(n))
 
     def _grab_done(self) -> None:
         """No grab pending any more: Grab buttons back on, next grab is a lamp unless asked otherwise."""
         self._grab_request_id = None
         self._grab_purpose = "lamp"
+        self._grab_sum, self._grab_count = None, 0
         self.btn_grab.setEnabled(True)
         self.keystone_page.set_grab_enabled(True)
 
@@ -845,7 +877,11 @@ class SmileCorrectionWidget(QWidget):
         self.btn_grab.setEnabled(False)
         self.keystone_page.set_grab_enabled(False)
         what = {"target": " (keystone line target)", "white": " (keystone white)"}.get(self._grab_purpose, "")
-        self._set_status(f"Waiting for one camera frame{what}…")
+        n = self.grab_average
+        if n > 1:
+            self._set_status(f"Waiting for camera frame {self._grab_count + 1} of {n}{what}…")
+        else:
+            self._set_status(f"Waiting for one camera frame{what}…")
 
     def accept_snapshot(self, packet):
         """Receive the frame requested via ``grabRequested``.
@@ -858,12 +894,27 @@ class SmileCorrectionWidget(QWidget):
         """
         if packet.request_id != self._grab_request_id:
             return
+        n = self.grab_average
+        if n > 1:
+            img = np.asarray(packet.image, np.float64)
+            if self._grab_sum is not None and self._grab_sum.shape != img.shape:
+                self._grab_sum, self._grab_count = None, 0         # the frame size changed mid-way: restart
+            self._grab_sum = img.copy() if self._grab_sum is None else self._grab_sum + img
+            self._grab_count += 1
+            if self._grab_count < n:
+                self._grab_request_id = None                      # ask for the next frame (same purpose)
+                QTimer.singleShot(0, self.grabRequested.emit)
+                return
+            packet = _AveragedSnapshot(packet, (self._grab_sum / n).astype(np.float32), n)
         purpose = self._grab_purpose
         self._grab_done()
         # Snapshot already has the acquisition orientation; never flip twice.
         current = self._camera_setting()
         dark = getattr(packet, "dark_applied", None)
         dark_tag = "" if dark is None else (", dark subtracted" if dark else ", NO dark subtracted")
+        n_avg = getattr(packet, "frames_averaged", 1)
+        if n_avg > 1:
+            dark_tag += f", mean of {n_avg} frames"
         dark_hint = (" (the host's dark correction was off or had no dark for this bin)" if dark is False else "")
         if purpose in ("target", "white"):           # keystone frames do not replace the lamp frame
             setting = current.with_frame(packet.image.shape, packet.camera_bin) if current is not None else None

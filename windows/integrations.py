@@ -667,6 +667,33 @@ class FocusMapIntegration(Integration):
         self.host.open_widget(widget, "Focus Map", (1250, 760))
 
 
+class KeystoneCheckIntegration(Integration):
+    """Residual keystone of a corrected cube (``modules.keystone_check``): a file, or an open cube viewer."""
+
+    def menu_entries(self):
+        return [("Keystone Check (cube)", self.open)]
+
+    def _open_cubes(self):
+        """``[(title, cube, wavelengths, metadata)]`` of the cube viewers open in the main window."""
+        mdi = getattr(self.host, "mdi", None)
+        out = []
+        for sub in (mdi.subWindowList() if mdi is not None else []):
+            viewer = sub.widget()
+            cube = getattr(viewer, "cube", None)
+            if cube is None or getattr(cube, "ndim", 0) != 3 or not hasattr(viewer, "wavelengths"):
+                continue
+            out.append((sub.windowTitle() or "cube", cube, getattr(viewer, "wavelengths", None),
+                        dict(getattr(viewer, "config", None) or {})))
+        return out
+
+    def open(self, *_):
+        """Open Keystone Check; it lists the open cube viewers and opens ENVI files."""
+        from modules.keystone_check import KeystoneCheckWidget
+        widget = KeystoneCheckWidget()
+        widget.set_source_provider(self._open_cubes)
+        self.host.open_widget(widget, "Keystone Check", (1400, 720))
+
+
 class ReferenceROIIntegration(Integration):
     """Visual reference-ROI selection: a preview scan feeds the widget, the saved profile drives the live overlay."""
 

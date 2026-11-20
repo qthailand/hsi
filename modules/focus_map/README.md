@@ -8,9 +8,13 @@ the window shows, live:
 
 * a map of the local bar contrast (bright = sharp) with the sharpest column of every slit
   row and the parabola fitted through them (the "<" shaped best-focus curve);
-* **worst-zone contrast** - the 5th percentile of the contrast over the lit frame, with its
-  peak and a trend arrow. Turn the focus until it is highest: the least sharp part of the
-  frame is then as sharp as it can be;
+* **worst-zone CNR** (contrast-to-noise) - the 5th percentile over the lit frame of the bar
+  amplitude (lock-in at the bar period, DN) divided by the single-pixel noise (DN, from second
+  differences along the spectrum), with its peak and a trend arrow. Turn the focus, and close
+  the aperture, until it is highest: stopping down sharpens the bars but costs light, and the
+  CNR falls again once the light lost outweighs the sharpness gained. The light-independent
+  worst-zone contrast (bar amplitude / local level) is shown below it, with the signal level
+  (DN, % of full scale for integer frames), the noise and a clipping warning;
 * the wavelength (or column) of best focus at the slit centre and at the slit ends, and a
   one-line hint (which way the best-focus band should move, whether field curvature is so
   large that stopping down is the remedy).

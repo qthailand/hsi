@@ -49,6 +49,26 @@ from modules.frame_exchange.snapshot import FrameSnapshot
 from modules.preprocessing import PreprocessingRuntime
 from modules.sharpness import ImageSharpness
 from modules.smile.runtime import SmileRuntime
+
+
+def crop_keystone_rows(image, calibration):
+    """*image* without the keystone row margin of *calibration* (rows the keystone remap filled
+    from outside the sensor: 0 in some bands), like the smile border bands are left out.
+
+    ``image`` is a corrected frame ``(slit rows, ...)`` (numpy or a device array that slices the
+    same way); returned unchanged without a keystone model, without a margin, or when the margin
+    would leave no rows.
+    """
+    if image is None or calibration is None or not getattr(calibration, "has_keystone", False):
+        return image
+    try:
+        top, bottom = (max(0, int(v)) for v in getattr(calibration, "row_margin", (0, 0)))
+    except (TypeError, ValueError):
+        return image
+    h = image.shape[0]
+    if top + bottom <= 0 or top + bottom >= h:
+        return image
+    return image[top:h - bottom]
 from modules.spectral_processing import LambdaBinner
 
 from .profiler import StageProfiler
@@ -628,6 +648,8 @@ class AcquisitionEngine:
                 try:
                     top, bottom = getattr(cal, "row_margin", (0, 0))
                     info["keystone_row_margin"] = [int(top), int(bottom)]
+                    if int(top) + int(bottom) > 0:
+                        info["keystone_margin_rows"] = f"cropped at acquisition (first line = sensor row {int(top)})"
                 except (TypeError, ValueError):
                     pass
         return info
@@ -1340,6 +1362,7 @@ class AcquisitionEngine:
                 ceiling, _, _ = self._preprocessor.process_binned(
                     full, correction, self._ensure_binner(frame.shape[1]),
                     calibration=self._smile.calibration, inverted=self._raw_inverted)
+                ceiling = crop_keystone_rows(ceiling, self._smile.calibration)   # same rows as the frames
         except Exception as exc:
             logger.warning("Saturation ceiling unavailable: %s", exc)
         self._ceiling_key = key
@@ -1447,6 +1470,9 @@ class AcquisitionEngine:
                         self.sink.error(str(exc))
                         break
                     self._report_corrections(frame)
+                    # rows the keystone filled from outside the sensor are left out, as the smile
+                    # border bands are (the snapshot for calibration keeps the full sensor frame)
+                    emit_frame = crop_keystone_rows(emit_frame, calibration)
                     self._update_saturation_ceiling(frame, correction, dark_capture=False)
                     # transform() allocates a new array per call, so it is safe to keep
                     self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp)

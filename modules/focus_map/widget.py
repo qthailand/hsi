@@ -114,7 +114,7 @@ class FocusMapWidget(QWidget):
                 s.set_color("#444")
         self.ax_map.set_ylabel("row (slit)", color=_DIM, fontsize=9)
         self.ax_map.set_xlabel("column (spectral)", color=_DIM, fontsize=9)
-        self.ax_hist.set_ylabel("worst-zone", color=_DIM, fontsize=9)
+        self.ax_hist.set_ylabel("worst-zone CNR", color=_DIM, fontsize=9)
         self.ax_hist.set_xlabel("frames (latest at right) - turn the focus until this is highest", color=_DIM, fontsize=8)
         self._sec = None
         (self._pts,) = self.ax_map.plot([], [], "o", ms=3, color="#4dd0e1", label="sharpest column per row")
@@ -135,6 +135,9 @@ class FocusMapWidget(QWidget):
         self.lab_trend = _big_label(26, _DIM)
         self.lab_peak = _big_label(11, _ACCENT, bold=False)
         self.lab_balance = _big_label(11, _DIM, bold=False)
+        self.lab_balance.setWordWrap(True)
+        self.lab_light = _big_label(11, _DIM, bold=False)
+        self.lab_light.setWordWrap(True)
         self.lab_centre = _big_label(18)
         self.lab_edge = _big_label(18)
         self.lab_tilt = _big_label(10, _DIM, bold=False)
@@ -142,18 +145,19 @@ class FocusMapWidget(QWidget):
         self.lab_advice = QLabel("")
         self.lab_advice.setWordWrap(True)
         self.lab_advice.setStyleSheet(f"color: {_TEXT}; font-size: 12px;")
-        g.addWidget(cap("Worst-zone contrast (×100)"), 0, 0, 1, 2)
+        g.addWidget(cap("Worst-zone contrast-to-noise (CNR)"), 0, 0, 1, 2)
         g.addWidget(self.lab_score, 1, 0)
         g.addWidget(self.lab_trend, 1, 1, Qt.AlignRight)
         g.addWidget(self.lab_peak, 2, 0, 1, 2)
         g.addWidget(self.lab_balance, 3, 0, 1, 2)
-        g.addWidget(cap("Sharpest at slit centre"), 4, 0, 1, 2)
-        g.addWidget(self.lab_centre, 5, 0, 1, 2)
-        g.addWidget(cap("Sharpest at slit ends"), 6, 0, 1, 2)
-        g.addWidget(self.lab_edge, 7, 0, 1, 2)
-        g.addWidget(self.lab_tilt, 8, 0, 1, 2)
-        g.addWidget(self.lab_advice, 9, 0, 1, 2)
-        g.setRowStretch(10, 1)
+        g.addWidget(self.lab_light, 4, 0, 1, 2)
+        g.addWidget(cap("Sharpest at slit centre"), 5, 0, 1, 2)
+        g.addWidget(self.lab_centre, 6, 0, 1, 2)
+        g.addWidget(cap("Sharpest at slit ends"), 7, 0, 1, 2)
+        g.addWidget(self.lab_edge, 8, 0, 1, 2)
+        g.addWidget(self.lab_tilt, 9, 0, 1, 2)
+        g.addWidget(self.lab_advice, 10, 0, 1, 2)
+        g.setRowStretch(11, 1)
 
         body = QHBoxLayout()
         body.addWidget(self.canvas, stretch=1)
@@ -300,7 +304,9 @@ class FocusMapWidget(QWidget):
         self.ax_map.set_title("Bar contrast - bright = sharp bars" + ("" if to_nm else "   (no wavelength calibration)"),
                               color=_TEXT, fontsize=10, pad=24 if to_nm else 6)
 
-        score = 100.0 * fm.worst
+        # contrast-to-noise falls with the light: stopping down helps only while the sharper bars
+        # gain more than the noise costs. Contrast alone (light-independent) is shown below it.
+        score = fm.worst_cnr if np.isfinite(fm.worst_cnr) else 100.0 * fm.worst
         self._history.append(score)
         self._peak = max(self._peak, score)
         ys = np.array(self._history)
@@ -322,7 +328,19 @@ class FocusMapWidget(QWidget):
         self.lab_trend.setText(arrow)
         self.lab_trend.setStyleSheet(f"color: {colour};")
         self.lab_peak.setText(f"peak {self._peak:.2f}")
-        self.lab_balance.setText(f"even-ness (worst / best) {100 * fm.balance:.0f} %")
+        self.lab_balance.setText(f"worst-zone contrast {100 * fm.worst:.2f} %  (even-ness {100 * fm.balance:.0f} %)")
+        light = f"signal {fm.level_dn:.0f} DN" + (f" ({100 * fm.level_fraction:.0f} % of full scale)"
+                                                  if fm.level_fraction is not None else "")
+        light += f", noise {fm.noise_dn:.0f} DN"
+        colour = _DIM
+        if fm.clipped > 0.001:
+            light += f" - {100 * fm.clipped:.1f} % clipped: lower the exposure"
+            colour = _BAD
+        elif fm.level_fraction is not None and fm.level_fraction < 0.15:
+            light += " - dim: average frames for calibration, or slow the line rate for scans"
+            colour = _ACCENT
+        self.lab_light.setText(light)
+        self.lab_light.setStyleSheet(f"color: {colour};")
         fmt = (lambda c: f"{float(to_nm(c)):.0f} nm") if to_nm else (lambda c: f"col {c:.0f}")
         if fm.fit is None:
             self.lab_centre.setText("—")

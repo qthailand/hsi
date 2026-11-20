@@ -7,12 +7,13 @@ from __future__ import annotations
 
 from typing import List
 
-from .integrations import (FocusMapIntegration, Integration, RadiometricIntegration, ReferenceROIIntegration,
+from .integrations import (FocusMapIntegration, Integration, KeystoneCheckIntegration, RadiometricIntegration,
+                           ReferenceROIIntegration,
                            SmileIntegration, SpectralResolutionIntegration, WavelengthIntegration)
 
 #: Integration classes in menu order.
 INTEGRATIONS = (RadiometricIntegration, SmileIntegration, WavelengthIntegration,
-                SpectralResolutionIntegration, ReferenceROIIntegration, FocusMapIntegration)
+                SpectralResolutionIntegration, ReferenceROIIntegration, FocusMapIntegration, KeystoneCheckIntegration)
 
 
 def default_integrations(host) -> List[Integration]:

@@ -32,6 +32,7 @@ Example:
 """
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -73,6 +74,14 @@ class FocusMap:
         worst: 5th percentile of the lit contrast (the least sharp part of the frame).
         best: 95th percentile of the lit contrast.
         frame_shape: ``(height, width)`` of the input frame.
+        cnr: ``(rows, cols)`` float32 contrast-to-noise: bar modulation (DN) over the single-pixel
+            noise (DN) there; NaN where unlit. Unlike ``contrast`` it falls when the light falls.
+        worst_cnr: 5th percentile of the lit ``cnr`` (the score to focus and stop down by).
+        best_cnr: 95th percentile of the lit ``cnr``.
+        noise_dn: Median single-pixel noise over the lit frame (DN).
+        level_dn: 95th percentile of the lit signal level (DN).
+        full_scale: Full scale of the input (DN; the integer dtype's maximum), ``None`` for float input.
+        clipped: Share of the lit pixels at or above 98 % of ``full_scale`` (0 without a full scale).
     """
     contrast: np.ndarray
     rows: np.ndarray
@@ -88,6 +97,18 @@ class FocusMap:
     worst: float
     best: float
     frame_shape: tuple
+    cnr: Optional[np.ndarray] = None
+    worst_cnr: float = float("nan")
+    best_cnr: float = float("nan")
+    noise_dn: float = float("nan")
+    level_dn: float = float("nan")
+    full_scale: Optional[float] = None
+    clipped: float = 0.0
+
+    @property
+    def level_fraction(self) -> Optional[float]:
+        """``level_dn / full_scale`` (``None`` without a full scale)."""
+        return float(self.level_dn / self.full_scale) if self.full_scale else None
 
     @property
     def balance(self) -> float:
@@ -162,11 +183,12 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
     Raises:
         ValueError: Not a 2-D frame of at least 32 x 32 pixels, no bar pattern, or nothing lit.
     """
-    img = np.asarray(image, np.float32)
-    if img.ndim != 2 or min(img.shape) < 32:
+    raw = np.asarray(image)
+    if raw.ndim != 2 or min(raw.shape) < 32:
         raise ValueError("Use a 2-D frame of at least 32 x 32 pixels")
+    full_scale = float(np.iinfo(raw.dtype).max) if np.issubdtype(raw.dtype, np.integer) else None
+    img = np.nan_to_num(raw.astype(np.float32))
     h, w = img.shape
-    img = np.nan_to_num(img)
     if period is None:
         period = bar_period(img)
     period = float(np.clip(period, *PERIOD_RANGE))
@@ -177,11 +199,16 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
     cols = (np.arange(nb) + 0.5) * COLUMN_BLOCK - 0.5
     col_smooth = max(1.0, 0.004 * w / COLUMN_BLOCK)
     level = gaussian_filter(red, (period, col_smooth))
-    fine = gaussian_filter(red, (max(0.6, period / 12.0), col_smooth))
-    ripple = fine - level
     win_r = max(3, int(round(2 * period)))
     win_c = max(3, int(round(0.02 * w / COLUMN_BLOCK)))
-    amp = np.sqrt(np.maximum(uniform_filter(ripple * ripple, (win_r, win_c)), 0.0)) * np.sqrt(2.0)
+    # lock-in at the bar frequency: amplitude of the bars' fundamental along the slit. Noise
+    # averages out over the window (unlike an RMS of the ripple, whose noise floor would read as
+    # bar contrast where the bars are blurred away).
+    ph = 2.0 * np.pi * np.arange(h, dtype=np.float64)[:, None] / period
+    ac = red - level
+    i_c = uniform_filter(ac * np.cos(ph), (win_r, win_c))
+    q_c = uniform_filter(ac * np.sin(ph), (win_r, win_c))
+    amp = (2.0 * np.sqrt(i_c * i_c + q_c * q_c)).astype(np.float32)
     bright = float(np.percentile(level, 99))
     if bright <= 0:
         raise ValueError("The frame is dark")
@@ -191,6 +218,8 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
     if lit.sum() < 50:
         raise ValueError("Too few lit pixels")
     contrast = np.where(lit, amp / np.maximum(level, 1e-6), np.nan).astype(np.float32)
+    noise = _pixel_noise(img, nb, (win_r, win_c))
+    cnr = np.where(lit, amp / np.maximum(noise, 1e-6), np.nan).astype(np.float32)
 
     lit_r = np.flatnonzero(lit.any(axis=1))
     lit_c = np.flatnonzero(lit.any(axis=0))
@@ -245,12 +274,34 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
         if not (lit_cols[0] - 0.25 * span <= fit[0] <= lit_cols[1] + 0.25 * span):
             fit = None
 
-    vals = contrast[lit]
+    vals, cvals = contrast[lit], cnr[lit]
+    lit_full = np.repeat(lit, COLUMN_BLOCK, axis=1)
+    lit_pix = img[:, :nb * COLUMN_BLOCK][lit_full]
+    clipped = float(np.mean(lit_pix >= 0.98 * full_scale)) if full_scale and lit_pix.size else 0.0
     return FocusMap(contrast=contrast, rows=np.arange(h, dtype=float), cols=cols, period=period,
                     row_samples=row_samples, best_col=best_col, best_contrast=best_val, fit=fit,
                     centre_row=float(centre_row), lit_rows=lit_rows, lit_cols=lit_cols,
                     worst=float(np.percentile(vals, WORST_PERCENTILE)),
-                    best=float(np.percentile(vals, 100 - WORST_PERCENTILE)), frame_shape=(h, w))
+                    best=float(np.percentile(vals, 100 - WORST_PERCENTILE)), frame_shape=(h, w),
+                    cnr=cnr, worst_cnr=float(np.percentile(cvals, WORST_PERCENTILE)),
+                    best_cnr=float(np.percentile(cvals, 100 - WORST_PERCENTILE)),
+                    noise_dn=float(np.median(noise[lit])), level_dn=float(np.percentile(level[lit], 95)),
+                    full_scale=full_scale, clipped=clipped)
+
+
+def _pixel_noise(img: np.ndarray, nb: int, window) -> np.ndarray:
+    """Local single-pixel noise (DN) on the reduced grid, from second differences along the spectrum.
+
+    The bars run along the spectral axis, so the signal is smooth there; the second difference
+    ``x[c-1] - 2 x[c] + x[c+1]`` removes slopes and keeps the noise (variance ``6 sigma**2``). Its
+    mean absolute value over a window gives sigma for Gaussian noise (``E|d| = sigma_d sqrt(2/pi)``).
+    """
+    d2 = np.zeros_like(img)
+    d2[:, 1:-1] = np.abs(img[:, :-2] - 2.0 * img[:, 1:-1] + img[:, 2:])
+    d2[:, 0], d2[:, -1] = d2[:, 1], d2[:, -2]
+    red = d2[:, :nb * COLUMN_BLOCK].reshape(img.shape[0], nb, COLUMN_BLOCK).mean(axis=2)
+    mean_abs = uniform_filter(red, window)
+    return (mean_abs * math.sqrt(math.pi / 2.0) / math.sqrt(6.0)).astype(np.float32)
 
 
 def linear_wavelength(slope_nm_per_px: float, offset_nm: float) -> Callable[[np.ndarray], np.ndarray]:

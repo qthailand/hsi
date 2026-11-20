@@ -49,7 +49,7 @@ from PyQt5.QtWidgets import (
     QLabel, QSlider, QGroupBox, QComboBox, QPushButton,
     QFileDialog, QProgressBar, QMessageBox, QDialog,
     QSplitter, QShortcut, QScrollArea, QSizePolicy, QFrame,
-    QStackedWidget,
+    QStackedWidget, QCheckBox,
 )
 
 from modules.live_view.mapping import DisplayMapper
@@ -251,6 +251,32 @@ class ExportDialog(QDialog):
         fmt_grp.setLayout(fmt_lay)
         lay.addWidget(fmt_grp)
 
+        # keystone margin rows: filled from outside the sensor by the keystone remap (0 there)
+        from modules.cube_io.writers import keystone_row_margin
+        top, bottom = keystone_row_margin(self.config)
+        if str(self.config.get("keystone_margin_rows", "")).startswith("cropped"):
+            top = bottom = 0                    # left out at acquisition already: nothing to crop
+        self.chk_crop_margin = QCheckBox(
+            f"Crop keystone margin ({top} rows top, {bottom} bottom: {h} \u2192 {h - top - bottom} lines)")
+        self.chk_crop_margin.setToolTip(
+            "Rows at the slit ends that the keystone correction filled partly from outside the sensor\n"
+            "(0 in some bands). Cropped: every pixel of the file has all bands; other row numbers in\n"
+            "the header (reference rows) stay sensor rows, and the header says where the file starts.\n"
+            "Not cropped: a float cube gets NaN in those rows, an integer cube is written as it is.")
+        self.lbl_margin = QLabel("")
+        self.lbl_margin.setWordWrap(True)
+        self.lbl_margin.setStyleSheet("color: #9aa0a6;")
+        if top + bottom > 0:
+            lay.addWidget(self.chk_crop_margin)
+            lay.addWidget(self.lbl_margin)
+        else:
+            self.chk_crop_margin.setVisible(False)
+            self.lbl_margin.setVisible(False)
+        self._margin = (top, bottom)
+        self.chk_crop_margin.toggled.connect(self._update_margin_note)
+        self.combo.currentIndexChanged.connect(self._update_margin_note)
+        self._update_margin_note()
+
         path_grp = QGroupBox("OUTPUT PATH")
         path_lay = QHBoxLayout()
         self.path_label = QLabel("No file selected")
@@ -280,6 +306,23 @@ class ExportDialog(QDialog):
         btn_row.addWidget(self.btn_export)
         btn_row.addWidget(btn_close)
         lay.addLayout(btn_row)
+
+    def _update_margin_note(self, *_):
+        """Say what happens to the keystone margin rows with the chosen format and crop setting."""
+        top, bottom = self._margin
+        if top + bottom <= 0:
+            return
+        spectro = self.combo.currentIndex() == 2
+        self.chk_crop_margin.setEnabled(not spectro)
+        if spectro:
+            self.lbl_margin.setText("Raw spectrogram: written as it is (no keystone margin handling).")
+        elif self.chk_crop_margin.isChecked():
+            self.lbl_margin.setText(f"Rows 0-{top - 1} and the last {bottom} are left out.")
+        elif np.dtype(self.cube.dtype).kind == "f":
+            self.lbl_margin.setText(f"Rows 0-{top - 1} and the last {bottom} are written as NaN.")
+        else:
+            self.lbl_margin.setText(f"Integer cube: rows 0-{top - 1} and the last {bottom} are written as they "
+                                    "are (0 where the keystone had no data); tick Crop to leave them out.")
 
     def _browse(self):
         ext_map = {0: ".bip", 1: ".tif", 2: ".bin"}
@@ -325,13 +368,13 @@ class ExportDialog(QDialog):
             w = HypercubeWorker(
                 save_path=self._save_path, config=self.config,
                 hypercube=cube_t, linear_spectrum=wl,
-                camera_bin=self.camera_bin,
+                camera_bin=self.camera_bin, crop_margin=self.chk_crop_margin.isChecked(),
             )
         elif idx == 1:
             w = GeoTIFFWorker(
                 save_path=self._save_path, config=self.config,
                 hypercube=cube_t, linear_spectrum=wl,
-                camera_bin=self.camera_bin,
+                camera_bin=self.camera_bin, crop_margin=self.chk_crop_margin.isChecked(),
             )
         else:
             w = SpectrogramWorker(
