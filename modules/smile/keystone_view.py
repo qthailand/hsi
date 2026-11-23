@@ -100,11 +100,9 @@ _GROUP = {PREVIEW: TAB_TARGET, DEVIATION: TAB_TARGET, WHITE: TAB_TARGET,
           BEFORE_AFTER: TAB_CORRECTION, RETRACE: TAB_CORRECTION, SPACING: TAB_CORRECTION,
           SHIFT_MAP: TAB_GEOMETRY, GRID: TAB_GEOMETRY}
 
-_GOOD, _WARN, _BAD, _TODO, _BUSY, _OPTIONAL = "ok", "warn", "bad", "todo", "busy", "optional"
-#: state -> (glyph, colour key of :func:`modules.smile.ui_theme.colors`)
-_GLYPH = {_GOOD: ("✓", "good"), _WARN: ("!", "warn"), _BAD: ("✗", "bad"),
-          _TODO: ("●", "todo"), _BUSY: ("…", "busy"), _OPTIONAL: ("○", "todo")}
-_CHIP = {_GOOD: "chip_good", _WARN: "chip_warn", _BAD: "chip_bad", "info": "chip_info"}
+# workflow states, step rows and dashboard parts shared with the Smile page (modules.smile.ui_parts)
+from .ui_parts import (BAD as _BAD, BUSY as _BUSY, CHIP as _CHIP, GLYPH as _GLYPH, GOOD as _GOOD,  # noqa: E402
+                       OPTIONAL as _OPTIONAL, TODO as _TODO, WARN as _WARN, DashboardMixin, Step as _Step)
 
 
 def _c(key: str) -> str:
@@ -388,71 +386,6 @@ class PreviewWorker(QThread):
 
 
 # ------------------------------------------------------------------------------------- step rows
-class _Step(QFrame):
-    """One row of the step checklist: status glyph, title, detail, Thai hint and its controls."""
-
-    def __init__(self, number: int, title: str, hint: str, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setObjectName("ksStep")
-        c = colors(self)
-        self.setStyleSheet(f"#ksStep {{ border: 1px solid {c['border']}; border-radius: 6px; background: {c['card']}; }}"
-                           f" #ksStep QLabel {{ color: {c['text']}; background: transparent; }}")
-        grid = QGridLayout(self)
-        grid.setContentsMargins(6, 4, 6, 4)
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(2)
-        self.glyph = QLabel()
-        self.glyph.setFixedWidth(26)
-        self.glyph.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        grid.addWidget(self.glyph, 0, 0, 4, 1)
-        self.title = QLabel(f"<b>{number}&nbsp;&nbsp;{html.escape(title)}</b>")
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        head.addWidget(self.title)
-        head.addStretch()
-        self.head = head
-        grid.addLayout(head, 0, 1)
-        self.detail = QLabel()
-        self.detail.setWordWrap(True)
-        self.detail.setTextFormat(Qt.RichText)
-        self.detail.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        grid.addWidget(self.detail, 1, 1)
-        # the step's explanation is its tooltip; the line shows only when the step needs action
-        self.hint = QLabel(hint)
-        self.hint.setWordWrap(True)
-        self.hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.hint.setStyleSheet(f"color:{colors(self)['hint']}; font-size:8.5pt;")
-        self.hint.setVisible(False)
-        self.setToolTip(hint)
-        grid.addWidget(self.hint, 2, 1)
-        self.actions = QHBoxLayout()
-        self.actions.setSpacing(4)
-        grid.addLayout(self.actions, 3, 1)
-        grid.setColumnStretch(1, 1)
-        self.state = _TODO
-        self.set_state(_TODO, "")
-
-    def set_state(self, state: str, detail: str, hint: Optional[str] = None, tip: str = "") -> None:
-        """Status glyph + detail text (rich text); *tip*: the full notes behind a shortened detail."""
-        self.state = state
-        glyph, key = _GLYPH[state]
-        colour = colors(self)[key]
-        self.glyph.setText(f"<span style='font-size:15pt;font-weight:bold;color:{colour}'>{glyph}</span>")
-        self.detail.setText(detail)
-        self.detail.setToolTip(tip)
-        if hint is not None:
-            self.hint.setText(hint)
-            self.setToolTip(hint)
-        self.hint.setVisible(state == _BAD and bool(self.hint.text()))
-
-    def add(self, *widgets) -> None:
-        for wdg in widgets:
-            self.actions.addWidget(wdg)
-
-    def finish(self) -> None:
-        self.actions.addStretch()
-
-
 def _chip(text: str, kind: str, tip: str = "") -> str:
     bg, fg, border = colors()[_CHIP.get(kind, "chip_info")]
     return text, f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:9px; " \
@@ -504,7 +437,7 @@ class _TiltIndicator(QWidget):
 
 
 # ------------------------------------------------------------------------------------- the page
-class KeystonePage(QWidget):
+class KeystonePage(DashboardMixin, QWidget):
     """Smile model (stored by default) + line target (+ white) -> smile + keystone model, with a
     live preview of the bars and check plots.
 
@@ -581,110 +514,17 @@ class KeystonePage(QWidget):
         self._refresh()
 
     # ------------------------------------------------------------------ UI
-    def _make_plot_panel(self, index: int, *, minimum: int = 200) -> QWidget:
-        """A retained Matplotlib canvas inside a compact dashboard panel.
-
-        Canvas indices and all per-plot exports remain stable for the host.
-        NavigationToolbar2QT is preserved for existing zoom/pan workflows.
-        """
-        from .widget import PlotCanvas
-        panel = QFrame()
-        panel.setObjectName("ksPlotPanel")
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(7, 7, 7, 7)
-        lay.setSpacing(3)
-        bar = QHBoxLayout()
-        bar.setSpacing(5)
-        name = _PLOTS[index][0]
-        label = QLabel(name)
-        label.setObjectName("ksPlotTitle")
-        bar.addWidget(label)
+    def _panel(self, index: int, *, minimum: int = 200) -> QWidget:
+        """Dashboard panel of canvas *index* (the grid's panel carries the magnify switch)."""
+        extras = ()
         if index == GRID:
             self.chk_exaggerate = QCheckBox("Magnified (visual only)")
             self.chk_exaggerate.setChecked(True)   # a ~1 px keystone is invisible at true scale; the title gives xG
             self.chk_exaggerate.setToolTip("Enlarge the DRAWN distortion only; the calibration model, values and "
                                            "corrected image do not change. The plot title shows actual display ×G.")
             self.chk_exaggerate.toggled.connect(lambda _on: self._plot_grid(self.result))
-            bar.addWidget(self.chk_exaggerate)
-        bar.addStretch()
-        canvas = PlotCanvas(panel)
-        try:
-            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
-            toolbar = NavigationToolbar2QT(canvas, panel, coordinates=True)
-            toolbar.setIconSize(toolbar.iconSize() * 0.75)
-            toolbar.setStyleSheet("QToolBar { border: 0px; }")
-            bar.addWidget(toolbar)
-        except Exception:  # matplotlib toolbar is optional
-            pass
-        btn_expand = QToolButton()
-        btn_expand.setText("Expand")
-        btn_expand.setCheckable(True)
-        btn_expand.setToolTip("Show this plot over the whole tab; press again to return to the dashboard.")
-        btn_expand.toggled.connect(lambda on, p=panel, b=btn_expand: self._expand_panel(p, b, on))
-        bar.addWidget(btn_expand)
-        btn_export = QPushButton("Export PNG")
-        btn_export.setToolTip("Export this plot at 300 dpi (not the entire dashboard).")
-        btn_export.clicked.connect(lambda _checked=False, i=index: self._on_export_plot(i))
-        bar.addWidget(btn_export)
-        lay.addLayout(bar)
-        canvas.setMinimumHeight(minimum)
-        lay.addWidget(canvas, stretch=1)
-        self._canvases[index] = canvas
-        self._tab_pages[index] = panel
-        return panel
-
-    def _expand_panel(self, panel: QWidget, button: QToolButton, on: bool) -> None:
-        """Let one plot panel fill its workflow tab (on) or put the dashboard back (off).
-
-        Every widget beside the panel's branch, up to the tab page, is hidden and given back; nothing
-        is rebuilt, so the canvas, its toolbar state and the host's canvas indices are untouched.
-        """
-        button.setText("Restore" if on else "Expand")
-        if not on:
-            hidden, stretched = getattr(panel, "_ks_expanded", ([], []))
-            for widget in hidden:
-                widget.setVisible(True)
-            for layout, widget in stretched:
-                layout.setStretchFactor(widget, 0)
-            panel._ks_expanded = ([], [])
-            return
-        hidden, stretched = [], []
-        w = panel
-        while w is not None and w not in getattr(self, "_group_pages", ()):
-            parent = w.parentWidget()
-            if parent is None:
-                break
-            if isinstance(parent, QSplitter):
-                layout, siblings = None, [parent.widget(i) for i in range(parent.count())]
-            else:
-                layout = parent.layout()
-                siblings = [layout.itemAt(i).widget() for i in range(layout.count())] if layout is not None else []
-            for s in siblings:
-                if s is not None and s is not w and not s.isHidden():   # not hidden by us or anyone else
-                    s.setVisible(False)
-                    hidden.append(s)
-            if isinstance(layout, QBoxLayout) and layout.indexOf(w) >= 0:
-                layout.setStretchFactor(w, 100)         # beats the trailing stretch of a scroll column
-                stretched.append((layout, w))
-            w = parent
-        panel._ks_expanded = (hidden, stretched)
-
-    @staticmethod
-    def _scroll_panels(*panels) -> QScrollArea:
-        """Secondary charts stay accessible on short displays without creating more tabs."""
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(2, 1, 2, 2)
-        layout.setSpacing(8)
-        for panel in panels:
-            layout.addWidget(panel)
-        layout.addStretch(1)
-        scroll = QScrollArea()
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(container)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        return scroll
+            extras = (self.chk_exaggerate,)
+        return self._make_plot_panel(index, _PLOTS[index][0], minimum=minimum, extras=extras)
 
     def _metric(self, title: str, *, tilt: bool = False):
         frame = QFrame()
@@ -706,15 +546,6 @@ class KeystonePage(QWidget):
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(value)
         return frame, value
-
-    def _paint_metric(self, label: QLabel, key: str) -> None:
-        """Colour of a summary value: ``good`` / ``warn`` / ``bad`` for a verdict, ``text`` for a plain number."""
-        label.setStyleSheet(f"color:{colors(self)[key]};")
-
-    def _paint_banner(self, state: str) -> None:
-        bg, fg, border = colors(self)[_CHIP.get(state, "chip_info")]
-        self.lbl_ready.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; "
-                                     f"border-radius:6px; padding:8px; }}")
 
     #: Warnings that are standing reminders, not a verdict on this analysis (kept in the report).
     _REMINDERS = ("Smile taken from the stored model",)
@@ -969,10 +800,10 @@ class KeystonePage(QWidget):
         tlay = QVBoxLayout(target)
         tlay.setContentsMargins(4, 4, 4, 4)
         target_split = QSplitter(Qt.Vertical)
-        target_split.addWidget(self._make_plot_panel(PREVIEW, minimum=260))
+        target_split.addWidget(self._panel(PREVIEW, minimum=260))
         lower = QSplitter(Qt.Horizontal)
-        lower.addWidget(self._make_plot_panel(DEVIATION, minimum=220))
-        lower.addWidget(self._make_plot_panel(WHITE, minimum=220))
+        lower.addWidget(self._panel(DEVIATION, minimum=220))
+        lower.addWidget(self._panel(WHITE, minimum=220))
         lower.setStretchFactor(0, 3)
         lower.setStretchFactor(1, 2)
         lower.setSizes([600, 400])
@@ -987,9 +818,9 @@ class KeystonePage(QWidget):
         clay = QHBoxLayout(correction)
         clay.setContentsMargins(4, 4, 4, 4)
         correction_split = QSplitter(Qt.Horizontal)
-        correction_split.addWidget(self._make_plot_panel(BEFORE_AFTER, minimum=400))
-        spacing_panel = self._make_plot_panel(SPACING, minimum=250)
-        retrace_panel = self._make_plot_panel(RETRACE, minimum=440)    # two stacked plots (bars, lamp lines)
+        correction_split.addWidget(self._panel(BEFORE_AFTER, minimum=400))
+        spacing_panel = self._panel(SPACING, minimum=250)
+        retrace_panel = self._panel(RETRACE, minimum=440)    # two stacked plots (bars, lamp lines)
         correction_split.addWidget(self._scroll_panels(spacing_panel, retrace_panel))
         correction_split.setStretchFactor(0, 3)
         correction_split.setStretchFactor(1, 2)
@@ -1002,8 +833,8 @@ class KeystonePage(QWidget):
         glay = QHBoxLayout(geometry)
         glay.setContentsMargins(4, 4, 4, 4)
         geometry_split = QSplitter(Qt.Horizontal)
-        geometry_split.addWidget(self._make_plot_panel(SHIFT_MAP, minimum=400))
-        grid_panel = self._make_plot_panel(GRID, minimum=310)
+        geometry_split.addWidget(self._panel(SHIFT_MAP, minimum=400))
+        grid_panel = self._panel(GRID, minimum=310)
         coverage_panel = QFrame()
         coverage_panel.setObjectName("ksPlotPanel")
         cov_lay = QVBoxLayout(coverage_panel)

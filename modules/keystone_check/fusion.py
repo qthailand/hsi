@@ -105,6 +105,7 @@ class BandFusion:
         self._block = max(1, int(block))
         self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
         self._levels: Optional[np.ndarray] = None
+        self._sharp: Optional[np.ndarray] = None
 
     @property
     def bands(self) -> int:
@@ -130,6 +131,33 @@ class BandFusion:
             floor = 0.02 * float(lev.max()) if lev.max() > 0 else 1.0
             self._levels = np.maximum(lev, floor).astype(np.float32)
         return self._levels
+
+    def sharpness(self, columns: int = 48) -> np.ndarray:
+        """Per-band edge sharpness: steepest edge along the slit, above the noise, per unit of band level.
+
+        On ``columns`` scan columns spread over the cube (all rows but the margins): each column's
+        largest row-to-row step ``|d|``, 75th percentile over the columns (the edges cross the slit,
+        so most columns have one), minus 5 x the median ``|d|`` (about the largest step noise alone
+        makes over ~1000 rows), divided by :meth:`levels`. A step edge of contrast C blurred by sigma
+        px gives about ``C / (2.5 sigma)``: in focus and high-contrast is high, defocused or
+        noisy is low. 0 where no edge stands out of the noise. Read once, cached.
+
+        Returns:
+            ``(bands,)`` float32, >= 0 (1 / px of the white level).
+        """
+        if self._sharp is None:
+            L, S, B = self.shape
+            top, bottom = self._margin
+            r0 = min(top, L - 2)
+            r1 = max(r0 + 2, L - bottom)
+            cs = max(1, S // max(1, int(columns)))
+            sub = np.nan_to_num(np.asarray(self.cube[r0:r1, ::cs, :], np.float32))     # (rows, cols, B)
+            d = np.abs(np.diff(sub, axis=0))
+            del sub
+            peak = np.percentile(d.max(axis=0), 75, axis=0)                           # (B,)
+            noise = np.median(d.reshape(-1, B), axis=0)
+            self._sharp = (np.maximum(peak - 5.0 * noise, 0.0) / self.levels()).astype(np.float32)
+        return self._sharp
 
     def _read(self, a: int, b: int, progress: Callable[[int], None]) -> None:
         """Read bands ``a:b`` in contiguous row chunks into the cache."""

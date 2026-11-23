@@ -47,6 +47,7 @@ class BandWindowSlider(QWidget):
                         "drag the white marker, click the spectrum, arrow keys or wheel to move the centre band")
         self._wl = np.zeros(0)
         self._spec = np.zeros(0)
+        self._bar_label = ""
         self._c = 0
         self._nl = 0
         self._nr = 0
@@ -60,15 +61,17 @@ class BandWindowSlider(QWidget):
         """New cube: its band *wavelengths* (nm); the spectrum is flat until :meth:`set_spectrum`."""
         self._wl = np.asarray(wavelengths, float)
         self._spec = np.ones(self._wl.size)
+        self._bar_label = ""
         self._c = min(self._c, max(0, self._wl.size - 1))
         self._clip()
         self.update()
 
-    def set_spectrum(self, levels) -> None:
-        """Bar heights (one per band, any scale)."""
+    def set_spectrum(self, levels, label: str = "") -> None:
+        """Bar heights (one per band, any scale) and what they are (*label*, drawn top-left)."""
         lv = np.nan_to_num(np.asarray(levels, float))
-        if lv.size == self._wl.size and lv.max() > 0:
-            self._spec = lv / lv.max()
+        if lv.size == self._wl.size:
+            self._spec = lv / lv.max() if lv.max() > 0 else np.zeros(lv.size)
+            self._bar_label = label
             self.update()
 
     def set_max_side(self, n: int) -> None:
@@ -196,6 +199,14 @@ class BandWindowSlider(QWidget):
         p.drawRoundedRect(box, 3, 3)
         p.setPen(QColor("#e0e0e0"))
         p.drawText(box, Qt.AlignCenter, txt)
+        if self._bar_label:
+            tw = p.fontMetrics().horizontalAdvance(self._bar_label) + 10
+            box = QRectF(bars.left(), bars.top(), tw, 16)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(30, 31, 34, 220))
+            p.drawRoundedRect(box, 3, 3)
+            p.setPen(QColor("#e0e0e0"))
+            p.drawText(box, Qt.AlignCenter, self._bar_label)
         p.end()
 
     # ── mouse / keys ───────────────────────────────────────────

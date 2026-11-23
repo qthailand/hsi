@@ -21,7 +21,10 @@ try:
         QPushButton,
         QSizePolicy,
         QSpinBox,
+        QSplitter,
         QTabWidget,
+        QTextEdit,
+        QToolButton,
         QHBoxLayout,
         QVBoxLayout,
         QAction,
@@ -57,7 +60,7 @@ from .core import (
     robust_sigma,
     save_frame,
 )
-from .analysis import SmileAnalysis, analyze_smile
+from .analysis import SmileAnalysis, analyze_smile, review_analysis
 from .calibration import (
     SmileCalibration,
     calibration_from_analysis,
@@ -67,6 +70,13 @@ from .calibration import (
     save_calibration,
 )
 from .corrector import SmileCorrector
+from .ui_theme import colors as _theme_colors
+
+try:
+    from .ui_parts import DashboardMixin
+except ImportError:          # no Qt: the widget is unavailable anyway
+    class DashboardMixin:  # noqa: D101
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +84,12 @@ __all__ = [
     "PlotCanvas", "SmileCorrectionWidget", "SmileMainWindow",
     "launch_gui", "HAVE_QT",
 ]
+
+#: Plot tabs of the Smile page (the canvases inside keep their indices 0-7).
+TAB_CORRECTION, TAB_SHIFT, TAB_QUALITY = range(3)
+#: Straightness RMS (px) after correction above which the Smile page asks for a review
+#: (the limit of the keystone re-trace and the spectrogram view).
+SMILE_RMS_WARN_PX = 0.25
 
 _COLORS = [
     "#1f77b4",
@@ -143,19 +159,22 @@ class _AnalyzeWorker(QThread):
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, frame: np.ndarray, kwargs: dict):
+    def __init__(self, frame: np.ndarray, kwargs: dict, fn=None):
         """Args:
             frame: Calibration image ``(H, W)``; read by the worker thread, do not modify while running.
-            kwargs: Keyword arguments forwarded to :func:`analyze_smile`.
+            kwargs: Keyword arguments forwarded to *fn*.
+            fn: ``fn(frame, **kwargs)`` to run (default :func:`analyze_smile`; the review of a
+                loaded model uses :func:`review_analysis`).
         """
         super().__init__()
         self._frame = frame
         self._kwargs = kwargs
+        self._fn = fn or analyze_smile
 
     def run(self) -> None:
         """Execute the analysis."""
         try:
-            self.done.emit(analyze_smile(self._frame, **self._kwargs))
+            self.done.emit(self._fn(self._frame, **self._kwargs))
         except Exception as exc:  # noqa: BLE001
             import traceback
 
@@ -231,7 +250,7 @@ class _AveragedSnapshot:
         self.frames_averaged = int(n)
 
 
-class SmileCorrectionWidget(QWidget):
+class SmileCorrectionWidget(DashboardMixin, QWidget):
     """Interactive smile correction widget for PyQt5 applications.
 
     Provides file loading, analysis, visualisation (the *Smile* tabs), and
@@ -300,6 +319,7 @@ class SmileCorrectionWidget(QWidget):
         self._store = None                 # CalibrationStore (host)
         self._setting_provider = None      # () -> CameraSetting of the camera now
         self._setting = None               # CameraSetting of the current frame
+        self._review = None                # loaded model shown as the result: {"path", "cal", "identical", "lamp"}
         self._build_ui()
 
     # -----------------------------------------------------------------
@@ -307,17 +327,18 @@ class SmileCorrectionWidget(QWidget):
     # -----------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        """Construct the widget layout and controls."""
+        """Construct the widget layout: the Smile page (workflow, quality summary, plot tabs), the
+        Keystone and Result pages, and the camera-setting / status lines shared by all three."""
+        from .ui_parts import Step, page_style, title_bar
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(4)
 
-        # -- control row --
-        ctrl = QHBoxLayout()
-
-        self.btn_load = QPushButton("📂 Load lamp image…")
+        # -- controls (placed in the workflow steps below; names kept for the host and tests) --
+        self.btn_load = QPushButton("Load lamp image…")
+        self.btn_load.setToolTip("A calibration-lamp frame taken with the fore-optics removed (or a model saved "
+                                 "with its frames)")
         self.btn_load.clicked.connect(self._on_load)
-        ctrl.addWidget(self.btn_load)
         self._grab_request_id = None
         self._grab_purpose = "lamp"        # what the pending grab is for: lamp | target | white
         self._grab_available = False
@@ -325,7 +346,6 @@ class SmileCorrectionWidget(QWidget):
         self.btn_grab.setEnabled(False)
         self.btn_grab.setToolTip("Request one frame after dark/hot-pixel correction and orientation")
         self.btn_grab.clicked.connect(lambda: self._request_grab("lamp"))
-        ctrl.addWidget(self.btn_grab)
         self._grab_sum = None              # running sum of the frames of an averaged grab
         self._grab_count = 0
         self.spin_grab_average = QSpinBox()
@@ -335,48 +355,36 @@ class SmileCorrectionWidget(QWidget):
         self.spin_grab_average.setToolTip(
             "Frames averaged per grab (lamp, keystone target and white). The scene is static, so N frames "
             "give sqrt(N) times the signal-to-noise: e.g. 16 frames make up for 4 stops of aperture.")
-        ctrl.addWidget(self.spin_grab_average)
         self.btn_export_png = QPushButton("Export PNG…")
         self.btn_export_png.setEnabled(False)
         self.btn_export_png.setToolTip("Save the current image (as grabbed) as an 8/16-bit PNG, values unscaled")
         self.btn_export_png.clicked.connect(self._on_export_png)
-        ctrl.addWidget(self.btn_export_png)
 
-
-        self.btn_analyze = QPushButton("🔍 Analyze smile")
+        self.btn_analyze = QPushButton("Analyze smile")
         self.btn_analyze.setEnabled(False)
         self.btn_analyze.setStyleSheet("font-weight:bold;")
         self.btn_analyze.clicked.connect(self._on_analyze)
-        ctrl.addWidget(self.btn_analyze)
 
-        self.btn_save = QPushButton("💾 Save corrected image…")
+        self.btn_save = QPushButton("Save corrected image…")
         self.btn_save.setEnabled(False)
+        self.btn_save.setToolTip("Save the smile-corrected lamp frame")
         self.btn_save.clicked.connect(self._on_save)
-        ctrl.addWidget(self.btn_save)
-
-        self.btn_save_cal = QPushButton("📐 Save model…")
+        self.btn_save_cal = QPushButton("Save model…")
         self.btn_save_cal.setEnabled(False)
-        self.btn_save_cal.setToolTip(
-            "Save map_x (and map_y with keystone) for reuse without re-analysis."
-        )
+        self.btn_save_cal.setToolTip("Save map_x (and map_y with keystone) for reuse without re-analysis.")
         self.btn_save_cal.clicked.connect(self._on_save_cal)
-        ctrl.addWidget(self.btn_save_cal)
-
-        self.btn_load_cal = QPushButton("📥 Load model…")
+        self.btn_load_cal = QPushButton("Load model…")
         self.btn_load_cal.setToolTip(
-            "Load a previously saved calibration matrix."
-        )
+            "Load a saved smile model (.npz) and show its result: with the lamp frame stored in the file, the "
+            "plots and quality summary are rebuilt from the stored smile (no re-fit); Apply / Save write that model.")
         self.btn_load_cal.clicked.connect(self._on_load_cal)
-        ctrl.addWidget(self.btn_load_cal)
-
-        self.btn_export_excel = QPushButton("📊 Export Excel")
+        self.btn_export_excel = QPushButton("Export Excel")
         self.btn_export_excel.setEnabled(False)
         self.btn_export_excel.setToolTip(
             "Export the smile result (lines, traces, fit, residuals) and, if run, "
             "the spectral-quality analysis to an .xlsx workbook."
         )
         self.btn_export_excel.clicked.connect(self._on_export_excel)
-
         self.btn_apply = QPushButton("📌 Apply to camera")
         self.btn_apply.setEnabled(False)
         self.btn_apply.setStyleSheet("font-weight:bold;")
@@ -386,63 +394,110 @@ class SmileCorrectionWidget(QWidget):
         )
         self.btn_apply.clicked.connect(self.apply_to_camera)
 
-        ctrl.addStretch()
-
-        # -- fit parameters --
-        ctrl.addWidget(QLabel("deg_y:"))
+        # fit parameters
         self.spin_dy = QSpinBox()
         self.spin_dy.setRange(1, 5)
         self.spin_dy.setValue(2)
-        ctrl.addWidget(self.spin_dy)
-
-        ctrl.addWidget(QLabel("deg_x:"))
+        self.spin_dy.setToolTip("Degree of the smile along the slit (rows): 2 = the usual parabolic smile")
         self.spin_dx = QSpinBox()
         self.spin_dx.setRange(0, 3)
         self.spin_dx.setValue(1)
-        ctrl.addWidget(self.spin_dx)
-
-        ctrl.addWidget(QLabel("sat:"))
+        self.spin_dx.setToolTip("Degree of the smile's change across the spectrum (columns)")
         self.spin_sat = QSpinBox()
         self.spin_sat.setRange(0, 65535)
         self.spin_sat.setValue(0)
         self.spin_sat.setSpecialValueText("auto")
-        self.spin_sat.setToolTip(
-            "Sensor full-scale (e.g. 4095 for 12-bit). "
-            "auto = detect from image."
-        )
-        ctrl.addWidget(self.spin_sat)
-
-        self.chk_crop = QCheckBox("Crop invalid border (data discarded)")
+        self.spin_sat.setToolTip("Sensor full-scale (e.g. 4095 for 12-bit). auto = detect from image.")
+        self.chk_crop = QCheckBox("Crop invalid border")
+        self.chk_crop.setToolTip("Crop the border columns without a full source (their data are discarded)")
         self.chk_crop.setChecked(True)
-        ctrl.addWidget(self.chk_crop)
 
-        root.addLayout(ctrl)
-
-        quality_controls = QHBoxLayout()
+        # spectral quality
         self.btn_wavelength = QPushButton("Load wavelength calibration…")
         self.btn_wavelength.setToolTip("Override the wavelength profile stored for this camera setting")
         self.btn_wavelength.clicked.connect(self._on_load_wavelength)
-        quality_controls.addWidget(self.btn_wavelength)
         self.btn_quality = QPushButton("Analyze spectral quality")
+        self.btn_quality.setToolTip("Line positions, widths and the shift uncertainty per row against the "
+                                    "wavelength standards (fills the Spectral quality tab)")
         self.btn_quality.clicked.connect(self.run_quality_analysis)
         self.btn_quality.setEnabled(False)
-        quality_controls.addWidget(self.btn_quality)
         self.lbl_quality = QLabel("Wavelength calibration: loaded automatically for the frame's camera setting")
         self.lbl_quality.setWordWrap(True)          # long auto-load messages must not widen the window
         self.lbl_quality.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        quality_controls.addWidget(self.lbl_quality, stretch=1)
         self.quality_progress = QProgressBar()
         self.quality_progress.setRange(0, 100)
-        self.quality_progress.setFixedWidth(160)
         self.quality_progress.setVisible(False)
-        quality_controls.addWidget(self.quality_progress)
-        quality_controls.addWidget(self.btn_export_excel)   # second row: the first one is full
-        quality_controls.addWidget(self.btn_apply)
-        root.addLayout(quality_controls)
 
-        # -- tabbed plot area --
-        self.tabs = QTabWidget()
-        self._canvases: List[PlotCanvas] = []
+        # -- Smile page: workflow (left) | quality summary + plot tabs (right) --
+        self.smile_page = QWidget()
+        self.smile_page.setObjectName("smilePage")
+        self.smile_page.setStyleSheet(page_style(self))
+        page = QVBoxLayout(self.smile_page)
+        page.setContentsMargins(5, 5, 5, 5)
+        page.setSpacing(6)
+        split = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        lay = QVBoxLayout(left)
+        lay.setContentsMargins(1, 1, 5, 1)
+        lay.setSpacing(6)
+        lay.addWidget(title_bar("WORKFLOW"))
+        self.step_lamp = Step(1, "Lamp frame (fore-optics off)",
+                              "Image the calibration lamp through the spectrograph with the fore-optics removed, "
+                              "same bin / orientation as the scans; averaged grabs lower the noise")
+        self.step_lamp.add(self.btn_load, self.btn_grab, self.spin_grab_average)
+        self.step_fit = Step(2, "Fit settings",
+                             "Smile surface degrees and the sensor full scale; the defaults suit most spectrographs")
+        lbl_dy, lbl_dx, lbl_sat = QLabel("deg y"), QLabel("deg x"), QLabel("sat")
+        for lbl, spin in ((lbl_dy, self.spin_dy), (lbl_dx, self.spin_dx), (lbl_sat, self.spin_sat)):
+            lbl.setToolTip(spin.toolTip())
+        self.step_fit.add(lbl_dy, self.spin_dy, lbl_dx, self.spin_dx, lbl_sat, self.spin_sat)
+        self.step_fit.add_row(self.chk_crop)
+        self.step_analyze = Step(3, "Analyze", "Detect the lamp lines, trace them along the slit and fit the smile")
+        self.step_analyze.add(self.btn_analyze)
+        self.step_quality = Step(4, "Spectral quality (optional)",
+                                 "Checks the corrected lines against the wavelength standards of this setting")
+        self.step_quality.add(self.btn_wavelength, self.btn_quality)
+        self.step_quality.add_row(self.lbl_quality)
+        self.step_quality.add_row(self.quality_progress)
+        self.step_apply = Step(5, "Apply", "Store the smile model for this camera setting (or save it to a file)")
+        self.step_apply.add(self.btn_apply, self.btn_save_cal)
+        self.step_apply.add_row(self.btn_load_cal, self.btn_export_excel)
+        self.step_apply.add_row(self.btn_save, self.btn_export_png)
+        for step in (self.step_lamp, self.step_fit, self.step_analyze, self.step_quality, self.step_apply):
+            step.finish()
+            lay.addWidget(step)
+        self.btn_smile_report = QToolButton()
+        self.btn_smile_report.setText("Technical report ▾")
+        self.btn_smile_report.setCheckable(True)
+        self.btn_smile_report.setChecked(True)
+        self.btn_smile_report.setToolTip("Fit summary of the smile model")
+        lay.addWidget(self.btn_smile_report)
+        self.smile_report = QTextEdit()
+        self.smile_report.setReadOnly(True)
+        self.smile_report.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.smile_report.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 8.5pt;")
+        self.smile_report.setMinimumHeight(140)
+        lay.addWidget(self.smile_report, stretch=4)
+        lay.addStretch(1)
+        self.btn_smile_report.toggled.connect(self._toggle_smile_report)
+        split.addWidget(left)
+
+        right = QWidget()
+        rlay = QVBoxLayout(right)
+        rlay.setContentsMargins(3, 0, 0, 0)
+        rlay.setSpacing(6)
+        rlay.addWidget(title_bar("CALIBRATION QUALITY SUMMARY"))
+        metrics = QHBoxLayout()
+        metrics.setSpacing(5)
+        for attr, title, stretch in (("metric_lines", "Lamp lines used", 1), ("metric_rms", "Straightness RMS", 2),
+                                     ("metric_cv", "Cross-validated RMS", 1), ("metric_smile", "Max smile", 1),
+                                     ("metric_border", "Border cropped", 1), ("metric_status", "Quality status", 2)):
+            frame, value = self._metric_card(title)
+            setattr(self, attr, value)
+            metrics.addWidget(frame, stretch)
+        rlay.addLayout(metrics)
+
+        # plot tabs: the 8 canvases keep their indices (quality code, exports, tests)
         tab_names = [
             "Before / after",
             "Line traces",
@@ -453,6 +508,7 @@ class SmileCorrectionWidget(QWidget):
             "Uncertainty",
             "Cross-correlation",
         ]
+        self._plot_names = tab_names
         self._plot_export_names = [
             "Smile_Before_After.png",
             "Smile_Traces.png",
@@ -463,26 +519,56 @@ class SmileCorrectionWidget(QWidget):
             "Smile_Uncertainty.png",
             "Smile_Cross_Correlation.png",
         ]
-        for index, name in enumerate(tab_names):
-            page = QWidget(self.tabs)
-            page_layout = QVBoxLayout(page)
-            page_layout.setContentsMargins(2, 2, 2, 2)
-            export_row = QHBoxLayout()
-            export_row.addStretch()
-            button = QPushButton("Export PNG")
-            button.setToolTip(
-                "Export this plot as a presentation-quality PNG (300 dpi)."
-            )
-            button.clicked.connect(
-                lambda _checked=False, i=index: self._on_export_plot(i)
-            )
-            export_row.addWidget(button)
-            page_layout.addLayout(export_row)
+        self._canvases: List[PlotCanvas] = [None] * len(tab_names)
+        self._tab_pages = [None] * len(tab_names)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
 
-            canvas = PlotCanvas(page)
-            self._canvases.append(canvas)
-            page_layout.addWidget(canvas, stretch=1)
-            self.tabs.addTab(page, name)
+        def panel(index, minimum):
+            return self._make_plot_panel(index, tab_names[index], minimum=minimum)
+
+        correction = QWidget()
+        clay = QHBoxLayout(correction)
+        clay.setContentsMargins(4, 4, 4, 4)
+        csplit = QSplitter(Qt.Horizontal)
+        csplit.addWidget(panel(0, 400))
+        csplit.addWidget(self._scroll_panels(panel(1, 320), panel(2, 300)))
+        csplit.setStretchFactor(0, 3)
+        csplit.setStretchFactor(1, 2)
+        csplit.setSizes([600, 400])
+        clay.addWidget(csplit)
+        self.tabs.addTab(correction, "1  Correction")
+
+        shift = QWidget()
+        slay = QVBoxLayout(shift)
+        slay.setContentsMargins(4, 4, 4, 4)
+        slay.addWidget(panel(3, 400))
+        self.tabs.addTab(shift, "2  Shift map")
+
+        quality = QWidget()
+        qlay = QVBoxLayout(quality)
+        qlay.setContentsMargins(4, 4, 4, 4)
+        qsplit = QSplitter(Qt.Vertical)
+        for i0 in (4, 6):
+            row = QSplitter(Qt.Horizontal)
+            row.addWidget(panel(i0, 240))
+            row.addWidget(panel(i0 + 1, 240))
+            qsplit.addWidget(row)
+        qlay.addWidget(qsplit)
+        self.tabs.addTab(quality, "3  Spectral quality")
+        self._group_pages = (correction, shift, quality)
+        self.tabs.setTabEnabled(TAB_SHIFT, False)
+        self.tabs.setTabEnabled(TAB_QUALITY, False)
+        rlay.addWidget(self.tabs, stretch=1)
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([360, 1140])
+        page.addWidget(split, stretch=1)
+        self.lbl_ready = QLabel()
+        self.lbl_ready.setWordWrap(True)
+        page.addWidget(self.lbl_ready)
 
         (
             self.canvas_img,
@@ -490,7 +576,6 @@ class SmileCorrectionWidget(QWidget):
             self.canvas_resid,
             self.canvas_surf,
         ) = self._canvases[:4]
-        # Outer level: the 8 smile tabs stay one QTabWidget (indices used by tests / quality code).
         from .keystone_view import KeystonePage
 
         self.keystone_page = KeystonePage(self, setting_for_file=self._setting_for_shape)
@@ -500,8 +585,17 @@ class SmileCorrectionWidget(QWidget):
         self.keystone_page.applyKeystoneRequested.connect(self.apply_keystone)
         self.keystone_page.saveKeystoneRequested.connect(self._on_save_keystone_matrix)
         self.keystone_page.statusChanged.connect(self._set_status)
+        # the frames-per-grab setting is shared: the Keystone page shows its own copy, kept in step
+        self.spin_grab_average_keystone = QSpinBox()
+        self.spin_grab_average_keystone.setRange(1, 256)
+        self.spin_grab_average_keystone.setPrefix("Avg ×")
+        self.spin_grab_average_keystone.setToolTip(self.spin_grab_average.toolTip())
+        self.spin_grab_average_keystone.valueChanged.connect(self.spin_grab_average.setValue)
+        self.spin_grab_average.valueChanged.connect(self.spin_grab_average_keystone.setValue)
+        actions = self.keystone_page.step_target.actions
+        actions.insertWidget(actions.indexOf(self.keystone_page.btn_grab_target) + 1, self.spin_grab_average_keystone)
         self.outer_tabs = QTabWidget()
-        self.outer_tabs.addTab(self.tabs, "Smile")
+        self.outer_tabs.addTab(self.smile_page, "Smile")
         self.outer_tabs.addTab(self.keystone_page, "Keystone")
         from .result_view import ResultView
         self.result_page = ResultView(self._session_model, self,
@@ -510,6 +604,9 @@ class SmileCorrectionWidget(QWidget):
         self.outer_tabs.addTab(self.result_page, "Result")
         self.outer_tabs.currentChanged.connect(self._on_outer_tab)
         root.addWidget(self.outer_tabs, stretch=1)
+        self._smile_failure = ""
+        self._placeholder_plots((0,), "Load or grab a calibration-lamp frame (fore-optics removed)")
+        self._placeholder_plots((1, 2, 3), "Analyze smile to see this plot")
         self._clear_quality_plots()
 
         self.lbl_setting = QLabel("Camera setting: —")
@@ -522,6 +619,204 @@ class SmileCorrectionWidget(QWidget):
         self.lbl_status.setFrameStyle(QFrame.StyledPanel | QFrame.Sunken)
         self.lbl_status.setMinimumHeight(24)
         root.addWidget(self.lbl_status)
+        for w in (self.spin_dy, self.spin_dx, self.spin_sat):
+            w.valueChanged.connect(lambda _v: self._refresh_smile_page())
+        self.chk_crop.toggled.connect(lambda _on: self._refresh_smile_page())
+        self._refresh_smile_page()
+
+    def _toggle_smile_report(self, on: bool) -> None:
+        self.smile_report.setVisible(on)
+        self.btn_smile_report.setText("Technical report ▾" if on else "Technical report ▸")
+
+    def _refresh_smile_page(self) -> None:
+        """Workflow steps, quality summary, analysis tabs and banner of the Smile page (read-only view)."""
+        if not hasattr(self, "lbl_ready"):
+            return
+        from .ui_parts import BAD, BUSY, GOOD, OPTIONAL, TODO, WARN
+        import html as _html
+        c = lambda key: _theme_colors(self)[key]
+        muted = lambda s: f"<span style='color:{c('muted')}'>{s}</span>"
+        r = self._result
+        # 1 lamp frame
+        if self._frame is None:
+            self.step_lamp.set_state(TODO, "None yet.")
+        else:
+            h, w = self._frame.shape[:2]
+            src = _html.escape(self._lamp_source or "array")
+            dark = self._lamp_dark is False
+            self.step_lamp.set_state(WARN if dark else GOOD,
+                                     f"<b>{w}x{h}</b><br>{muted(src)}"
+                                     + (f"<br><span style='color:{c('warn')}'>No dark subtracted (hover for "
+                                        "details)</span>" if dark else ""),
+                                     tip=("No dark subtracted: the host's dark correction was off or had no dark "
+                                          "for this bin. Load a dark in the main window and grab again.") if dark else "")
+        # 2 fit settings
+        sat = self.spin_sat.value()
+        self.step_fit.set_state(OPTIONAL, f"deg y {self.spin_dy.value()} &middot; deg x {self.spin_dx.value()} "
+                                          f"&middot; full scale {sat or 'auto'} &middot; crop "
+                                          f"{'on' if self.chk_crop.isChecked() else 'off'}")
+        # 3 analyze
+        review = self._review
+        if self._worker is not None:
+            self.step_analyze.set_state(BUSY, "Re-tracing the loaded model..." if review else "Running...")
+        elif review is not None and r is not None:
+            n_used, n_all = len(r.used_lines), len(r.all_lines)
+            state = GOOD if r.rms_after <= SMILE_RMS_WARN_PX and n_used >= 3 else WARN
+            self.step_analyze.set_state(state, f"Loaded model <b>{_html.escape(review['name'])}</b>: {n_used}/{n_all} "
+                                               f"lines, RMS {r.rms_before:.3f} &rarr; <b>{r.rms_after:.3f} px</b>")
+        elif review is not None:
+            self.step_analyze.set_state(WARN, f"Loaded model <b>{_html.escape(review['name'])}</b>: stored numbers "
+                                              "only (no lamp frame to re-trace)")
+        elif r is not None:
+            n_used, n_all = len(r.used_lines), len(r.all_lines)
+            state = GOOD if r.rms_after <= SMILE_RMS_WARN_PX and n_used >= 3 else WARN
+            self.step_analyze.set_state(state, f"Done: {n_used}/{n_all} lines, RMS "
+                                               f"{r.rms_before:.3f} &rarr; <b>{r.rms_after:.3f} px</b>")
+        elif self._smile_failure:
+            self.step_analyze.set_state(BAD, _html.escape("Failed: " + self._smile_failure))
+        elif self._frame is not None:
+            self.step_analyze.set_state(TODO, "Ready")
+        else:
+            self.step_analyze.set_state(TODO, "After the lamp frame.")
+        # 4 spectral quality
+        if self._quality_worker is not None:
+            self.step_quality.set_state(BUSY, "Running...")
+        elif self._quality_report is not None:
+            self.step_quality.set_state(GOOD, "Done (Spectral quality tab)")
+        elif self._wavelength_config is None:
+            self.step_quality.set_state(OPTIONAL, "Needs a wavelength calibration")
+        else:
+            self.step_quality.set_state(OPTIONAL if r is None else TODO, "Ready" if r is not None else "After Analyze.")
+        # 5 apply
+        applied = getattr(self, "_applied_text", "")
+        if applied:
+            self.step_apply.set_state(GOOD, _html.escape(applied))
+        elif r is None and self._corrector is None:
+            self.step_apply.set_state(TODO, "After Analyze (or load a model).")
+        elif self.btn_apply.isEnabled():
+            where = f" for bin {self._setting.camera_bin}" if self._setting is not None else ""
+            self.step_apply.set_state(TODO, f"Ready{where}",
+                                      tip="Stores the model for this camera setting; the previous file is kept "
+                                          "in history/.")
+        else:
+            self.step_apply.set_state(WARN if r is not None else TODO,
+                                      "Apply needs a frame from the connected camera; Save model works anyway"
+                                      if r is not None else "Model loaded: Save / Export available")
+        # quality summary
+        for lab in (self.metric_lines, self.metric_rms, self.metric_cv, self.metric_smile, self.metric_border,
+                    self.metric_status):
+            self._paint_metric(lab, "text")
+        tabs_on = r is not None
+        shift_on = tabs_on or (review is not None and self._worker is None)   # a stored model's shift map
+        self.tabs.setTabEnabled(TAB_SHIFT, shift_on)
+        self.tabs.setTabEnabled(TAB_QUALITY, tabs_on)
+        if self.tabs.currentIndex() == TAB_QUALITY and not tabs_on or \
+                self.tabs.currentIndex() == TAB_SHIFT and not shift_on:
+            self.tabs.setCurrentIndex(TAB_CORRECTION)
+        if r is None and review is not None and self._worker is None:
+            cal = review["cal"]
+            self.metric_lines.setText(f"{cal.n_lines_used} / {cal.n_lines_total}")
+            self.metric_rms.setText(f"{cal.rms_before:.3f} → {cal.rms_after:.3f} px")
+            self.metric_cv.setText(f"{cal.cv_rms:.3f} px" if np.isfinite(cal.cv_rms) else "n/a")
+            self.metric_smile.setText(f"{self._max_shift_px(cal.surface(), cal.image_shape):.2f} px")
+            self.metric_border.setText(f"L {cal.margin[0]} · R {cal.margin[1]} px")
+            self.metric_status.setText("Stored (as saved)")
+            why = review.get("lamp_error")
+            self.smile_report.setPlainText(
+                f"Loaded model: {review['path']}\n\n" + cal.summary()
+                + ("\n\nIts lamp frame could not be re-traced: " + why if why else
+                   "\n\nSaved without its lamp frame: the numbers above are those stored in the file; Before / "
+                   "after, Line traces and Residual need the lamp frame (models saved by newer builds carry it)."))
+            self.lbl_ready.setText(f"STORED MODEL  ·  {review['name']} ({cal.created[:16].replace('T', ' ')}): "
+                                   "stored numbers and shift map only")
+            self._paint_banner(WARN)
+            return
+        if r is None:
+            for lab in (self.metric_lines, self.metric_rms, self.metric_cv, self.metric_smile, self.metric_border):
+                lab.setText("—")
+            self.metric_status.setText("Before analysis")
+            self.smile_report.setPlainText(
+                self._corrector.summary() if self._corrector is not None else
+                "Smile: with the fore-optics removed, grab or load a calibration-lamp frame (emission lines across "
+                "the spectrum). Analyze traces every line along the slit and fits the smile surface; Apply stores "
+                "the model for this camera setting.")
+            self.lbl_ready.setText("LAMP FRAME  ·  Load or grab a calibration-lamp frame, then Analyze smile"
+                                   if self._frame is None else "READY  ·  Analyze smile")
+            self._paint_banner("info")
+            return
+        n_used, n_all = len(r.used_lines), len(r.all_lines)
+        self.metric_lines.setText(f"{n_used} / {n_all}")
+        self._paint_metric(self.metric_lines, "good" if n_used >= 3 and n_used >= 0.6 * n_all else "warn")
+        self.metric_rms.setText(f"{r.rms_before:.3f} → {r.rms_after:.3f} px")
+        rms_state = ("good" if r.rms_after <= SMILE_RMS_WARN_PX else
+                     "warn" if r.rms_after <= 2 * SMILE_RMS_WARN_PX else "bad")
+        self._paint_metric(self.metric_rms, rms_state)
+        cv = r.cv_rms
+        self.metric_cv.setText(f"{cv:.3f} px" if np.isfinite(cv) else "n/a")
+        self.metric_smile.setText(f"{self._max_smile_px(r):.2f} px")
+        self.metric_border.setText(f"L {r.margin[0]} · R {r.margin[1]} px")
+        notes = []
+        if n_used < 0.6 * n_all:
+            notes.append(f"only {n_used} of {n_all} lamp lines used")
+        if np.isfinite(cv) and cv > 2 * max(r.rms_after, 1e-9) and cv > SMILE_RMS_WARN_PX:
+            notes.append(f"cross-validated RMS {cv:.3f} px well above the fit: the surface may be over-fitted "
+                         "(lower deg y / deg x)")
+        if self._lamp_dark is False:
+            notes.append("no dark subtracted from the lamp frame")
+        if rms_state != "good":
+            status, state = "Review QC", ("bad" if rms_state == "bad" else WARN)
+            first = f"straightness RMS {r.rms_after:.3f} px above {SMILE_RMS_WARN_PX:.2f} px after correction"
+            notes.insert(0, first)
+        elif notes:
+            status, state = f"{len(notes)} warning" + ("s" if len(notes) > 1 else ""), WARN
+        else:
+            status, state = "PASS", GOOD
+        self.metric_status.setText(status)
+        self._paint_metric(self.metric_status, {GOOD: "good", WARN: "warn"}.get(state, "bad"))
+        if review is not None:
+            cal = review["cal"]
+            when = cal.created[:16].replace("T", " ")
+            if state == GOOD:
+                self.lbl_ready.setText(f"STORED MODEL  ·  {review['name']} ({when}) on its own lamp frame: PASS")
+            else:
+                self.lbl_ready.setText(f"STORED MODEL  ·  {review['name']} ({when}): " + notes[0]
+                                       + (f"  (+{len(notes) - 1} more)" if len(notes) > 1 else ""))
+        elif state == GOOD:
+            self.lbl_ready.setText("ANALYSIS COMPLETE  ·  Review the plots, then Apply (or Save model)")
+        else:
+            self.lbl_ready.setText("REVIEW REQUIRED  ·  " + notes[0][0].upper() + notes[0][1:]
+                                   + (f"  (+{len(notes) - 1} more)" if len(notes) > 1 else ""))
+        self._paint_banner(state if state in (GOOD, WARN) else BAD)
+        if review is not None:
+            cal = review["cal"]
+            same = review.get("identical")
+            self.smile_report.setPlainText(
+                f"Loaded model: {review['path']}\n\n" + cal.summary()
+                + "\n\nShown: the stored smile re-traced on the lamp frame stored in the file. "
+                + ("A re-fit gives the same smile (identical within 0.001 px)." if same else
+                   "The stored smile differs from a re-fit with this build; the plots show the stored smile "
+                   "(Residual = measured shift minus the stored surface; CV RMS as stored).")
+                + ("\n\nNotes:\n- " + "\n- ".join(notes) if notes else ""))
+            return
+        self.smile_report.setPlainText((self._corrector.summary() if self._corrector is not None else "")
+                                       + ("\n\nNotes:\n- " + "\n- ".join(notes) if notes else ""))
+
+    @staticmethod
+    def _max_smile_px(r) -> float:
+        """Largest |smile shift| (px) of the fitted surface over the frame (sampled every 8 px)."""
+        return SmileCorrectionWidget._max_shift_px(r.surface, r.frame_orig.shape[:2])
+
+    @staticmethod
+    def _max_shift_px(surface, shape) -> float:
+        """Largest |shift| (px) of *surface* over a frame of *shape* (sampled every 8 px)."""
+        h, w = (int(v) for v in shape[:2])
+        ys = np.arange(0, h, 8, dtype=float)
+        xs = np.arange(0, w, 8, dtype=float)
+        try:
+            Y, X = np.meshgrid(ys, xs, indexing="ij")
+            return float(np.max(np.abs(surface(Y, X))))
+        except Exception:  # noqa: BLE001
+            return float("nan")
 
     # -----------------------------------------------------------------
     #  Public API
@@ -631,6 +926,7 @@ class SmileCorrectionWidget(QWidget):
             what = "Smile + keystone" if self._has_keystone() else "to camera"
             self.btn_apply.setText(f"📌 Apply {what} (bin {self._setting.camera_bin})")
         self._update_keystone_actions()
+        self._refresh_smile_page()
 
     def _update_keystone_actions(self) -> None:
         """Apply / Save Matrix on the Keystone page follow its result.
@@ -689,7 +985,8 @@ class SmileCorrectionWidget(QWidget):
                 return None
         what = "Smile + keystone" if keystone else "Smile"
         path = self._store_model(self._setting, what, self._corrector, self._result)
-        if path is not None and keystone and self._corrector.keystone is self.keystone_page.result:
+        if (path is not None and keystone and self._corrector.keystone is not None
+                and self._corrector.keystone is self.keystone_page.result):
             self.keystone_page.mark_applied(path)
         return path
 
@@ -703,7 +1000,11 @@ class SmileCorrectionWidget(QWidget):
             corrector, label = page.result_corrector, "Keystone fitted onto the stored smile (this session)"
         elif self._corrector is not None:
             corrector = self._corrector
-            label = "This session: smile + keystone" if corrector.has_keystone else "This session: smile only"
+            src = getattr(corrector, "_source_path", None) if corrector.analysis is None else None
+            if src:
+                label = "Loaded model " + os.path.basename(str(src))
+            else:
+                label = "This session: smile + keystone" if corrector.has_keystone else "This session: smile only"
         elif page.stored_ok:
             corrector = page.stored["corrector"]
             label = "Stored model " + os.path.basename(str(page.stored.get("path", "")))
@@ -820,6 +1121,7 @@ class SmileCorrectionWidget(QWidget):
             return None
         logger.info("%s model stored for %s: %s%s", what, setting.label(), path,
                     f" (previous kept as {backup})" if backup else "")
+        self._applied_text = f"Applied: {os.path.basename(str(path))}"
         self._set_status(f"{what} model stored for {setting.label()}: {path}"
                          + (f" (previous → history/{backup.name})" if backup else ""))
         if self._setting is not None:                   # the Smile tab's lamp frame (none in a stored-smile apply)
@@ -954,7 +1256,10 @@ class SmileCorrectionWidget(QWidget):
         """
         self._frame_gen += 1                 # a running analysis of the old frame is discarded
         self._lamp_source, self._lamp_dark = "array", None   # callers that know better set them after
+        self._review = None
         self._result = None
+        self._smile_failure = ""
+        self._applied_text = ""
         self._corrector = None
         self._quality_report = None
         self.btn_quality.setEnabled(False)
@@ -978,6 +1283,7 @@ class SmileCorrectionWidget(QWidget):
             self._frame is not None and self._worker is None
         )
         self._show_preview(self._frame)
+        self._placeholder_plots((1, 2, 3), "Analyze smile to see this plot")
         self.keystone_page.set_context(
             None, None if self._frame is None else self._frame.shape, self._setting,
             reason="New lamp frame: the previous keystone was dropped. Analyze the smile, then Analyze Keystone.")
@@ -1097,6 +1403,7 @@ class SmileCorrectionWidget(QWidget):
         worker.finished.connect(self._on_quality_finished)
         self._quality_worker = worker
         worker.start()
+        self._refresh_smile_page()
 
     def _on_load_wavelength(self):
         """Ask for a wavelength JSON and load it; errors are shown in the quality label."""
@@ -1126,6 +1433,17 @@ class SmileCorrectionWidget(QWidget):
         self._quality_worker = None
         self.btn_wavelength.setEnabled(True)
         self.btn_quality.setEnabled(self._result is not None and self._wavelength_config is not None)
+        self._refresh_smile_page()
+
+    def _placeholder_plots(self, indices, text: str) -> None:
+        """Centered hint on empty plots (what to do to fill them)."""
+        for i in indices:
+            canvas = self._canvases[i]
+            canvas.clear()
+            ax = canvas.fig.add_subplot(111)
+            ax.text(.5, .5, text, ha="center", va="center", transform=ax.transAxes, color="#7b8a97")
+            ax.set_axis_off()
+            canvas.refresh()
 
     def _clear_quality_plots(self):
         """Replace the quality tabs with the "load wavelength calibration" placeholder."""
@@ -1192,8 +1510,8 @@ class SmileCorrectionWidget(QWidget):
             f"In-sample RMSE {stats['rmse']:.3f} nm; "
             f"{stats['count']} paired fits; blends omitted; row step 8"
         )
-        self.outer_tabs.setCurrentWidget(self.tabs)
-        self.tabs.setCurrentIndex(4)
+        self.outer_tabs.setCurrentWidget(self.smile_page)
+        self.tabs.setCurrentIndex(TAB_QUALITY)
 
     @staticmethod
     def _draw_quality_lines(ax, report, key):
@@ -1292,6 +1610,7 @@ class SmileCorrectionWidget(QWidget):
         """Update the status label and emit ``statusChanged``."""
         self.lbl_status.setText(msg)
         self.statusChanged.emit(msg)
+        self._refresh_smile_page()
 
     def _show_preview(self, frame: Optional[np.ndarray]) -> None:
         """Draw the initial preview in the image tab."""
@@ -1346,9 +1665,11 @@ class SmileCorrectionWidget(QWidget):
             self._worker.wait()
         self._worker = None
         self.btn_analyze.setEnabled(self._frame is not None)
+        self._refresh_smile_page()
 
     def _on_analysis_failed(self, msg: str) -> None:
         """Handle analysis failure (safe: queued to main thread)."""
+        self._smile_failure = msg
         self._set_status(f"Error: {msg}")
 
     def _on_analysis_done(self, r: SmileAnalysis) -> None:
@@ -1358,6 +1679,9 @@ class SmileCorrectionWidget(QWidget):
                              "Press Analyze for the new frame.")
             return
         self._result = r
+        self._smile_failure = ""
+        self._applied_text = ""
+        self._review = None
 
         # Reuse the completed analysis through the corrector's public factory.
         self._corrector = SmileCorrector.from_analysis(r)
@@ -1630,26 +1954,111 @@ class SmileCorrectionWidget(QWidget):
         self.load_calibration_file(path)
 
     def load_calibration_file(self, path: str) -> bool:
-        """Load a saved model (smile, or smile + keystone) for *Apply* / *Save*; the Keystone tab
-        shows its stored keystone report.
+        """Load a saved model (smile, or smile + keystone) and show its result, as after *Analyze*.
+
+        A model saved with its lamp frame: the lamp frame becomes the current frame and the stored
+        smile is re-traced on it in the background (no re-fit, see :func:`review_analysis`), so the
+        plots, quality summary and report show the stored model. A model saved without its lamp
+        frame shows its stored numbers and shift map. *Apply* / *Save model* write the loaded model
+        (with its keystone); the Keystone tab shows the stored keystone report.
 
         Returns:
             ``False`` when the file could not be loaded (reason in the status bar).
         """
+        if self._worker is not None:
+            self._set_status("Wait for the running smile analysis to finish, then load the model")
+            return False
         try:
-            self._calibration = load_calibration(path)
-            self._corrector = SmileCorrector.load(path)
-            self._set_status(
-                self._calibration.summary().replace("\n", " | ")
-            )
+            cal = load_calibration(path)
+            corrector = SmileCorrector.load(path)
+            frames, info, recorded = load_frames(path)
         except Exception as exc:
             self._set_status(f"Load failed: {exc}")
             return False
-        cal = self._calibration
+        name = os.path.basename(path)
+        lamp = frames.get("lamp")
+        if lamp is not None and tuple(lamp.shape) == tuple(cal.image_shape):
+            from .keystone_view import model_setting
+            current = self._camera_setting()
+            self.set_frame(lamp, setting=model_setting(
+                recorded, lamp.shape, (lambda shape: current.with_frame(shape)) if current else None))
+            lamp_info = info.get("lamp") or {}
+            self._lamp_source = f"{lamp_info.get('source') or 'lamp'} [from {name}]"
+            self._lamp_dark = lamp_info.get("dark_applied")
+        else:
+            lamp = None
+            self.set_frame(None)            # the page shows the loaded model only, not an older lamp frame
+        self._calibration = cal
+        self._corrector = corrector
+        self._review = {"path": str(path), "name": name, "cal": cal, "identical": None, "lamp": lamp is not None}
+        for spin, value in ((self.spin_dy, cal.deg_y), (self.spin_dx, cal.deg_x)):
+            spin.blockSignals(True)
+            spin.setValue(int(value))
+            spin.blockSignals(False)
+        self.btn_save_cal.setEnabled(True)
         self.keystone_page.show_stored(cal.keystone if cal.has_keystone else None,
-                                       cal.map_y if cal.has_keystone else None, os.path.basename(path))
+                                       cal.map_y if cal.has_keystone else None, name)
         self._update_apply_state()
+        if lamp is None:
+            self._plot_stored_surface(cal)
+            self._placeholder_plots((0, 1, 2), f"{name} was saved without its lamp frame: only the stored numbers "
+                                               "and the shift map can be shown")
+            self._set_status(f"Loaded {name}, saved without its lamp frame: stored numbers and shift map only")
+            return True
+        self._start_review(lamp, cal)
         return True
+
+    def _start_review(self, frame: np.ndarray, cal: SmileCalibration) -> None:
+        """Re-trace the loaded model's smile on its lamp frame in the background (:func:`review_analysis`)."""
+        kwargs = dict(surface=cal.surface(), interp=cal.interp, y_ref=cal.y_ref,
+                      sat_level=(self.spin_sat.value() or None), cv_rms=cal.cv_rms)
+        self._set_status(f"Loading the result of {self._review['name']}: re-tracing its lamp frame ...")
+        self.btn_analyze.setEnabled(False)
+        self._analyze_gen = self._frame_gen
+        worker = _AnalyzeWorker(np.asarray(frame, dtype=np.float32).copy(), kwargs, fn=review_analysis)
+        worker.done.connect(self._on_review_done)
+        worker.failed.connect(self._on_review_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
+        self._refresh_smile_page()
+
+    def _on_review_done(self, payload) -> None:
+        """The loaded model's result is ready: show it like a finished analysis (the corrector stays the loaded one)."""
+        r, identical = payload
+        review = self._review
+        if review is None or self._analyze_gen != self._frame_gen:
+            return                                      # another frame / analysis replaced the loaded model
+        review["identical"] = bool(identical)
+        self._result = r
+        self._smile_failure = ""
+        self._applied_text = ""
+        for button in (self.btn_save, self.btn_save_cal, self.btn_export_excel):
+            button.setEnabled(True)
+        self._update_all_plots(r)
+        self._quality_report = None
+        self._quality_uncertainty = None
+        self._clear_quality_plots()
+        self.btn_quality.setEnabled(self._wavelength_config is not None and self._quality_worker is None)
+        cal = review["cal"]
+        self.keystone_page.set_context(r, r.frame_orig.shape, self._setting)
+        self.keystone_page.show_stored(cal.keystone if cal.has_keystone else None,
+                                       cal.map_y if cal.has_keystone else None, review["name"])
+        self._update_apply_state()
+        self._set_status(
+            f"Stored model {review['name']}: lines {len(r.used_lines)}/{len(r.all_lines)}  |  "
+            f"RMS {r.rms_before:.3f}->{r.rms_after:.3f} px (stored {cal.rms_before:.3f}->{cal.rms_after:.3f})  |  "
+            + ("re-fit identical to the stored smile" if identical else "stored smile shown (differs from a re-fit)"))
+        self.analysisComplete.emit(r)
+
+    def _on_review_failed(self, msg: str) -> None:
+        """The stored lamp frame could not be re-traced: show the stored numbers and shift map only."""
+        review = self._review
+        if review is None:
+            return
+        review["lamp_error"] = msg
+        self._plot_stored_surface(review["cal"])
+        self._set_status(f"Loaded {review['name']}, but its lamp frame could not be re-traced: {msg}")
 
     # -----------------------------------------------------------------
     #  Plotting
@@ -1799,14 +2208,24 @@ class SmileCorrectionWidget(QWidget):
 
     def _plot_surface(self, r: SmileAnalysis) -> None:
         """Render the Shift Map tab (2-D displacement surface)."""
+        self._draw_surface(r.surface, r.frame_orig.shape, r.meas_x, r.meas_y)
+
+    def _plot_stored_surface(self, cal: SmileCalibration) -> None:
+        """Shift Map tab of a loaded model without a usable lamp frame (stored surface, no measurements)."""
+        self.tabs.setTabEnabled(TAB_SHIFT, True)
+        self._draw_surface(cal.surface(), tuple(int(v) for v in cal.image_shape), None, None,
+                           note="stored model, no lamp measurements")
+
+    def _draw_surface(self, surface, shape, meas_x=None, meas_y=None, note: str = "clamped outside line range") -> None:
+        """Integer-shift map of *surface* over a frame of *shape*, with the measured points when given."""
         self.canvas_surf.clear()
         ax = self.canvas_surf.fig.add_subplot(111)
 
-        n_rows, n_cols = r.frame_orig.shape
+        n_rows, n_cols = shape
         yy = np.linspace(0, n_rows - 1, 100)
         xx = np.linspace(0, n_cols - 1, 100)
         XX, YY = np.meshgrid(xx, yy)
-        shift_px = np.rint(r.surface(YY, XX)).astype(np.int32)
+        shift_px = np.rint(surface(YY, XX)).astype(np.int32)
         levels = np.arange(
             int(shift_px.min()), int(shift_px.max()) + 1, dtype=np.int32
         )
@@ -1831,13 +2250,14 @@ class SmileCorrectionWidget(QWidget):
             im, ax=ax, ticks=levels, label="Shift (px) — integer"
         )
 
-        ax.scatter(r.meas_x, r.meas_y, s=0.3, c="black", alpha=0.15)
+        if meas_x is not None and meas_y is not None:
+            ax.scatter(meas_x, meas_y, s=0.3, c="black", alpha=0.15)
         ax.set_xlabel("Column (spectral)")
         ax.set_ylabel("Row (spatial)")
         ax.set_title(
             f"Smile Shift Surface  "
-            f"[deg_y={r.surface.deg_y}, deg_x={r.surface.deg_x}]  "
-            f"(clamped outside line range)",
+            f"[deg_y={surface.deg_y}, deg_x={surface.deg_x}]  "
+            f"({note})",
             fontsize=10,
         )
         self.canvas_surf.refresh()

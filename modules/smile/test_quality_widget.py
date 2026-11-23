@@ -13,8 +13,8 @@ from smile.analysis import analyze_smile
 def test_quality_tabs_placeholders_and_calibration(qtbot, tmp_path):
     widget = SmileCorrectionWidget()
     qtbot.addWidget(widget)
-    assert widget.tabs.count() == 8
-    assert widget.tabs.tabText(4) == 'Wavelength'
+    assert widget.tabs.count() == 3                      # Correction / Shift map / Spectral quality
+    assert widget.tabs.tabText(2) == '3  Spectral quality'
     assert not widget.btn_quality.isEnabled()
     config = tmp_path/'wave.json'
     config.write_text(json.dumps(dict(m_nm_per_px=.5, c_nm=500,
@@ -41,7 +41,7 @@ def test_quality_worker_plots_and_export(qtbot, synthetic_frame, tmp_path):
     widget.run_quality_analysis()
     qtbot.waitUntil(lambda: widget._quality_worker is None, timeout=60000)
     assert widget.get_quality_report() is not None, widget.lbl_quality.text()
-    assert widget.tabs.currentIndex() == 4
+    assert widget.tabs.currentIndex() == 2               # the Spectral quality tab is shown
     assert len(widget._canvases[5].fig.axes) == 3
     for index in range(4,8):
         path = tmp_path/f'tab_{index}.png'

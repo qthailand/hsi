@@ -88,6 +88,22 @@ def _init_pyqtgraph_theme():
         background=PLOT_BACKGROUND,
         foreground=PLOT_FOREGROUND,
     )
+    _disable_auto_si_prefix()
+
+
+def _disable_auto_si_prefix():
+    """Every pyqtgraph axis shows its values as they are: no SI rescaling of the ticks with an
+    ``(x0.001)`` / ``(x1e+03)`` note on the label (hard to read). Idempotent."""
+    if getattr(pg.AxisItem, "_hsi_no_si_prefix", False):
+        return
+    original_init = pg.AxisItem.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.enableAutoSIPrefix(False)
+
+    pg.AxisItem.__init__ = __init__
+    pg.AxisItem._hsi_no_si_prefix = True
 
 
 def main():

@@ -77,7 +77,9 @@ class _FusionWorker(QThread):
     def run(self) -> None:
         """Fuse (worker thread)."""
         try:
-            self.done.emit((self._fusion, self._fusion.compose(*self._request, progress=self.progressed.emit)))
+            parts = self._fusion.compose(*self._request, progress=self.progressed.emit)
+            self._fusion.sharpness()                    # bars of the band slider (read once, cached)
+            self.done.emit((self._fusion, parts))
         except Exception as exc:  # noqa: BLE001 - reported in the window
             self.failed.emit(str(exc))
 
@@ -199,9 +201,24 @@ class KeystoneCheckWidget(QWidget):
         self.chk_edges.setChecked(True)
         self.chk_edges.setToolTip("Ticks at the edges found by Check (grey = thin, left out)")
         self.chk_edges.toggled.connect(self._redraw_overlays)
+        self.chk_norm = QCheckBox("profile 0-1")
+        self.chk_norm.setChecked(True)
+        self.chk_norm.setToolTip("Stretch the centre-band and sum profiles each to 0..1 over the visible rows,\n"
+                                 "so a brightness / spectral offset drops out and only edge position and\n"
+                                 "width are compared. Off: the band-level-normalised values.")
+        self.chk_norm.toggled.connect(self._redraw_overlays)
         self.progress_fusion = QProgressBar()
         self.progress_fusion.setMaximumWidth(140)
         self.progress_fusion.setVisible(False)
+        self.combo_bars = QComboBox()
+        self.combo_bars.addItems(["bars: edge sharpness", "bars: signal level"])
+        self.combo_bars.setToolTip("Edge sharpness: steepest edge along the slit above the noise, per unit of the\n"
+                                   "band's white level - low where the band is defocused or noisy (a summed\n"
+                                   "edge widens there from focus, not keystone). Signal level: 99th percentile.")
+        self.combo_bars.currentIndexChanged.connect(lambda _i: self._update_bars())
+        self.btn_sharpest = QPushButton("centre = sharpest")
+        self.btn_sharpest.setToolTip("Move the centre band to the band with the sharpest edges")
+        self.btn_sharpest.clicked.connect(self._centre_on_sharpest)
         self.lbl_left = QLabel("left: none")
         self.lbl_left.setStyleSheet(f"color: {_LEFT};")
         self.lbl_right = QLabel("right: none")
@@ -211,8 +228,11 @@ class KeystoneCheckWidget(QWidget):
         row1.addWidget(self.lbl_centre)
         row1.addWidget(self.lbl_right)
         row1.addStretch(1)
+        row1.addWidget(self.combo_bars)
+        row1.addWidget(self.btn_sharpest)
         row1.addWidget(self.combo_mode)
         row1.addWidget(self.chk_edges)
+        row1.addWidget(self.chk_norm)
         row1.addWidget(self.progress_fusion)
 
         hint = QLabel("Drag the ▲ left / ▲ right out of the centre band to sum more bands onto it (cumulative); "
@@ -274,6 +294,24 @@ class KeystoneCheckWidget(QWidget):
         self.band_slider.set_window(None if centre_nm is None else int(np.argmin(np.abs(self._wl - centre_nm))),
                                     left, right)
 
+    def _update_bars(self) -> None:
+        """Bars of the band slider: edge sharpness or signal level per band."""
+        if self._fusion is None or self._wl is None:
+            return
+        if self.combo_bars.currentIndex() == 0:
+            s = self._fusion.sharpness()
+            best = f", sharpest {self._wl[int(np.argmax(s))]:.0f} nm" if s.max() > 0 else ", no edge above noise"
+            self.band_slider.set_spectrum(s, "edge sharpness" + best)
+        else:
+            self.band_slider.set_spectrum(self._fusion.levels(), "signal level (99th pct)")
+
+    def _centre_on_sharpest(self) -> None:
+        if self._fusion is None:
+            return
+        s = self._fusion.sharpness()
+        if s.max() > 0:
+            self.band_slider.set_window(centre=int(np.argmax(s)))
+
     def _on_window_changed(self, c: int, nl: int, nr: int) -> None:
         if self._wl is None:
             return
@@ -325,9 +363,10 @@ class KeystoneCheckWidget(QWidget):
             return
         if (parts.centre_band, parts.n_left, parts.n_right) != self.band_slider.window():
             return       # stale: the sliders moved since; the timer / pending re-run brings the current one
-        if self._parts is None:
-            self.band_slider.set_spectrum(fusion.levels())     # levels were read on the worker
+        first = self._parts is None
         self._parts = parts
+        if first:
+            self._update_bars()                         # levels / sharpness were read on the worker
         mode = _MODES[self.combo_mode.currentIndex()][1]
         img = fusion_image(parts, mode)
         kind = mode
@@ -379,9 +418,15 @@ class KeystoneCheckWidget(QWidget):
         rows = np.arange(self._parts.centre.shape[0])
         y0, y1 = sorted(self.ax_img.get_ylim())
         vis = (rows >= y0) & (rows <= y1)
+        norm = self.chk_norm.isChecked()
         lo, hi = np.inf, -np.inf
         for key, colour, lw in (("fused", _FUSED, 1.6), ("centre", _TEXT, 1.0)):
             p = prof[key]
+            if norm and vis.any():
+                # each line stretched to 0..1 over the visible rows: a level / spectral offset between the
+                # centre band and the sum drops out, edge position and width are left to compare
+                pmin, pmax = float(p[vis].min()), float(p[vis].max())
+                p = (p - pmin) / (pmax - pmin) if pmax > pmin else p * 0.0
             # no autoscale: the y axis is shared with the image and must keep its zoom
             ax.plot(p, rows, color=colour, lw=lw, drawstyle="steps-mid", scalex=False, scaley=False)
             if vis.any():
@@ -389,7 +434,7 @@ class KeystoneCheckWidget(QWidget):
         if np.isfinite(lo) and hi > lo:
             pad = 0.05 * (hi - lo)
             ax.set_xlim(lo - pad, hi + pad)
-        ax.set_title("row profile: centre / sum", color=_TEXT, fontsize=9)
+        ax.set_title("row profile: centre / sum" + (" (each 0-1)" if norm else ""), color=_TEXT, fontsize=9)
         if self.result is not None and self.chk_edges.isChecked():
             from matplotlib.transforms import blended_transform_factory
             tr = blended_transform_factory(ax.transAxes, ax.transData)

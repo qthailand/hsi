@@ -22,7 +22,7 @@ from .surface import Surface2D, cross_validate_lines, fit_surface_2d
 from .calibration import correct_smile, crop_margin
 from .debug_log import logged_analysis
 
-__all__ = ["SmileAnalysis", "analyze_smile", "verify_on_frame", "anchor_surface"]
+__all__ = ["SmileAnalysis", "analyze_smile", "review_analysis", "verify_on_frame", "anchor_surface"]
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +305,71 @@ def analyze_smile(
         y_ref=float(y_ref),
         timings=timings,
     )
+
+
+def review_analysis(
+    frame: np.ndarray,
+    surface: Surface2D,
+    *,
+    interp: str = "cubic",
+    y_ref: Optional[float] = None,
+    sat_level: Optional[float] = None,
+    cv_rms: Optional[float] = None,
+    snr_min: float = 5.0,
+    n_ref_iter: int = 2,
+) -> Tuple[SmileAnalysis, bool]:
+    """Rebuild the analysis of a stored model from its lamp frame, keeping the stored smile.
+
+    The lamp lines are detected and traced as in :func:`analyze_smile` (same degrees, reference
+    row and interpolation as the stored model). When that fit reproduces the stored surface the
+    analysis is returned as it is; otherwise the stored surface replaces the new fit: the frame is
+    corrected with it, the lines are re-traced, and the residuals are the measured shifts minus the
+    stored surface (per-line offset removed). So the plots and numbers always show *the stored
+    model* on its own lamp frame, never a silent re-fit.
+
+    Args:
+        frame: The lamp frame stored with the model ``(H, W)``.
+        surface: The stored smile surface (anchored at ``y_ref``).
+        interp: The model's interpolation.
+        y_ref: The model's reference row (``None``: the default centre row).
+        sat_level: Sensor full scale (``None``: auto).
+        cv_rms: Cross-validated RMS stored with the model, used when the stored surface differs
+            from the re-fit (its own value cannot be recomputed without re-fitting).
+        snr_min: Minimum peak-to-noise ratio for tracing.
+        n_ref_iter: Reference-offset iterations of the line tracing.
+
+    Returns:
+        ``(analysis, identical)``: *identical* is ``True`` when the re-fit equals the stored
+        surface within 0.001 px (the analysis is then exactly what *Analyze* gives).
+    """
+    import dataclasses
+
+    frame = np.asarray(frame, dtype=np.float32)
+    r = analyze_smile(frame, sat_level=sat_level, deg_y=surface.deg_y, deg_x=surface.deg_x, interp=interp,
+                      snr_min=snr_min, n_ref_iter=n_ref_iter, y_ref=y_ref)
+    h, w = frame.shape
+    Y, X = np.meshgrid(np.linspace(0, h - 1, 64), np.linspace(0, w - 1, 64), indexing="ij")
+    same_shape = (r.surface.deg_y, r.surface.deg_x) == (surface.deg_y, surface.deg_x)
+    if same_shape and float(np.max(np.abs(r.surface(Y, X) - surface(Y, X)))) < 1e-3:
+        return r, True
+    residuals = r.meas_v - surface(r.meas_y, r.meas_x)
+    for k in range(len(r.used_lines)):
+        mk = r.meas_id == k
+        if np.any(mk):
+            residuals[mk] -= float(np.median(residuals[mk]))
+    frame_corr, margin, _, _ = correct_smile(frame, surface, interp)
+    traces_corr: Dict[float, np.ndarray] = {}
+    for ln in r.used_lines:
+        halfwin = max(3, int(round(1.2 * ln.fwhm)))
+        traces_corr[ln.column] = trace_line(frame_corr, r.refs[ln.column], halfwin, r.sat_level, r.noise, snr_min)
+    fit_info = dict(r.fit_info, rms=float(np.sqrt(np.mean(residuals ** 2))) if residuals.size else float("nan"),
+                    n_used=int(residuals.size), deg_y=surface.deg_y, deg_x=surface.deg_x,
+                    coef=np.asarray(surface.coef, dtype=float).copy(), stored=True)
+    out = dataclasses.replace(
+        r, surface=surface, frame_corr=frame_corr, margin=margin, traces_corr=traces_corr, residuals=residuals,
+        fit_info=fit_info, rms_after=_traces_rms([traces_corr[ln.column] for ln in r.used_lines]),
+        cv_rms=float(cv_rms) if cv_rms is not None else float("nan"))
+    return out, False
 
 
 def verify_on_frame(
