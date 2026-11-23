@@ -4,8 +4,9 @@
 :func:`correction_result` (any thread) remaps the lamp / target / white frames with a model
 (:class:`~modules.smile.corrector.SmileCorrector`), traces the lamp lines and the target bars on
 the frames before and after, and returns their deviation from straight. :class:`ResultView`
-(GUI thread) shows it: a verdict strip, a before / after wipe of both frames with the traced
-lines on top, and the residual maps.
+(GUI thread) shows it in the layout of the Smile / Keystone pages: workflow steps, the summary
+cards, a *Before / after* tab (a wipe of both frames with the traced lines on top) and a
+*Residual maps* tab, and a status banner.
 
 The *after* numbers are measured on the corrected frames (lines and bars traced again), never
 drawn as straight lines. Displacement can be drawn magnified (``xG``); the frames are warped by
@@ -23,6 +24,7 @@ Threading:
 """
 from __future__ import annotations
 
+import html
 import math
 import os
 from typing import Callable, List, Optional
@@ -34,24 +36,31 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QSplitter,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from .ui_parts import BAD, BUSY, GOOD, OPTIONAL, TODO, WARN, DashboardMixin, Step, page_style, title_bar
 from .ui_theme import colors, is_dark
 
-__all__ = ["correction_result", "ResultView", "PASS_PX"]
+__all__ = ["correction_result", "ResultView", "PASS_PX", "TAB_WIPE", "TAB_MAPS"]
 
 PASS_PX = 0.25                       #: residual limit (px), same as the keystone re-trace check
 _GAINS = [("Auto", 0), ("x1", 1), ("x10", 10), ("x25", 25), ("x50", 50)]
 _GRID = 4                            # field grid step (px)
 _LAMP, _BAR = "#c58cff", "#2fd3e6"
+TAB_WIPE, TAB_MAPS = range(2)        #: plot tabs of the Result page
+WIPE, MAP_DX, MAP_DY = range(3)      # canvas indices
+_PLOTS = [("Before / after", "Smile_Keystone_Before_After.png"),
+          ("Residual dx (smile)", "Smile_Residual_dx.png"),
+          ("Residual dy (keystone)", "Keystone_Residual_dy.png")]
 
 
 # ------------------------------------------------------------------------------------- compute
@@ -332,36 +341,40 @@ def _composite(rec: dict) -> np.ndarray:
 
 
 class _Tile(QFrame):
-    """One verdict tile: label, value line, sub line."""
+    """One summary card (same look as the Smile / Keystone metric cards): heading, value, sub line."""
 
     def __init__(self, label: str, accent: Optional[str] = None, parent=None):
         super().__init__(parent)
-        self.setObjectName("resultTile")
+        self.setObjectName("ksMetric")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
-        lay.setSpacing(3)
-        self.lbl = QLabel(label.upper())
-        self.val = QLabel("-")
+        lay.setContentsMargins(9, 7, 9, 6)
+        lay.setSpacing(2)
+        self.lbl = QLabel(label)
+        self.lbl.setObjectName("ksMetricHeading")
+        self.val = QLabel("—")
+        self.val.setObjectName("ksMetricValue")
         self.val.setTextFormat(Qt.RichText)
+        self.val.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.sub = QLabel("")
+        self.sub.setObjectName("ksMetricHint")
         self.sub.setWordWrap(True)
+        self.sub.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         for wdg in (self.lbl, self.val, self.sub):
             lay.addWidget(wdg)
+        lay.addStretch(1)
         self._accent = accent
 
     def restyle(self, pal: dict) -> None:
-        top = f"border-top: 2px solid {self._accent};" if self._accent else ""
-        self.setStyleSheet(f"#resultTile {{ background: {pal['card']}; border: 1px solid {pal['border']}; "
-                           f"border-radius: 8px; {top} }}")
-        clear = "background: transparent; border: none;"
-        self.lbl.setStyleSheet(f"{clear} color: {pal['muted']}; font-size: 10px; letter-spacing: 1px;")
-        self.val.setStyleSheet(f"{clear} color: {pal['text']}; font-family: Consolas, 'JetBrains Mono', monospace; "
-                               "font-size: 20px; font-weight: 700;")
-        self.sub.setStyleSheet(f"{clear} color: {pal['muted']}; font-size: 11px;")
+        """The heading takes the colour of what the card measures (purple lamp lines, cyan bars)."""
+        if self._accent:
+            self.lbl.setStyleSheet(f"color: {self._accent}; font-size: 9pt; font-weight: bold;")
 
 
-class ResultView(QWidget):
+class ResultView(DashboardMixin, QWidget):
     """Smile + keystone result page (see the module docstring).
+
+    Same layout as the Smile and Keystone pages: workflow steps (left), the result summary cards and
+    two plot tabs (right: *Before / after* wipe, *Residual maps*), and a status banner.
 
     Args:
         session_model: ``() -> (corrector, frames, frames_info, label)`` of this session's model
@@ -373,7 +386,6 @@ class ResultView(QWidget):
     def __init__(self, session_model: Optional[Callable] = None, parent: Optional[QWidget] = None,
                  session_frames_key: Optional[Callable] = None):
         super().__init__(parent)
-        from .widget import PlotCanvas          # lazy: widget.py imports this module
         self._session_model = session_model
         self._session_frames_key = session_frames_key or (lambda: None)
         self._result: Optional[dict] = None
@@ -383,47 +395,29 @@ class ResultView(QWidget):
         self._drag = False
         self._gain = 1.0
         self._session_key = None
-        self._imgs = {}
         self._clip = {}
+        self._wipe: Optional[dict] = None
         self._ax = None
         self._label = ""
+        self._canvases = [None] * len(_PLOTS)
+        self._tab_pages = [None] * len(_PLOTS)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(6)
-        top = QHBoxLayout()
+        # -- controls (in the workflow steps) --
         self.btn_session = QPushButton("Use this session's model")
+        self.btn_session.setStyleSheet("font-weight:bold;")
         self.btn_session.setToolTip("Measure the model of this session (Smile / Keystone tabs) on the frames it "
                                     "was measured from")
         self.btn_session.clicked.connect(self.show_session_model)
-        self.btn_open = QPushButton("Open model file...")
+        self.btn_open = QPushButton("Open model file…")
         self.btn_open.setToolTip("Measure a stored model (.npz saved with its frames)")
         self.btn_open.clicked.connect(self._on_open)
-        self.lbl_source = QLabel("No model yet")
-        self.lbl_source.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.btn_export = QPushButton("Export PNG")
-        self.btn_export.setToolTip("Export this page's figure as a presentation-quality PNG (300 dpi).")
+        self.btn_export = QPushButton("Export report PNG…")
+        self.btn_export.setToolTip("One presentation PNG (300 dpi): the before / after view at the divider's "
+                                   "position and both residual maps.")
+        self.btn_export.setEnabled(False)
         self.btn_export.clicked.connect(self._on_export)
-        for wdg in (self.btn_session, self.btn_open):
-            top.addWidget(wdg)
-        top.addWidget(self.lbl_source, stretch=1)
-        top.addWidget(self.btn_export)
-        lay.addLayout(top)
-
-        tiles = QGridLayout()
-        tiles.setSpacing(8)
-        self.tile_smile = _Tile("Smile, max |dx|", _LAMP)
-        self.tile_key = _Tile("Keystone, max |dy|", _BAR)
-        self.tile_rms = _Tile("Residual RMS (re-traced)")
-        self.tile_verdict = _Tile("Verdict")
-        for i, t in enumerate((self.tile_smile, self.tile_key, self.tile_rms, self.tile_verdict)):
-            tiles.addWidget(t, 0, i)
-        lay.addLayout(tiles)
-
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        row.addWidget(QLabel("Displacement"))
         self._gain_group = QButtonGroup(self)
+        gain_buttons = []
         for i, (text, _g) in enumerate(_GAINS):
             b = QToolButton()
             b.setText(text)
@@ -431,38 +425,123 @@ class ResultView(QWidget):
             b.setToolTip("Draw the measured displacement magnified (the frames are warped the same way). "
                          "x1 = true scale. Numbers are always true pixels.")
             self._gain_group.addButton(b, i)
-            row.addWidget(b)
+            gain_buttons.append(b)
         self._gain_group.button(0).setChecked(True)
         self._gain_group.buttonClicked.connect(lambda _b: self._redraw())
         self.chk_lamp = QCheckBox("Lamp lines")
+        self.chk_lamp.setToolTip("Lamp lines (purple) traced on each frame: smile")
         self.chk_bars = QCheckBox("Target bars")
+        self.chk_bars.setToolTip("Target bars (cyan) traced on each frame: keystone")
         self.chk_ref = QCheckBox("Straight reference")
+        self.chk_ref.setToolTip("Dashed straight lines through each line / bar at the reference row / column")
         for c, on in ((self.chk_lamp, True), (self.chk_bars, True), (self.chk_ref, False)):
             c.setChecked(on)
             c.toggled.connect(lambda _on: self._redraw())
-            row.addWidget(c)
-        row.addSpacing(10)
-        row.addWidget(QLabel("Maps"))
         self._map_group = QButtonGroup(self)
+        map_buttons = []
         for i, text in enumerate(("After", "Before")):
             b = QToolButton()
             b.setText(text)
             b.setCheckable(True)
+            b.setToolTip("Residual maps after correction (limit scale) or the distortion before it")
             self._map_group.addButton(b, i)
-            row.addWidget(b)
+            map_buttons.append(b)
         self._map_group.button(0).setChecked(True)
         self._map_group.buttonClicked.connect(lambda _b: self._redraw())
-        row.addStretch()
-        hint = QLabel("Drag the divider to compare before / after")
-        row.addWidget(hint)
-        lay.addLayout(row)
 
-        self.canvas = PlotCanvas(self, figsize=(11, 8))
-        lay.addWidget(self.canvas, stretch=1)
+        # -- page: workflow (left) | summary + plot tabs (right) | banner --
+        self.setObjectName("resultPage")
+        self.setStyleSheet(page_style(self))
+        page = QVBoxLayout(self)
+        page.setContentsMargins(5, 5, 5, 5)
+        page.setSpacing(6)
+        split = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        lay = QVBoxLayout(left)
+        lay.setContentsMargins(1, 1, 5, 1)
+        lay.setSpacing(6)
+        lay.addWidget(title_bar("WORKFLOW"))
+        self.step_model = Step(1, "Model to check",
+                               "This session's model (Smile / Keystone tabs) or a model file saved with its "
+                               "frames; it is checked on the frames it was measured from")
+        self.step_model.add(self.btn_session, self.btn_open)
+        self.step_measure = Step(2, "Re-trace after correction",
+                                 "The frames are corrected with the model, then the lamp lines and target bars are "
+                                 "traced again: the numbers are those re-traced positions, never the model itself")
+        self.step_view = Step(3, "Display",
+                              "Magnify the displacement to see it (the frames are warped the same way; the numbers "
+                              "stay true pixels) and choose the overlays")
+        lbl_gain = QLabel("Displacement")
+        lbl_gain.setToolTip(gain_buttons[0].toolTip())
+        self.step_view.add(lbl_gain, *gain_buttons)
+        self.step_view.add_row(self.chk_lamp, self.chk_bars, self.chk_ref)
+        lbl_maps = QLabel("Residual maps")
+        lbl_maps.setToolTip(map_buttons[0].toolTip())
+        self.step_view.add_row(lbl_maps, *map_buttons)
+        self.step_export = Step(4, "Export", "One presentation PNG with the before / after view and both residual "
+                                             "maps; each plot also has its own Export PNG")
+        self.step_export.add(self.btn_export)
+        for step in (self.step_model, self.step_measure, self.step_view, self.step_export):
+            step.finish()
+            lay.addWidget(step)
+        legend = QLabel(f"<span style='color:{_LAMP}'>■</span> lamp lines = smile (dx)&nbsp;&nbsp; "
+                        f"<span style='color:{_BAR}'>■</span> target bars = keystone (dy)<br>"
+                        f"PASS: every re-traced residual below {PASS_PX} px")
+        legend.setWordWrap(True)
+        legend.setStyleSheet(f"color:{colors(self)['muted']}; font-size:8.5pt; padding:2px 4px;")
+        lay.addWidget(legend)
+        lay.addStretch(1)
+        split.addWidget(left)
+
+        right = QWidget()
+        rlay = QVBoxLayout(right)
+        rlay.setContentsMargins(3, 0, 0, 0)
+        rlay.setSpacing(6)
+        rlay.addWidget(title_bar("CORRECTION RESULT SUMMARY"))
+        tiles = QHBoxLayout()
+        tiles.setSpacing(5)
+        self.tile_smile = _Tile("Smile, max |dx|", _LAMP)
+        self.tile_key = _Tile("Keystone, max |dy|", _BAR)
+        self.tile_rms = _Tile("Residual RMS (re-traced)")
+        self.tile_verdict = _Tile("Verdict")
+        for t in (self.tile_smile, self.tile_key, self.tile_rms, self.tile_verdict):
+            tiles.addWidget(t, 1)
+        rlay.addLayout(tiles)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setElideMode(Qt.ElideNone)
+        wipe_page = QWidget()
+        wlay = QVBoxLayout(wipe_page)
+        wlay.setContentsMargins(4, 4, 4, 4)
+        wipe = self._make_plot_panel(WIPE, _PLOTS[WIPE][0], minimum=420)
         self.lbl_hover = QLabel(" ")
         self.lbl_hover.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.lbl_hover.setStyleSheet("font-family: Consolas, 'JetBrains Mono', monospace;")
-        lay.addWidget(self.lbl_hover)
+        self.lbl_hover.setStyleSheet("font-family: Consolas, 'JetBrains Mono', monospace; border: none;")
+        wipe.layout().addWidget(self.lbl_hover)
+        wlay.addWidget(wipe)
+        self.tabs.addTab(wipe_page, "1  Before / after")
+        maps_page = QWidget()
+        mlay = QVBoxLayout(maps_page)
+        mlay.setContentsMargins(4, 4, 4, 4)
+        msplit = QSplitter(Qt.Horizontal)
+        msplit.addWidget(self._make_plot_panel(MAP_DX, _PLOTS[MAP_DX][0], minimum=300))
+        msplit.addWidget(self._make_plot_panel(MAP_DY, _PLOTS[MAP_DY][0], minimum=300))
+        mlay.addWidget(msplit)
+        self.tabs.addTab(maps_page, "2  Residual maps")
+        self._group_pages = (wipe_page, maps_page)
+        self.tabs.setTabEnabled(TAB_MAPS, False)
+        rlay.addWidget(self.tabs, stretch=1)
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([360, 1140])
+        page.addWidget(split, stretch=1)
+        self.lbl_ready = QLabel()
+        self.lbl_ready.setWordWrap(True)
+        page.addWidget(self.lbl_ready)
+
+        self.canvas = self._canvases[WIPE]
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.canvas.mpl_connect("button_release_event", self._on_release)
@@ -486,7 +565,7 @@ class ResultView(QWidget):
         corrector, frames, _info, label = self._session_model()
         if corrector is None:
             self._message("No model in this session yet: analyse the smile (Smile tab) and, for the keystone, "
-                          "run Analyze Keystone - or open a model file.")
+                          "run Analyze Keystone - or open a model file.", BAD)
             return False
         self._session_key = self._key(corrector)
         return self.measure(corrector, frames, label)
@@ -511,11 +590,11 @@ class ResultView(QWidget):
             corrector = SmileCorrector.load(path)
             frames, _info, _setting = load_frames(path)
         except Exception as exc:  # noqa: BLE001
-            self._message(f"Cannot open {os.path.basename(path)}: {exc}")
+            self._message(f"Cannot open {os.path.basename(path)}: {exc}", BAD)
             return False
         if "lamp" not in frames and "target" not in frames:
             self._message(f"{os.path.basename(path)} holds no frames (saved before frames were stored): Apply the "
-                          "model again from this app to store them.")
+                          "model again from this app to store them.", BAD)
             return False
         self._session_key = None
         return self.measure(corrector, frames, os.path.basename(path))
@@ -524,11 +603,15 @@ class ResultView(QWidget):
         """Start measuring *corrector* on *frames* (worker thread, or here when ``synchronous``)."""
         frames = {k: v for k, v in (frames or {}).items() if v is not None}
         if "lamp" not in frames and "target" not in frames:
-            self._message("This model has no lamp or target frame to measure it on.")
+            self._message("This model has no lamp or target frame to measure it on.", BAD)
             return False
         self._token += 1
-        self.lbl_source.setText(f"Measuring {label}..." if label else "Measuring...")
         self._label = label
+        name = html.escape(label or "model")
+        self.step_model.set_state(BUSY, f"<b>{name}</b>")
+        self.step_measure.set_state(BUSY, "Correcting the frames and tracing the lines and bars again…")
+        self.lbl_ready.setText(f"<b>MEASURING</b> — {name} on its {' / '.join(sorted(frames))} frames…")
+        self._paint_banner("info")
         if synchronous:
             try:
                 self._on_done(self._token, correction_result(corrector, frames))
@@ -566,8 +649,10 @@ class ResultView(QWidget):
         if token != self._token:
             return
         self._result = result
-        self.lbl_source.setText(self._label or "model")
+        self.tabs.setTabEnabled(TAB_MAPS, True)
+        self.btn_export.setEnabled(True)
         self._update_tiles()
+        self._update_steps()
         self._redraw()
         self.statusChanged.emit("Result: " + self._verdict_text())
 
@@ -575,7 +660,7 @@ class ResultView(QWidget):
         if token != self._token:
             return
         self._result = None
-        self._message("Measuring the model failed: " + message)
+        self._message("Measuring the model failed: " + message, BAD)
 
     def _on_finished(self) -> None:
         if self._worker is not None:
@@ -583,7 +668,7 @@ class ResultView(QWidget):
             self._worker.deleteLater()
         self._worker = None
 
-    # ------------------------------------------------------------------ tiles
+    # ------------------------------------------------------------------ summary
     def _restyle(self) -> None:
         pal = colors(self)
         for t in (self.tile_smile, self.tile_key, self.tile_rms, self.tile_verdict):
@@ -631,7 +716,7 @@ class ResultView(QWidget):
                                  f"{a:.3f} <span style='font-size:12px; color:{pal['muted']}'>px</span>")
                 tile.sub.setText(sub)
             else:
-                tile.val.setText("-")
+                tile.val.setText("—")
                 tile.sub.setText(f"no {what} frame")
 
         pair(self.tile_smile, s["smile"], "lamp", "spectral line curvature along the slit, measured on "
@@ -640,7 +725,7 @@ class ResultView(QWidget):
             m = s["smile"].get("model")
             self.tile_smile.val.setText((f"<span style='color:{pal['hint']}'>&asymp; {m['max']:.2f}</span> "
                                          f"<span style='font-size:12px; color:{pal['muted']}'>px, model</span>")
-                                        if m else "-")
+                                        if m else "—")
             self.tile_smile.sub.setText("the lamp frame shows no line that could be traced (saturated, too faint "
                                         "or not a lamp frame): smile not measured")
         elif self._result.get("smile_source") == "model":
@@ -666,20 +751,77 @@ class ResultView(QWidget):
             self.tile_verdict.sub.setText(f"{'* ' if partial else ''}{self._scope()}; largest residual "
                                           f"{worst:.3f} px (limit {PASS_PX} px)")
         else:
-            self.tile_rms.val.setText("-")
-            self.tile_verdict.val.setText("-")
+            self.tile_rms.val.setText("—")
+            self.tile_verdict.val.setText("—")
             self.tile_verdict.sub.setText("no lines or bars could be traced")
 
+    def _update_steps(self) -> None:
+        """Workflow steps and banner for the measured result."""
+        r = self._result
+        name = html.escape(self._label or "model")
+        h, w = r["shape"]
+        frames = [name for name, key in (("lamp", "lamp"), ("target", "target_norm")) if r["before"][key] is not None]
+        self.step_model.set_state(GOOD, f"<b>{name}</b> <span style='color:{colors(self)['muted']}'>· "
+                                        f"{w}x{h} · {' + '.join(frames)}"
+                                        f"{' · keystone' if r.get('has_keystone') else ''}</span>")
+        n_lines, n_bars = len(r["after"]["lines"]), len(r["after"]["bars"])
+        rms, worst = self._residual()
+        scope = self._scope()
+        partial = scope != "smile + keystone"
+        parts = [f"{n_lines} lamp lines" if r["after"]["lamp"] is not None else "",
+                 f"{n_bars} target bars" if r["after"]["target_norm"] is not None else ""]
+        counts = f"<b>{' · '.join(p for p in parts if p)}</b> re-traced after correction"
+        if not np.isfinite(rms):
+            self.step_measure.set_state(BAD, "No line or bar could be traced on the corrected frames",
+                                        "Check that the frames are a lamp frame and a bar target of this setting")
+            self.lbl_ready.setText("<b>NOT MEASURED</b> — no lamp line or target bar could be traced.")
+            self._paint_banner(BAD)
+            return
+        self.step_measure.set_state(WARN if partial else GOOD,
+                                    counts + (f"<br>{html.escape(scope)}" if partial else ""))
+        ok = worst < PASS_PX
+        if ok and not partial:
+            text, state = (f"<b>PASS</b> — smile + keystone corrected: largest re-traced residual {worst:.3f} px, "
+                           f"RMS {rms:.3f} px (limit {PASS_PX} px)."), GOOD
+        elif ok:
+            text, state = (f"<b>PASS *</b> — {html.escape(scope)}: largest residual {worst:.3f} px "
+                           f"(limit {PASS_PX} px)."), "info"
+        else:
+            text, state = (f"<b>CHECK</b> — largest re-traced residual {worst:.3f} px is above the {PASS_PX} px "
+                           f"limit ({html.escape(scope)}): see the Residual maps tab."), WARN
+        self.lbl_ready.setText(text)
+        self._paint_banner(state)
+
     # ------------------------------------------------------------------ drawing
-    def _message(self, text: str) -> None:
-        self.canvas.clear()
-        ax = self.canvas.fig.add_subplot(111)
-        ax.text(.5, .5, text, ha="center", va="center", transform=ax.transAxes, color="#5d6d7e", fontsize=10,
-                wrap=True)
-        ax.set_axis_off()
+    def _placeholders(self, text: str) -> None:
+        for i, canvas in enumerate(self._canvases):
+            canvas.clear()
+            ax = canvas.fig.add_subplot(111)
+            ax.text(.5, .5, text if i == WIPE else "Measure a model to see this map", ha="center", va="center",
+                    transform=ax.transAxes, color="#5d6d7e", fontsize=10, wrap=True)
+            ax.set_axis_off()
+            canvas.draw_idle()
         self._ax = None
-        self.lbl_source.setText("No model" if self._result is None else self.lbl_source.text())
-        self.canvas.draw_idle()
+        self._wipe = None
+
+    def _message(self, text: str, state: str = TODO) -> None:
+        """No result to show: *text* on the plots, in the first step and the banner."""
+        self._placeholders(text)
+        self.tabs.setTabEnabled(TAB_MAPS, False)
+        self.tabs.setCurrentIndex(TAB_WIPE)
+        self.btn_export.setEnabled(False)
+        for tile in (self.tile_smile, self.tile_key, self.tile_rms, self.tile_verdict):
+            tile.val.setText("—")
+            tile.sub.setText("")
+        self.step_model.set_state(state, html.escape(text) if state == BAD else "No model measured yet",
+                                  None if state != BAD else "Use this session's model or open a model file "
+                                                            "saved with its frames")
+        self.step_measure.set_state(TODO, "After a model is chosen")
+        self.step_view.set_state(OPTIONAL, "Displacement magnified automatically")
+        self.step_export.set_state(OPTIONAL, "After measuring")
+        head = "MODEL NOT MEASURED" if state == BAD else "NO MODEL MEASURED"
+        self.lbl_ready.setText(f"<b>{head}</b> — {html.escape(text)}")
+        self._paint_banner(BAD if state == BAD else "info")
 
     def _pick_gain(self) -> float:
         choice = _GAINS[max(0, self._gain_group.checkedId())][1]
@@ -714,33 +856,17 @@ class ResultView(QWidget):
         return cv2.remap(img, xs - (gain - 1) * dx, ys - (gain - 1) * dy, cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
-    def _redraw(self) -> None:
-        if self._result is None:
-            return
+    def _draw_wipe(self, ax, gain: float, pal: dict) -> dict:
+        """Before / after frames on *ax*, each clipped to its side of the divider; returns the artists."""
         import matplotlib.patheffects as pe
         from matplotlib.patches import Rectangle
         r = self._result
         h, w = r["shape"]
-        gain = self._pick_gain()
-        self._gain = gain
-        dark = is_dark(self)
-        pal = colors(self)
-        fig = self.canvas.fig
-        self.canvas.clear()
-        try:
-            fig.set_layout_engine("none")           # fixed margins: the wipe redraws fast and never re-flows
-        except Exception:  # noqa: BLE001
-            pass
-        gs = fig.add_gridspec(2, 2, height_ratios=[3.0, 1.25], left=.065, right=.975, top=.95, bottom=.06,
-                              hspace=.32, wspace=.16)
-        ax = fig.add_subplot(gs[0, :])
-        self._ax = ax
-        self._clip = {}
-        self._clipped = {"before": [], "after": []}
+        clip, clipped = {}, {"before": [], "after": []}
         for mode in ("before", "after"):
             rect = Rectangle((0, -.5), 1, h, transform=ax.transData, fill=False, visible=False)
             ax.add_patch(rect)
-            self._clip[mode] = rect
+            clip[mode] = rect
             img = ax.imshow(self._warped(mode, gain), cmap="gray", vmin=0, vmax=1, aspect="auto",
                             interpolation="bilinear", extent=(-.5, w - .5, h - .5, -.5))
             arts = [img]
@@ -767,77 +893,127 @@ class ResultView(QWidget):
                     line, = ax.plot(ln["xfit"] + (gain - 1) * ln["devfit"], rows_all, color=_LAMP, lw=1.1,
                                     ls=(0, (5, 4)), alpha=.9)
                     arts.append(line)
-            self._clipped[mode] = arts
+            clipped[mode] = arts
         bbox = dict(boxstyle="round,pad=0.35", fc=(0.03, 0.06, 0.1, .85), ec="none")
-        self._chip_before = ax.text(0.01, 0.985, "BEFORE", transform=ax.transAxes, ha="left", va="top",
-                                    fontsize=8.5, fontweight="bold", color=pal["warn"], family="monospace", bbox=bbox,
-                                    zorder=8)
-        self._chip_after = ax.text(0.99, 0.985, "AFTER", transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
-                                   fontweight="bold", color=pal["good"], family="monospace", bbox=bbox, zorder=8)
+        chip_before = ax.text(0.01, 0.985, "BEFORE", transform=ax.transAxes, ha="left", va="top", fontsize=8.5,
+                              fontweight="bold", color=pal["warn"], family="monospace", bbox=bbox, zorder=8)
+        chip_after = ax.text(0.99, 0.985, "AFTER", transform=ax.transAxes, ha="right", va="top", fontsize=8.5,
+                             fontweight="bold", color=pal["good"], family="monospace", bbox=bbox, zorder=8)
         ax.text(0.01, 0.015, "TRUE SCALE" if gain == 1 else "displacement x%g" % gain, transform=ax.transAxes,
                 ha="left", va="bottom", fontsize=8, fontweight="bold", family="monospace",
                 color=pal["good"] if gain == 1 else "#f5a524", bbox=bbox, zorder=8)
-        self._divider = ax.axvline(0, color="#ffffff", lw=2, zorder=9)
-        self._knob, = ax.plot([0], [h / 2.0], marker="o", ms=17, mfc="#f5a524", mec="#0b1520", mew=2, zorder=10,
-                              clip_on=False)
+        divider = ax.axvline(0, color="#ffffff", lw=2, zorder=9)
+        knob, = ax.plot([0], [h / 2.0], marker="o", ms=17, mfc="#f5a524", mec="#0b1520", mew=2, zorder=10,
+                        clip_on=False)
         ax.set_xlim(-.5, w - .5)
         ax.set_ylim(h - .5, -.5)
         ax.set_xlabel("Column (spectral)")
         ax.set_ylabel("Slit position (row)")
-        title = "Before / after - lamp lines (purple) and target bars (cyan) traced on each frame"
+        title = "Lamp lines (purple) and target bars (cyan) traced on each frame - drag the divider"
         if r.get("smile_source") in ("model", "untraced"):
-            title = ("Before / after - target bars (cyan) traced on each frame; dashed purple = smile predicted by "
-                     "the model (no lamp frame)")
-        ax.set_title(title, fontsize=10, loc="left")
-        # residual maps
+            title = ("Target bars (cyan) traced on each frame; dashed purple = smile predicted by the model "
+                     "(no lamp frame)")
+        ax.set_title(title, fontsize=9, loc="left")
+        return dict(ax=ax, clip=clip, clipped=clipped, divider=divider, knob=knob, chip_before=chip_before,
+                    chip_after=chip_after)
+
+    def _apply_split(self, state: dict) -> None:
+        h, w = self._result["shape"]
+        x = -.5 + self._split * w
+        state["clip"]["before"].set_bounds(-.5, -.5, x + .5, h)
+        state["clip"]["after"].set_bounds(x, -.5, w - .5 - x, h)
+        for mode, rect in state["clip"].items():   # a Rectangle clip is frozen when set: set it again
+            for a in state["clipped"][mode]:
+                a.set_clip_path(rect)
+        state["divider"].set_xdata([x, x])
+        state["knob"].set_xdata([x])
+        state["chip_before"].set_visible(self._split > .08)
+        state["chip_after"].set_visible(self._split < .92)
+
+    def _map_mode(self):
+        """``(mode, colour limit, colour map)`` of the residual maps."""
+        r = self._result
         after = self._map_group.checkedId() != 1
         mode = "after" if after else "before"
         lim = PASS_PX if after else max(1.0, math.ceil(max(float(np.max(np.abs(r["before"]["dx"]))),
                                                              float(np.max(np.abs(r["before"]["dy"])))) * 2) / 2)
         from matplotlib.colors import LinearSegmentedColormap
+        pal = colors(self)
         cmap = LinearSegmentedColormap.from_list(
-            "resid", ["#4696ff", pal["card"] if dark else "#f4f6f8", "#ff9632"])
-        for col, (key, title, guide) in enumerate((("dx", "Residual dx (smile)", "lines"),
-                                                   ("dy", "Residual dy (keystone)", "bars"))):
-            axm = fig.add_subplot(gs[1, col])
-            field = r[mode][key]
-            im = axm.imshow(field, cmap=cmap, vmin=-lim, vmax=lim, aspect="auto", interpolation="bilinear",
-                            extent=(-.5, w - .5, h - .5, -.5))
-            s = r["stats"]["smile" if key == "dx" else "keystone"].get(mode)
-            text = (f"max {s['max']:.3f} px, RMS {s['rms']:.3f} px" if s and s["n"] else "not measured")
-            if key == "dx" and r.get("smile_source") in ("model", "untraced", "none"):
-                text = "model prediction" if mode == "before" else "not measured (no lamp frame)"
-                if mode == "after":
-                    axm.text(.5, .5, "No lamp frame: smile not measured after correction", ha="center",
-                             va="center", transform=axm.transAxes, fontsize=8.5, color=pal["muted"])
-            axm.set_title(f"{title}, {mode}: {text}", fontsize=9, loc="left")
-            axm.tick_params(labelsize=7)
-            cb = fig.colorbar(im, ax=axm, fraction=.04, pad=.01)
-            cb.ax.tick_params(labelsize=7)
-            cb.set_label("px", fontsize=7)
+            "resid", ["#4696ff", pal["card"] if is_dark(self) else "#f4f6f8", "#ff9632"])
+        return mode, lim, cmap
+
+    def _draw_map(self, fig, axm, key: str, mode: str, lim: float, cmap, pal: dict) -> None:
+        r = self._result
+        h, w = r["shape"]
+        title = "Residual dx (smile)" if key == "dx" else "Residual dy (keystone)"
+        im = axm.imshow(r[mode][key], cmap=cmap, vmin=-lim, vmax=lim, aspect="auto", interpolation="bilinear",
+                        extent=(-.5, w - .5, h - .5, -.5))
+        s = r["stats"]["smile" if key == "dx" else "keystone"].get(mode)
+        text = (f"max {s['max']:.3f} px, RMS {s['rms']:.3f} px" if s and s["n"] else "not measured")
+        if key == "dx" and r.get("smile_source") in ("model", "untraced", "none"):
+            text = "model prediction" if mode == "before" else "not measured (no lamp frame)"
+            if mode == "after":
+                axm.text(.5, .5, "No lamp frame: smile not measured after correction", ha="center",
+                         va="center", transform=axm.transAxes, fontsize=8.5, color=pal["muted"])
+        axm.set_title(f"{title}, {mode}: {text}", fontsize=9, loc="left")
+        axm.set_xlabel("Column (spectral)", fontsize=8)
+        axm.set_ylabel("Slit position (row)", fontsize=8)
+        axm.tick_params(labelsize=7)
+        cb = fig.colorbar(im, ax=axm, fraction=.04, pad=.01)
+        cb.ax.tick_params(labelsize=7)
+        cb.set_label("px", fontsize=7)
+
+    def _redraw(self) -> None:
+        if self._result is None:
+            return
+        gain = self._pick_gain()
+        self._gain = gain
+        pal = colors(self)
+        canvas = self._canvases[WIPE]
+        canvas.clear()
+        fig = canvas.fig
+        try:
+            fig.set_layout_engine("none")           # fixed margins: the wipe redraws fast and never re-flows
+        except Exception:  # noqa: BLE001
+            pass
+        fig.subplots_adjust(left=.07, right=.985, top=.94, bottom=.08)
+        self._wipe = self._draw_wipe(fig.add_subplot(111), gain, pal)
+        self._ax, self._clip = self._wipe["ax"], self._wipe["clip"]
         self._update_split(draw=False)
-        self.canvas.draw_idle()
+        canvas.draw_idle()
+        mode, lim, cmap = self._map_mode()
+        for index, key in ((MAP_DX, "dx"), (MAP_DY, "dy")):
+            c = self._canvases[index]
+            c.clear()
+            try:
+                c.fig.set_layout_engine("none")     # fixed margins: the map fills its panel
+            except Exception:  # noqa: BLE001
+                pass
+            c.fig.subplots_adjust(left=.12, right=.9, top=.92, bottom=.11)
+            self._draw_map(c.fig, c.fig.add_subplot(111), key, mode, lim, cmap, pal)
+            c.draw_idle()
+        auto = self._gain_group.checkedId() <= 0
+        self.step_view.set_state(OPTIONAL, ("Auto: " if auto else "") + (
+            "true scale" if gain == 1 else f"displacement drawn x{gain:g}") + f" · maps {mode} correction")
+        self.step_export.set_state(OPTIONAL, "Report PNG ready to export")
 
     def _update_split(self, draw: bool = True) -> None:
-        if self._ax is None or self._result is None:
+        if self._wipe is None or self._result is None:
             return
-        h, w = self._result["shape"]
-        x = -.5 + self._split * w
-        self._clip["before"].set_bounds(-.5, -.5, x + .5, h)
-        self._clip["after"].set_bounds(x, -.5, w - .5 - x, h)
-        for mode, rect in self._clip.items():   # a Rectangle clip is frozen when set: set it again
-            for a in self._clipped[mode]:
-                a.set_clip_path(rect)
-        self._divider.set_xdata([x, x])
-        self._knob.set_xdata([x])
-        self._chip_before.set_visible(self._split > .08)
-        self._chip_after.set_visible(self._split < .92)
+        self._apply_split(self._wipe)
         if draw:
-            self.canvas.draw_idle()
+            self._canvases[WIPE].draw_idle()
 
     # ------------------------------------------------------------------ mouse
+    def _toolbar_busy(self) -> bool:
+        """True while the plot toolbar's pan / zoom is active (the mouse then belongs to it)."""
+        toolbar = getattr(self._canvases[WIPE], "toolbar", None)
+        return bool(getattr(toolbar, "mode", ""))
+
     def _on_press(self, event) -> None:
-        if self._ax is None or event.inaxes is not self._ax or event.xdata is None or event.button != 1:
+        if (self._ax is None or event.inaxes is not self._ax or event.xdata is None or event.button != 1
+                or self._toolbar_busy()):
             return
         self._drag = True
         self.set_split((event.xdata + .5) / self._result["shape"][1])
@@ -877,14 +1053,47 @@ class ResultView(QWidget):
         if path:
             self.open_model(path)
 
+    def report_figure(self):
+        """One figure with the before / after view (divider as set) above both residual maps."""
+        from matplotlib.figure import Figure
+        from .ui_theme import theme_figure
+        if self._result is None:
+            return None
+        pal = colors(self)
+        fig = Figure(figsize=(11, 8), dpi=100)
+        gs = fig.add_gridspec(2, 2, height_ratios=[3.0, 1.25], left=.065, right=.975, top=.95, bottom=.06,
+                              hspace=.32, wspace=.16)
+        state = self._draw_wipe(fig.add_subplot(gs[0, :]), self._pick_gain(), pal)
+        self._apply_split(state)
+        mode, lim, cmap = self._map_mode()
+        for col, key in enumerate(("dx", "dy")):
+            self._draw_map(fig, fig.add_subplot(gs[1, col]), key, mode, lim, cmap, pal)
+        theme_figure(fig, is_dark(self))
+        return fig
+
     def _on_export(self) -> None:
+        if self._result is None:
+            return
         path, _ = QFileDialog.getSaveFileName(self, "Export result as PNG", "Smile_Keystone_Result.png",
                                               "PNG image (*.png)")
         if not path:
             return
         if not path.lower().endswith(".png"):
             path += ".png"
-        self.canvas.fig.savefig(path, format="png", dpi=300, facecolor=self.canvas.fig.get_facecolor())
+        fig = self.report_figure()
+        fig.savefig(path, format="png", dpi=300, facecolor=fig.get_facecolor())
+        self.statusChanged.emit(f"Exported result PNG: {path} (300 dpi)")
+
+    def _on_export_plot(self, index: int) -> None:
+        """Save one plot as a 300-dpi PNG."""
+        path, _ = QFileDialog.getSaveFileName(self, "Export plot as PNG", _PLOTS[index][1], "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        canvas = self._canvases[index]
+        canvas.fig.savefig(path, format="png", dpi=300, bbox_inches="tight", facecolor=canvas.fig.get_facecolor())
+        self.statusChanged.emit(f"Exported plot PNG: {path} (300 dpi)")
 
     def closeEvent(self, event):  # noqa: N802
         if self._worker is not None:
