@@ -450,8 +450,11 @@ class MainWindow(QMainWindow):
         if header is not None:
             from modules.radiometric.auto import reflectance_export_metadata
             metadata = reflectance_export_metadata(metadata, header)
-            title = (f"Reflectance Viewer {cube.shape} - "
-                     f"{header.get('reflectance_reference_cube') or header.get('reflectance_reference')}")
+            if header.get("flatfield_profile") and not header.get("reflectance_reference"):
+                title = f"Flat-fielded Viewer {cube.shape} - {header['flatfield_profile']} (counts evened)"
+            else:
+                title = (f"Reflectance Viewer {cube.shape} - "
+                         f"{header.get('reflectance_reference_cube') or header.get('reflectance_reference')}")
         viewer = self.create_cube_viewer(cube, wavelengths, title=title, camera_bits=metadata)
         if viewer is not None:
             viewer.cube_exported.connect(

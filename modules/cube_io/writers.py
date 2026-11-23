@@ -113,6 +113,11 @@ SCAN_HEADER_FIELDS = (
     ('reflectance_reference_age_h', 'reflectance reference age (h)', float),
     ('reflectance_reference_delta_t_c', 'reflectance reference temperature difference (C)', float),
     ('reflectance_reference_roi', 'reflectance reference roi', str),
+    # flat-field applied on its own (counts evened along the slit, no reflectance): the profile id
+    # and how ('frame by frame'); absent = not applied on its own (a reflectance cube holds it in
+    # its reference's factors when that reference was made with a profile)
+    ('flatfield_profile', 'flat-field profile', str),
+    ('flatfield_mode', 'flat-field mode', str),
     ('calibration_warnings', 'calibration warnings', str),
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),

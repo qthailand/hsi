@@ -81,7 +81,11 @@ class FocusMap:
         noise_dn: Median single-pixel noise over the lit frame (DN).
         level_dn: 95th percentile of the lit signal level (DN).
         full_scale: Full scale of the input (DN; the integer dtype's maximum), ``None`` for float input.
-        clipped: Share of the lit pixels at or above 98 % of ``full_scale`` (0 without a full scale).
+        clipped: Share of the lit pixels that are saturated: from the *clipped* mask given to
+            :func:`focus_map` (taken on the raw frame), else at or above 98 % of ``full_scale``.
+        clip_map: ``(rows, cols)`` bool on the reduced grid, True where saturated pixels make the
+            contrast unusable (left out of every statistic and of the best-focus search), or ``None``.
+        clip_source: ``"raw mask"``, ``"full scale"`` or ``None`` (how ``clipped`` was found).
     """
     contrast: np.ndarray
     rows: np.ndarray
@@ -104,6 +108,8 @@ class FocusMap:
     level_dn: float = float("nan")
     full_scale: Optional[float] = None
     clipped: float = 0.0
+    clip_map: Optional[np.ndarray] = None
+    clip_source: Optional[str] = None
 
     @property
     def level_fraction(self) -> Optional[float]:
@@ -170,12 +176,16 @@ def bar_period(image: np.ndarray) -> float:
     return float(1.0 / (k / n))
 
 
-def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
+def focus_map(image: np.ndarray, period: Optional[float] = None, clipped=None) -> FocusMap:
     """Measure the bar contrast of a line-target frame and where each slit row is sharpest.
 
     Args:
         image: ``(slit, wavelength)`` frame of a target with horizontal bars.
         period: Bar period along the slit (px); ``None``: :func:`bar_period`.
+        clipped: Optional bool mask (same shape) of saturated pixels, taken on the RAW frame
+            (a dark-subtracted frame hides saturation below full scale). Without it, pixels at
+            98 % of an integer dtype's maximum count as saturated. Saturated areas have no bar
+            contrast to measure: they are left out of the statistics and shown in ``clip_map``.
 
     Returns:
         :class:`FocusMap`.
@@ -217,9 +227,28 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
     lit &= uniform_filter(lit.astype(np.float32), (win_r, win_c)) > 0.999
     if lit.sum() < 50:
         raise ValueError("Too few lit pixels")
-    contrast = np.where(lit, amp / np.maximum(level, 1e-6), np.nan).astype(np.float32)
+    # saturated pixels (raw mask, else the integer full scale), spread over the measuring window
+    mask = None
+    clip_source = None
+    if clipped is not None and np.shape(clipped) == raw.shape:
+        mask, clip_source = np.asarray(clipped, bool), "raw mask"
+    elif full_scale:
+        mask, clip_source = raw >= 0.98 * full_scale, "full scale"
+    clip_map = None
+    clipped_share = 0.0
+    if mask is not None:
+        lit_full = np.repeat(lit, COLUMN_BLOCK, axis=1)
+        sub = mask[:, :nb * COLUMN_BLOCK]
+        clipped_share = float(sub[lit_full].mean()) if lit_full.any() else 0.0
+        blk = sub.reshape(h, nb, COLUMN_BLOCK).any(axis=2)
+        if blk.any():
+            clip_map = uniform_filter(blk.astype(np.float32), (win_r, win_c)) > 0
+    usable = lit if clip_map is None else (lit & ~clip_map)
+    if usable.sum() < 50:
+        raise ValueError("The frame is saturated almost everywhere: lower the exposure")
+    contrast = np.where(usable, amp / np.maximum(level, 1e-6), np.nan).astype(np.float32)
     noise = _pixel_noise(img, nb, (win_r, win_c))
-    cnr = np.where(lit, amp / np.maximum(noise, 1e-6), np.nan).astype(np.float32)
+    cnr = np.where(usable, amp / np.maximum(noise, 1e-6), np.nan).astype(np.float32)
 
     lit_r = np.flatnonzero(lit.any(axis=1))
     lit_c = np.flatnonzero(lit.any(axis=0))
@@ -274,10 +303,7 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
         if not (lit_cols[0] - 0.25 * span <= fit[0] <= lit_cols[1] + 0.25 * span):
             fit = None
 
-    vals, cvals = contrast[lit], cnr[lit]
-    lit_full = np.repeat(lit, COLUMN_BLOCK, axis=1)
-    lit_pix = img[:, :nb * COLUMN_BLOCK][lit_full]
-    clipped = float(np.mean(lit_pix >= 0.98 * full_scale)) if full_scale and lit_pix.size else 0.0
+    vals, cvals = contrast[usable], cnr[usable]
     return FocusMap(contrast=contrast, rows=np.arange(h, dtype=float), cols=cols, period=period,
                     row_samples=row_samples, best_col=best_col, best_contrast=best_val, fit=fit,
                     centre_row=float(centre_row), lit_rows=lit_rows, lit_cols=lit_cols,
@@ -286,7 +312,7 @@ def focus_map(image: np.ndarray, period: Optional[float] = None) -> FocusMap:
                     cnr=cnr, worst_cnr=float(np.percentile(cvals, WORST_PERCENTILE)),
                     best_cnr=float(np.percentile(cvals, 100 - WORST_PERCENTILE)),
                     noise_dn=float(np.median(noise[lit])), level_dn=float(np.percentile(level[lit], 95)),
-                    full_scale=full_scale, clipped=clipped)
+                    full_scale=full_scale, clipped=clipped_share, clip_map=clip_map, clip_source=clip_source)
 
 
 def _pixel_noise(img: np.ndarray, nb: int, window) -> np.ndarray:

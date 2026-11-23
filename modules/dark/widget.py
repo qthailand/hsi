@@ -205,6 +205,10 @@ class DarkFramePanel(QGroupBox):
         """
         return self._dark_toggle.isChecked()
 
+    def set_dark_enabled(self, enabled: bool) -> None:
+        """Tick or untick *Apply Dark Subtraction* (emits ``dark_toggled`` when it changes)."""
+        self._dark_toggle.setChecked(bool(enabled))
+
     def set_idle(self):
         """Show "No dark frame" (grey): nothing loaded and nothing capturing."""
         self._apply_state(self.IDLE)

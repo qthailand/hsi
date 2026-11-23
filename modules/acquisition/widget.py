@@ -23,7 +23,8 @@ Example:
 from PyQt5.QtCore import QObject
 from modules.status_card import StatusCard
 
-STATE_COLORS = {'Applied': 'green', 'Missing': 'red', 'Off': 'orange', 'Waiting': 'cyan', 'Capturing': 'cyan'}
+STATE_COLORS = {'Applied': 'green', 'Missing': 'red', 'Off': 'orange', 'Waiting': 'cyan', 'Capturing': 'cyan',
+                'Smile only': 'cyan'}
 
 class CorrectionStatusDisplay(QObject):
     """Independently reusable Dark, Smile and Wavelength cards.

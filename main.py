@@ -1,6 +1,17 @@
+# %%
 """HSI System entry point."""
 
+
 from __future__ import annotations
+import sklearn
+from modules.ui_kit.theme import ACCENT_DARK, PLOT_BACKGROUND, PLOT_FOREGROUND, dashboard_stylesheet
+from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
+import pyqtgraph as pg
+import qdarktheme
+import traceback
+import logging
 import os
 import sys
 # Thread caps for the BLAS/OpenMP pools: read once when numpy/sklearn load, so they must be
@@ -9,15 +20,6 @@ os.environ["OPENBLAS_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
 os.environ["OMP_NUM_THREADS"] = "2"
 
-import logging
-import traceback
-import qdarktheme
-import pyqtgraph as pg
-from PyQt5.QtCore import QObject, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QPalette
-from PyQt5.QtWidgets import QApplication, QMessageBox
-from modules.ui_kit.theme import ACCENT_DARK, PLOT_BACKGROUND, PLOT_FOREGROUND, dashboard_stylesheet
-import sklearn
 print(sys.getswitchinterval())
 
 
@@ -98,12 +100,14 @@ def main():
     app.setStyle("Fusion")
     app.setStyleSheet(dashboard_stylesheet(qdarktheme.load_stylesheet("dark")))
     palette = app.palette()
-    palette.setColor(QPalette.Highlight, QColor(ACCENT_DARK))   # MDI title bars and other Fusion highlights
+    # MDI title bars and other Fusion highlights
+    palette.setColor(QPalette.Highlight, QColor(ACCENT_DARK))
     app.setPalette(palette)
 
     from windows.main_window import MainWindow
 
-    main_win = MainWindow(persist_settings=True)   # remember camera/stage settings for the next start
+    # remember camera/stage settings for the next start
+    main_win = MainWindow(persist_settings=True)
     main_win.resize(1400, 900)
     main_win.show()
 

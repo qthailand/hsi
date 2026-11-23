@@ -56,3 +56,50 @@ def test_generic_card_accepts_arbitrary_values_and_palette():
     assert long_detail in card.toolTip() and len(card.detail.text()) < 40
     with pytest.raises(ValueError):
         card.set_content('Ready', color='purple')
+
+
+def test_status_card_value_is_a_switch():
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from modules.status_card import StatusCard
+    card = StatusCard("Dark")
+    card.set_compact(92)
+    card.set_clickable(True)
+    card.show()
+    app.processEvents()
+    clicks, switches = [], []
+    card.clicked.connect(lambda: clicks.append(1))
+    card.value_clicked.connect(lambda: switches.append(1))
+    QTest.mouseClick(card.value, Qt.LeftButton)                    # not a switch yet: a card click
+    assert clicks == [1] and switches == []
+    card.set_togglable(True, "Click to switch")
+    assert card.is_togglable() and card.switch_mark.isVisible()
+    QTest.mouseClick(card.value, Qt.LeftButton)                    # the value is the switch now
+    assert switches == [1] and clicks == [1]
+    QTest.mouseClick(card, Qt.LeftButton, pos=QPoint(4, card.height() - 4))   # elsewhere: still the card
+    assert clicks == [1, 1]
+    card.set_togglable(False)
+    assert not card.switch_mark.isVisible()
+    card.close()
+
+
+def test_engine_geometry_switches_pick_the_model():
+    from types import SimpleNamespace
+    from modules.acquisition.engine import AcquisitionEngine
+    smile_only = object()
+    cal = SimpleNamespace(has_keystone=True, smile_only=lambda: smile_only)
+    eng = AcquisitionEngine.__new__(AcquisitionEngine)
+    import threading
+    eng._lock = threading.Lock()
+    eng._smile = SimpleNamespace(calibration=cal)
+    eng.set_geometry(True, True)
+    assert eng._active_calibration() is cal
+    eng.set_geometry(True, False)
+    assert eng._active_calibration() is smile_only and eng._active_calibration() is smile_only   # cached
+    eng.set_geometry(False, True)
+    assert eng._active_calibration() is None and eng.geometry() == (False, True)
+    eng._smile = SimpleNamespace(calibration=None)
+    eng.set_geometry(True, True)
+    assert eng._active_calibration() is None

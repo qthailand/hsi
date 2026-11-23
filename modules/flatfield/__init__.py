@@ -18,12 +18,12 @@ Example:
     >>> flat = compute_flatfield(strip_cube, strip_mask)          # doctest: +SKIP
     >>> evened = apply_flatfield(scan_cube, flat['profile'])      # doctest: +SKIP
 """
-from .core import (DEFAULT_MAX_SATURATED, DEFAULT_MIN_COVERAGE, DEFAULT_STEP_THRESHOLD, apply_flatfield,
+from .core import (DEFAULT_MAX_SATURATED, DEFAULT_MIN_COVERAGE, DEFAULT_STEP_THRESHOLD, apply_flatfield, evening_factors,
                    check_profile, compute_flatfield)
 from .store import (FLATFIELD_FORMAT_VERSION, FlatFieldMatch, FlatFieldProfile, FlatFieldStore,
                     flatfield_mismatch)
 
-__all__ = ["compute_flatfield", "apply_flatfield", "check_profile", "DEFAULT_MIN_COVERAGE", "DEFAULT_MAX_SATURATED",
+__all__ = ["compute_flatfield", "apply_flatfield", "evening_factors", "check_profile", "DEFAULT_MIN_COVERAGE", "DEFAULT_MAX_SATURATED",
            "DEFAULT_STEP_THRESHOLD",
            "FlatFieldStore", "FlatFieldProfile", "FlatFieldMatch", "flatfield_mismatch",
            "FLATFIELD_FORMAT_VERSION"]

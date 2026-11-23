@@ -130,6 +130,8 @@ class ScanWindow(QWidget):
     auto_calibration_requested = pyqtSignal(object, object)
     #: The user finished a wavelength range edit: Enter, or focus leaving the Start/End pair.
     wavelength_range_committed = pyqtSignal()
+    #: Smile card switched: ``(smile, keystone)`` - smile off = no remap; keystone off = smile only.
+    geometry_requested = pyqtSignal(bool, bool)
 
     def request_snapshot(self, request_id):
         controller = getattr(self, 'controller', None)
@@ -185,8 +187,18 @@ class ScanWindow(QWidget):
         self.flatfield_card.set_content('Waiting', 'Waiting for camera')
         self.radiometric_card = StatusCard('Radiometric', self)
         self.radiometric_card.set_content('Waiting', 'Waiting for camera')
-        self.status_cards = (self.correction_status.dark, self.correction_status.smile,
-                             self.correction_status.wavelength, self.flatfield_card, self.radiometric_card)
+        # Wavelength first (always on: the band grid needs it), then the ones that switch on / off
+        self.status_cards = (self.correction_status.wavelength, self.correction_status.dark,
+                             self.correction_status.smile, self.flatfield_card, self.radiometric_card)
+        self._geometry = dict(model=False, keystone_available=False, smile=True, keystone=True)
+        self.correction_status.dark.value_clicked.connect(self._on_dark_card_switch)
+        self.correction_status.smile.value_clicked.connect(self._on_smile_card_switch)
+        self.radiometric_card.value_clicked.connect(self._on_radiometric_card_switch)
+        self._flatfield_on = True                 # Flat-field card switch (used at the next Start)
+        self._flatfield_last = None
+        self.flatfield_card.value_clicked.connect(self._on_flatfield_card_switch)
+        self.correction_status.dark.set_togglable(True, "Click to switch dark + hot-pixel correction on / off")
+        self.radiometric_card.set_togglable(True, "Click to switch automatic radiometric calibration on / off")
         for card in self.status_cards:
             card.set_compact(STATUS_CARD_SIZE)
         # a click on a card opens that module's profile; Smile and Wavelength always have a
@@ -570,6 +582,8 @@ class ScanWindow(QWidget):
         self._settings_sizes_before_scan = None
         self._scan_clock = None             # (monotonic start, expected s) while the stage moves
         self._scanning = False
+        self.dark_panel.dark_toggled.connect(lambda _on: self._update_card_switches())
+        self._update_card_switches()             # the switch faces start in step with the settings
         self._stage_speed = None            # speed the stage reported it runs, this scan
 
         # ── SPLITTER ─────────────────────────────────────────────
@@ -699,7 +713,7 @@ class ScanWindow(QWidget):
         self.save_reference_btn.setEnabled(True)
         self.save_flatfield_btn.setEnabled(True)
         if calibration is not None:
-            self.open_reflectance_btn.setText(f"Open Reflectance Viewer  ({shape_str})")
+            self.open_reflectance_btn.setText(f"Open {self._calibrated_word(calibration.get('header'))} Viewer  ({shape_str})")
             self.open_reflectance_btn.setVisible(True)
             self.set_scan_calibration("applied", calibration.get("text") or "Last scan: calibrated")
         elif note is not None:
@@ -766,6 +780,13 @@ class ScanWindow(QWidget):
         return self.request_auto_calibration()
 
     def _on_auto_radiometric_toggled(self, checked):
+        last = getattr(self, "_radiometric_last", None)
+        if last is not None:                                  # the card follows the switch
+            self.set_radiometric_status(*last)
+        if getattr(self, "_flatfield_last", None) is not None:   # Ready / Applied follows radiometric
+            self.set_flatfield_status(*self._flatfield_last)
+        if hasattr(self, "flatfield_card"):
+            self._update_card_switches()
         if checked:
             self.request_auto_calibration()
         else:
@@ -802,6 +823,13 @@ class ScanWindow(QWidget):
         return (cube is not None and cube is self._pending_cube and self._calibrating_cube is cube
                 and (token is None or token == self._calibration_token))
 
+    @staticmethod
+    def _calibrated_word(header) -> str:
+        """``"Reflectance"``, or ``"Flat-fielded"`` for counts evened by the flat-field alone."""
+        header = header or {}
+        return "Flat-fielded" if header.get("flatfield_profile") and not header.get("reflectance_reference") \
+            else "Reflectance"
+
     def set_calibrated_cube(self, cube, calibrated, header: dict, text: str, token=None) -> bool:
         """The reflectance ``calibrated`` of ``cube`` is ready, with its export-header metadata.
 
@@ -815,7 +843,7 @@ class ScanWindow(QWidget):
         self._pending_calibrated = calibrated
         self._pending_calibration_header = dict(header or {})
         shape = "x".join(str(n) for n in calibrated.shape)
-        self.open_reflectance_btn.setText(f"Open Reflectance Viewer  ({shape})")
+        self.open_reflectance_btn.setText(f"Open {self._calibrated_word(header)} Viewer  ({shape})")
         self.open_reflectance_btn.setVisible(True)
         self.set_scan_calibration("applied", text)
         return True
@@ -946,8 +974,13 @@ class ScanWindow(QWidget):
                 ``Flat-field: `` is dropped (the card has that title).
             tooltip: Further lines for the card's tooltip.
         """
+        self._flatfield_last = (state, text, tooltip)
         value, color = {"applied": ("Applied", "green"), "on": ("Ready", "cyan")}.get(state, ("Off", "orange"))
         detail = text[len("Flat-field: "):] if text.startswith("Flat-field: ") else text
+        if not self.flatfield_enabled():
+            value, color, detail = "Off", "orange", "Switched off - " + detail
+        elif state == "on" and not self.auto_radiometric_box.isChecked():
+            value, color = "Applied", "green"     # the next scan is flat-fielded on its own
         self.flatfield_card.set_content(value, detail, color)
         has_profile = state in ("applied", "on")
         self.flatfield_card.set_clickable(has_profile)
@@ -963,17 +996,95 @@ class ScanWindow(QWidget):
     def set_radiometric_status(self, state: str, text: str):
         """Show the automatic radiometric calibration state: ``state`` ``"on"`` (green),
         ``"expired"`` (amber) or anything else (grey), with ``text``."""
+        self._radiometric_last = (state, text)
         color = {"on": "#43a047", "expired": "#fb8c00"}.get(state, "#7a8699")
         card = getattr(self, "radiometric_card", None)       # absent while the window is being built
         if card is not None:
             value, card_color = {"on": ("Applied", "green"), "expired": ("Expired", "red")}.get(
                 state, ("Off", "orange"))
             detail = text[len("Auto radiometric: "):] if text.startswith("Auto radiometric: ") else text
+            box = getattr(self, "auto_radiometric_box", None)
+            if box is not None and not box.isChecked():       # switched off on the card / box
+                value, card_color, detail = "Off", "orange", "Switched off - " + detail
             card.set_content(value, detail, card_color)
             card.set_clickable(state in ("on", "expired"))   # a reference to show
             card.setToolTip(card.toolTip() + ("\n\nClick to view the reference." if card.is_clickable() else ""))
         self.radiometric_status_label.setText(text)
         self.radiometric_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    # ── correction switches on the status cards ───────────────────
+    def _update_card_switches(self):
+        """Card values are switches except during a scan (corrections are fixed for a scan)."""
+        idle = not getattr(self, "_scanning", False)
+        self.correction_status.dark.set_switch_state(self.dark_panel.is_dark_enabled())
+        self.radiometric_card.set_switch_state(self.auto_radiometric_box.isChecked())
+        self.flatfield_card.set_switch_state(self.flatfield_enabled())
+        geo_now = getattr(self, "_geometry", {})
+        if not geo_now.get("smile", True):
+            self.correction_status.smile.set_switch_state(False)
+        elif geo_now.get("keystone_available"):
+            self.correction_status.smile.set_switch_state(True, "S+K" if geo_now.get("keystone", True) else "S")
+        else:
+            self.correction_status.smile.set_switch_state(True)
+        self.correction_status.dark.set_togglable(idle, "Click to switch dark + hot-pixel correction on / off")
+        self.radiometric_card.set_togglable(idle, "Click to switch automatic radiometric calibration on / off")
+        self.flatfield_card.set_togglable(idle, "Click to switch the flat-field on / off (next scan): on its own it "
+                                                "evens the counts along the slit; with radiometric calibration it is "
+                                                "part of the reflectance")
+        geo = getattr(self, "_geometry", {})
+        tip = ("Click: Smile + keystone -> Smile only -> Off" if geo.get("keystone_available")
+               else "Click to switch the smile correction on / off")
+        self.correction_status.smile.set_togglable(idle and bool(geo.get("model")), tip)
+
+    def update_geometry(self, status):
+        """Take the engine's geometry switches / model from a correction status dict (``'geometry'``)."""
+        geo = (status or {}).get("geometry")
+        if not geo:
+            return
+        self._geometry = dict(geo)
+        self._update_card_switches()
+
+    def _on_dark_card_switch(self):
+        if self._scanning:
+            return
+        self.dark_panel.set_dark_enabled(not self.dark_panel.is_dark_enabled())
+        self._update_card_switches()
+
+    def flatfield_enabled(self) -> bool:
+        """Flat-field card switch: the next scan is flat-fielded (on its own, or within reflectance)."""
+        return bool(getattr(self, "_flatfield_on", True))
+
+    def _on_flatfield_card_switch(self):
+        if self._scanning:
+            return
+        self._flatfield_on = not self.flatfield_enabled()
+        if self._flatfield_last is not None:
+            self.set_flatfield_status(*self._flatfield_last)
+        self._update_card_switches()
+
+    def _on_radiometric_card_switch(self):
+        if self._scanning or not self.auto_radiometric_box.isEnabled():
+            return
+        self.auto_radiometric_box.setChecked(not self.auto_radiometric_box.isChecked())
+
+    def _on_smile_card_switch(self):
+        """Cycle the geometry: smile + keystone -> smile only -> off (smile on / off for a smile-only model)."""
+        geo = self._geometry
+        if self._scanning or not geo.get("model"):
+            return
+        smile, keystone = bool(geo.get("smile", True)), bool(geo.get("keystone", True))
+        if geo.get("keystone_available"):
+            if smile and keystone:
+                smile, keystone = True, False
+            elif smile:
+                smile, keystone = False, False
+            else:
+                smile, keystone = True, True
+        else:
+            smile, keystone = (not smile), True
+        geo.update(smile=smile, keystone=keystone)
+        self._update_card_switches()
+        self.geometry_requested.emit(smile, keystone)
 
     # ── stage controls ───────────────────────────────────────────
 
@@ -1033,6 +1144,8 @@ class ScanWindow(QWidget):
         self.free_duration_spin.setEnabled(not active)   # the box stays lit for its countdown
         # chosen at Start for the whole scan (frames are calibrated while recorded)
         self.auto_radiometric_box.setEnabled(not active)
+        self._scanning = bool(active)
+        self._update_card_switches()
         splitter = self.settings_splitter
         if active and self._settings_sizes_before_scan is None:
             sizes = splitter.sizes()
@@ -1294,4 +1407,4 @@ class ScanWindow(QWidget):
             self._cal_win.close()
         if self._spectro_viewer is not None:                    
             self._spectro_viewer.close()
-        super().closeEvent(event)
+        super().closeEvent(event)

@@ -33,14 +33,17 @@ import time
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
-from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QThread, Qt, QRectF, pyqtSignal
 from PyQt5.QtWidgets import (
+    QBoxLayout,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QToolButton,
+    QScrollArea,
     QLabel,
     QProgressBar,
     QPushButton,
@@ -51,6 +54,9 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen
+
+from .keystone_spacing import spacing_variation
 
 from .core import auto_sat_level, load_frame
 from .ui_theme import colors
@@ -83,9 +89,16 @@ _PLOTS = [
     ("Deviation (magnified)", "Keystone_Deviation.png"),
     ("Distortion Grid", "Keystone_Distortion_Grid.png"),
     ("White", "Keystone_White.png"),
+    ("Spacing Uniformity", "Keystone_Spacing_Uniformity.png"),
 ]
-BEFORE_AFTER, SHIFT_MAP, RETRACE, PREVIEW, DEVIATION, GRID, WHITE = range(7)
-_TAB_ORDER = [PREVIEW, DEVIATION, GRID, BEFORE_AFTER, SHIFT_MAP, RETRACE, WHITE]
+BEFORE_AFTER, SHIFT_MAP, RETRACE, PREVIEW, DEVIATION, GRID, WHITE, SPACING = range(8)
+#: Workflow tabs of the plot area: two before Analyze (open with a target), two after it.
+TAB_SPECTROGRAM, TAB_TARGET, TAB_CORRECTION, TAB_GEOMETRY = range(4)
+_ANALYSIS_TABS = (TAB_CORRECTION, TAB_GEOMETRY)
+# canvas index -> its workflow tab
+_GROUP = {PREVIEW: TAB_TARGET, DEVIATION: TAB_TARGET, WHITE: TAB_TARGET,
+          BEFORE_AFTER: TAB_CORRECTION, RETRACE: TAB_CORRECTION, SPACING: TAB_CORRECTION,
+          SHIFT_MAP: TAB_GEOMETRY, GRID: TAB_GEOMETRY}
 
 _GOOD, _WARN, _BAD, _TODO, _BUSY, _OPTIONAL = "ok", "warn", "bad", "todo", "busy", "optional"
 #: state -> (glyph, colour key of :func:`modules.smile.ui_theme.colors`)
@@ -404,10 +417,13 @@ class _Step(QFrame):
         self.detail.setTextFormat(Qt.RichText)
         self.detail.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         grid.addWidget(self.detail, 1, 1)
+        # the step's explanation is its tooltip; the line shows only when the step needs action
         self.hint = QLabel(hint)
         self.hint.setWordWrap(True)
         self.hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.hint.setStyleSheet(f"color:{colors(self)['hint']}; font-size:8.5pt;")
+        self.hint.setVisible(False)
+        self.setToolTip(hint)
         grid.addWidget(self.hint, 2, 1)
         self.actions = QHBoxLayout()
         self.actions.setSpacing(4)
@@ -416,15 +432,18 @@ class _Step(QFrame):
         self.state = _TODO
         self.set_state(_TODO, "")
 
-    def set_state(self, state: str, detail: str, hint: Optional[str] = None) -> None:
-        """Status glyph + detail text (rich text)."""
+    def set_state(self, state: str, detail: str, hint: Optional[str] = None, tip: str = "") -> None:
+        """Status glyph + detail text (rich text); *tip*: the full notes behind a shortened detail."""
         self.state = state
         glyph, key = _GLYPH[state]
         colour = colors(self)[key]
         self.glyph.setText(f"<span style='font-size:15pt;font-weight:bold;color:{colour}'>{glyph}</span>")
         self.detail.setText(detail)
+        self.detail.setToolTip(tip)
         if hint is not None:
             self.hint.setText(hint)
+            self.setToolTip(hint)
+        self.hint.setVisible(state == _BAD and bool(self.hint.text()))
 
     def add(self, *widgets) -> None:
         for wdg in widgets:
@@ -438,6 +457,50 @@ def _chip(text: str, kind: str, tip: str = "") -> str:
     bg, fg, border = colors()[_CHIP.get(kind, "chip_info")]
     return text, f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; border-radius:9px; " \
                  f"padding:2px 9px; }}", tip
+
+
+class _TiltIndicator(QWidget):
+    """Sensor tilt pictogram: numerical angle is exact; visual angle is exaggerated.
+
+    A positive detector slope (row increases toward the right) looks clockwise
+    in Qt/image coordinates, never interpreted as a physical mounting command.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.angle = float("nan")
+        self.setMinimumSize(110, 55)
+        self.setToolTip("Detector image-coordinate estimate, not a physical inclinometer. "
+                        "The icon's angle is exaggerated for legibility.")
+
+    def set_angle(self, value) -> None:
+        self.angle = _num(value)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(QPen(QColor("#8eb7c4"), 1, Qt.DashLine))
+        p.drawLine(int(w * .1), h // 2, int(w * .9), h // 2)
+        p.save()
+        p.translate(w / 2, h / 2)
+        if np.isfinite(self.angle):
+            p.rotate(float(np.clip(self.angle * 12, -15, 15)))
+        p.setPen(QPen(QColor("#225074"), 2))
+        p.setBrush(QColor("#f6fbff"))
+        rect_w = min(104, w - 28)
+        rect_h = min(46, h - 15)
+        p.drawRoundedRect(QRectF(-rect_w / 2, -rect_h / 2, rect_w, rect_h), 5, 5)
+        p.setPen(QColor("#078d81"))
+        f = QFont(self.font())
+        f.setBold(True)
+        f.setPointSize(13)
+        p.setFont(f)
+        label = f"{self.angle:+.3f}°" if np.isfinite(self.angle) else "—"
+        p.drawText(QRectF(-rect_w / 2, -rect_h / 2, rect_w, rect_h), Qt.AlignCenter, label)
+        p.restore()
+
 
 
 # ------------------------------------------------------------------------------------- the page
@@ -512,20 +575,255 @@ class KeystonePage(QWidget):
         self._preview_again = False
         self._preview_error = ""
         self._build_ui()
-        self._clear_plots("Run Analyze Keystone to see the check plots", (BEFORE_AFTER, SHIFT_MAP, RETRACE, GRID))
+        self._clear_plots("Run Analyze Keystone to see the check plots", (BEFORE_AFTER, SHIFT_MAP, RETRACE, GRID, SPACING))
         self._clear_plots("Load or grab a line-target frame: its bars are drawn here at once", (PREVIEW, DEVIATION))
         self._clear_plots("No white frame (optional, recommended)", (WHITE,))
         self._refresh()
 
     # ------------------------------------------------------------------ UI
+    def _make_plot_panel(self, index: int, *, minimum: int = 200) -> QWidget:
+        """A retained Matplotlib canvas inside a compact dashboard panel.
+
+        Canvas indices and all per-plot exports remain stable for the host.
+        NavigationToolbar2QT is preserved for existing zoom/pan workflows.
+        """
+        from .widget import PlotCanvas
+        panel = QFrame()
+        panel.setObjectName("ksPlotPanel")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(7, 7, 7, 7)
+        lay.setSpacing(3)
+        bar = QHBoxLayout()
+        bar.setSpacing(5)
+        name = _PLOTS[index][0]
+        label = QLabel(name)
+        label.setObjectName("ksPlotTitle")
+        bar.addWidget(label)
+        if index == GRID:
+            self.chk_exaggerate = QCheckBox("Magnified (visual only)")
+            self.chk_exaggerate.setChecked(True)   # a ~1 px keystone is invisible at true scale; the title gives xG
+            self.chk_exaggerate.setToolTip("Enlarge the DRAWN distortion only; the calibration model, values and "
+                                           "corrected image do not change. The plot title shows actual display ×G.")
+            self.chk_exaggerate.toggled.connect(lambda _on: self._plot_grid(self.result))
+            bar.addWidget(self.chk_exaggerate)
+        bar.addStretch()
+        canvas = PlotCanvas(panel)
+        try:
+            from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
+            toolbar = NavigationToolbar2QT(canvas, panel, coordinates=True)
+            toolbar.setIconSize(toolbar.iconSize() * 0.75)
+            toolbar.setStyleSheet("QToolBar { border: 0px; }")
+            bar.addWidget(toolbar)
+        except Exception:  # matplotlib toolbar is optional
+            pass
+        btn_expand = QToolButton()
+        btn_expand.setText("Expand")
+        btn_expand.setCheckable(True)
+        btn_expand.setToolTip("Show this plot over the whole tab; press again to return to the dashboard.")
+        btn_expand.toggled.connect(lambda on, p=panel, b=btn_expand: self._expand_panel(p, b, on))
+        bar.addWidget(btn_expand)
+        btn_export = QPushButton("Export PNG")
+        btn_export.setToolTip("Export this plot at 300 dpi (not the entire dashboard).")
+        btn_export.clicked.connect(lambda _checked=False, i=index: self._on_export_plot(i))
+        bar.addWidget(btn_export)
+        lay.addLayout(bar)
+        canvas.setMinimumHeight(minimum)
+        lay.addWidget(canvas, stretch=1)
+        self._canvases[index] = canvas
+        self._tab_pages[index] = panel
+        return panel
+
+    def _expand_panel(self, panel: QWidget, button: QToolButton, on: bool) -> None:
+        """Let one plot panel fill its workflow tab (on) or put the dashboard back (off).
+
+        Every widget beside the panel's branch, up to the tab page, is hidden and given back; nothing
+        is rebuilt, so the canvas, its toolbar state and the host's canvas indices are untouched.
+        """
+        button.setText("Restore" if on else "Expand")
+        if not on:
+            hidden, stretched = getattr(panel, "_ks_expanded", ([], []))
+            for widget in hidden:
+                widget.setVisible(True)
+            for layout, widget in stretched:
+                layout.setStretchFactor(widget, 0)
+            panel._ks_expanded = ([], [])
+            return
+        hidden, stretched = [], []
+        w = panel
+        while w is not None and w not in getattr(self, "_group_pages", ()):
+            parent = w.parentWidget()
+            if parent is None:
+                break
+            if isinstance(parent, QSplitter):
+                layout, siblings = None, [parent.widget(i) for i in range(parent.count())]
+            else:
+                layout = parent.layout()
+                siblings = [layout.itemAt(i).widget() for i in range(layout.count())] if layout is not None else []
+            for s in siblings:
+                if s is not None and s is not w and not s.isHidden():   # not hidden by us or anyone else
+                    s.setVisible(False)
+                    hidden.append(s)
+            if isinstance(layout, QBoxLayout) and layout.indexOf(w) >= 0:
+                layout.setStretchFactor(w, 100)         # beats the trailing stretch of a scroll column
+                stretched.append((layout, w))
+            w = parent
+        panel._ks_expanded = (hidden, stretched)
+
+    @staticmethod
+    def _scroll_panels(*panels) -> QScrollArea:
+        """Secondary charts stay accessible on short displays without creating more tabs."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(2, 1, 2, 2)
+        layout.setSpacing(8)
+        for panel in panels:
+            layout.addWidget(panel)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return scroll
+
+    def _metric(self, title: str, *, tilt: bool = False):
+        frame = QFrame()
+        frame.setObjectName("ksMetric")
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(9, 7, 9, 6)
+        lay.setSpacing(2)
+        heading = QLabel(title)
+        heading.setObjectName("ksMetricHeading")
+        lay.addWidget(heading)
+        if tilt:
+            self.tilt_indicator = _TiltIndicator(frame)
+            lay.addWidget(self.tilt_indicator, stretch=1)
+            value = QLabel("Detector image coordinates · icon exaggerated")
+            value.setObjectName("ksMetricHint")
+        else:
+            value = QLabel("—")
+            value.setObjectName("ksMetricValue")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(value)
+        return frame, value
+
+    def _paint_metric(self, label: QLabel, key: str) -> None:
+        """Colour of a summary value: ``good`` / ``warn`` / ``bad`` for a verdict, ``text`` for a plain number."""
+        label.setStyleSheet(f"color:{colors(self)[key]};")
+
+    def _paint_banner(self, state: str) -> None:
+        bg, fg, border = colors(self)[_CHIP.get(state, "chip_info")]
+        self.lbl_ready.setStyleSheet(f"QLabel {{ background:{bg}; color:{fg}; border:1px solid {border}; "
+                                     f"border-radius:6px; padding:8px; }}")
+
+    #: Warnings that are standing reminders, not a verdict on this analysis (kept in the report).
+    _REMINDERS = ("Smile taken from the stored model",)
+
+    def _update_dashboard(self) -> None:
+        """Read-only UI values; never changes calibration or host Apply rules."""
+        if not hasattr(self, "metric_rms"):
+            return
+        p = self.preview or {}
+        result = self.result
+        bars = len(p.get("bars") or []) if p else 0
+        if result is not None:
+            bars = len(result.target_lines)
+        self.metric_bars.setText(f"{bars} detected" if bars else "—")
+        self.metric_rms.setText("—")
+        self.metric_shift.setText("—")
+        self.metric_fitter.setText("—")
+        self.metric_status.setText("Before analysis")
+        for lab in (self.metric_bars, self.metric_rms, self.metric_shift, self.metric_fitter, self.metric_status):
+            self._paint_metric(lab, "text")
+        if bars:
+            self._paint_metric(self.metric_bars, "good" if bars >= 3 else "bad")
+        self._paint_banner("info")
+        preview_tilt = _num((p.get("fan") or {}).get("tilt_deg"))
+        self.tilt_indicator.set_angle(preview_tilt)
+        self.metric_tilt_note.setText(
+            ("Right side lower" if preview_tilt > 0 else "Right side higher" if preview_tilt < 0 else "Level")
+            + " · displayed angle exaggerated" if np.isfinite(preview_tilt) else "Tilt pending")
+        cov = _num(p.get("coverage"))
+        self.coverage_value.setValue(round(100 * np.clip(cov, 0, 1)) if np.isfinite(cov) else 0)
+        self.coverage_note.setText(
+            f"Median traced bar width: {100*cov:.1f}%" if np.isfinite(cov) else
+            "Median traced bar width: not available")
+        if result is None:
+            self.lbl_spacing_status.setText("Spacing variation: after analysis (diagnostic only)")
+            self.lbl_ready.setText("TARGET INSPECTION  ·  Load / grab a line target, then Analyze Keystone")
+            return
+        q, s = result.qc, result.summary
+        rms = _num(q.get("retrace_target_median_bar_px"))
+        if not np.isfinite(rms):
+            rms = _num(q.get("retrace_target_rms_px"))
+        self.metric_rms.setText(f"{rms:.3f} px" if np.isfinite(rms) else "N/A")
+        self._paint_metric(self.metric_rms, "bad" if not np.isfinite(rms) or rms > 2 * RETRACE_WARN_PX else
+                           "warn" if rms > RETRACE_WARN_PX else "good")
+        shift = _num(s.get("keystone_max_px"))
+        self.metric_shift.setText(f"{shift:.2f} px" if np.isfinite(shift) else "N/A")
+        self.metric_fitter.setText(str(q.get("dy_fitter") or q.get("dy_model") or "Auto"))
+        self.metric_fitter.setToolTip(next((n for n in q.get("notes") or [] if n.startswith("keystone fitter")), ""))
+        angle = _num(s.get("tilt_deg"))
+        self.tilt_indicator.set_angle(angle)
+        self.metric_tilt_note.setText(
+            ("Right side lower" if angle > 0 else "Right side higher" if angle < 0 else "Level")
+            + " · detector image coordinates" if np.isfinite(angle) else "Tilt unavailable")
+        # Warnings are surfaced, not translated into a new Apply gate.
+        valid_rms = bool(np.isfinite(rms) and rms <= RETRACE_WARN_PX)
+        warnings = [w for w in (result.warnings or []) if not w.startswith(self._REMINDERS)]
+        n_rem = len(result.warnings or []) - len(warnings)
+        if not valid_rms:
+            status, state = "Review QC", ("bad" if not np.isfinite(rms) or rms > 2 * RETRACE_WARN_PX else _WARN)
+        elif warnings:
+            status, state = f"{len(warnings)} warning" + ("s" if len(warnings) > 1 else ""), _WARN
+        else:
+            status, state = "Re-trace PASS", _GOOD
+        self.metric_status.setText(status)
+        self._paint_metric(self.metric_status, {_GOOD: "good", _WARN: "warn"}.get(state, "bad"))
+        if state == _GOOD:
+            self.lbl_ready.setText("ANALYSIS COMPLETE  ·  Review the quality plots; Apply is controlled by the host"
+                                   + (f"  ·  {n_rem} reminder(s) in the technical report" if n_rem else ""))
+        else:
+            self.lbl_ready.setText("REVIEW REQUIRED  ·  " + (warnings[0] if warnings else
+                                                            "Re-trace residual above %.2f px: check the re-trace "
+                                                            "and coverage plots" % RETRACE_WARN_PX)
+                                   + (f"  (+{len(warnings) - 1} more in the technical report)" if len(warnings) > 1 else ""))
+        self._paint_banner(state if state in (_GOOD, _WARN) else _BAD)
+        if self._spacing_stats and np.isfinite(self._spacing_stats.get("after_rms", float("nan"))):
+            v = self._spacing_stats
+            self.lbl_spacing_status.setText(f"Spacing variation: {v['before_rms']:.3f} → {v['after_rms']:.3f} px RMS"
+                                            "  (relative to the reference column; diagnostic only)")
+        else:
+            self.lbl_spacing_status.setText("Spacing variation: not available")
+
     def _build_ui(self) -> None:
-        from .widget import PlotCanvas          # lazy: widget.py imports this module
-
+        from .widget import PlotCanvas  # imported here intentionally: widget.py references KeystonePage
+        from .spectrogram_view import SpectrogramView
+        self.setObjectName("keystonePage")
+        palette = colors(self)
+        page_bg = palette["page"]
+        card_bg = palette["card"]
+        fg = palette["text"]
+        border = palette["border"]
+        self.setStyleSheet(f"""
+            #keystonePage {{ background: {page_bg}; color: {fg}; }}
+            #ksTitleBar {{ background: #193d5c; border-radius: 7px; }}
+            #ksTitleBar QLabel {{ color: #ffffff; font-weight: 700; font-size: 12pt; }}
+            #ksMetric, #ksPlotPanel {{ background: {card_bg}; border: 1px solid {border}; border-radius: 8px; }}
+            #ksMetricHeading {{ color: {palette['muted']}; font-size: 9pt; }}
+            #ksMetricValue {{ color: {palette['good']}; font-size: 15pt; font-weight: bold; }}
+            #ksMetricHint {{ color: {palette['muted']}; font-size: 8pt; }}
+            #ksPlotTitle {{ color: {fg}; font-size: 10pt; font-weight: bold; border: none; }}
+            #ksReady {{ background: {palette['chip_warn'][0]}; color: {palette['chip_warn'][1]};
+                        border: 1px solid {palette['chip_warn'][2]}; border-radius: 6px; padding: 8px; }}
+            QTabWidget::pane {{ border: 1px solid {border}; border-radius: 8px; top: -1px; }}
+            QTabBar::tab {{ padding: 6px 14px; margin-right: 3px; }}
+            QTabBar::tab:selected {{ border-bottom: 3px solid #0b9398; }}
+        """)
         root = QVBoxLayout(self)
-        root.setContentsMargins(2, 2, 2, 2)
-        root.setSpacing(3)
+        root.setContentsMargins(5, 5, 5, 5)
+        root.setSpacing(6)
 
-        # buttons (created here, placed in their step rows)
         self.btn_load_target = QPushButton("Load target...")
         self.btn_load_target.setToolTip("Line-target frame(s). Several files are averaged only if they show the "
                                         "same scene (a static target); otherwise they are refused.")
@@ -557,14 +855,13 @@ class KeystonePage(QWidget):
                                     "now; smile and keystone are fitted together.")
         self.combo_smile.activated.connect(self._on_smile_choice)
         self.btn_analyze = QPushButton("Analyze Keystone")
-        self.btn_analyze.setStyleSheet("font-weight:bold;")
+        self.btn_analyze.setStyleSheet("font-weight: bold;")
         self.btn_analyze.clicked.connect(lambda: self.analyze())
         self.busy = QProgressBar()
         self.busy.setRange(0, 0)
-        self.busy.setFixedWidth(90)
+        self.busy.setFixedWidth(65)
         self.busy.setVisible(False)
         self.btn_apply = QPushButton("Apply smile + keystone")
-        self.btn_apply.setStyleSheet("font-weight:bold;")
         self.btn_apply.setToolTip("Store ONE smile + keystone model for the target's camera setting (the previous "
                                   "file is kept in history/) and load it into the live HSI session.")
         self.btn_apply.clicked.connect(self.applyKeystoneRequested.emit)
@@ -575,8 +872,13 @@ class KeystonePage(QWidget):
         split = QSplitter(Qt.Horizontal)
         left = QWidget()
         lay = QVBoxLayout(left)
-        lay.setContentsMargins(0, 0, 4, 0)
-        lay.setSpacing(4)
+        lay.setContentsMargins(1, 1, 5, 1)
+        lay.setSpacing(6)
+        workflow_title = QLabel("WORKFLOW")
+        workflow_title.setObjectName("ksTitleBar")
+        workflow_title.setStyleSheet("QLabel { background:#193d5c;color:white;padding:9px;font-weight:bold;"
+                                     "border-radius:6px; }")
+        lay.addWidget(workflow_title)
         self.step_smile = _Step(1, "Smile model", "")
         self.step_smile.head.addWidget(self.combo_smile)
         self.step_target = _Step(2, "Line target (fore-optics on)",
@@ -595,22 +897,47 @@ class KeystonePage(QWidget):
         for step in (self.step_smile, self.step_target, self.step_white, self.step_analyze, self.step_apply):
             step.finish()
             lay.addWidget(step)
-
-        self.lbl_frames = QLabel()                     # frame summary (kept for scripts / tests; steps show it)
+        self.lbl_frames = QLabel()
         self.lbl_frames.setVisible(False)
         lay.addWidget(self.lbl_frames)
+        self.btn_report = QToolButton()
+        self.btn_report.setText("Technical report ▸")
+        self.btn_report.setCheckable(True)
+        self.btn_report.setChecked(False)
+        self.btn_report.setToolTip("Show detailed fitting and QC diagnostics (kept for advanced users)")
+        self.btn_report.toggled.connect(self._toggle_report)
+        lay.addWidget(self.btn_report)
         self.report = QTextEdit()
         self.report.setReadOnly(True)
         self.report.setLineWrapMode(QTextEdit.WidgetWidth)
         self.report.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 8.5pt;")
-        self.report.setMinimumHeight(80)
-        lay.addWidget(self.report, stretch=1)
+        self.report.setMinimumHeight(180)
+        self.report.setVisible(False)
+        lay.addWidget(self.report, stretch=4)
+        lay.addStretch(1)
+        self.btn_report.setChecked(True)                # the QC numbers stay in view; collapse when not needed
         split.addWidget(left)
 
         right = QWidget()
         rlay = QVBoxLayout(right)
-        rlay.setContentsMargins(4, 0, 0, 0)
-        rlay.setSpacing(3)
+        rlay.setContentsMargins(3, 0, 0, 0)
+        rlay.setSpacing(6)
+        title = QLabel("CALIBRATION QUALITY SUMMARY")
+        title.setStyleSheet("QLabel { background:#193d5c;color:white;padding:8px;font-weight:bold;"
+                            "border-radius:6px; }")
+        rlay.addWidget(title)
+        metrics = QHBoxLayout()
+        metrics.setSpacing(5)
+        a, self.metric_rms = self._metric("Re-trace RMS")
+        b, self.metric_bars = self._metric("Target bars")
+        c, self.metric_shift = self._metric("Max Keystone")
+        d, self.metric_fitter = self._metric("Fitter")
+        e, self.metric_tilt_note = self._metric("Sensor tilt", tilt=True)
+        f, self.metric_status = self._metric("Quality status")
+        for frame, stretch in ((a, 1), (b, 1), (c, 1), (d, 2), (e, 2), (f, 2)):
+            metrics.addWidget(frame, stretch)
+        rlay.addLayout(metrics)
+        # Retain all original preview/QC chips; the preview worker updates them.
         chips = QHBoxLayout()
         chips.setSpacing(5)
         self._chips: List[QLabel] = []
@@ -619,67 +946,129 @@ class KeystonePage(QWidget):
             chip.setVisible(False)
             chips.addWidget(chip)
             self._chips.append(chip)
-        chips.addStretch()
+        chips.addStretch(1)
         rlay.addLayout(chips)
-        self.plot_tabs = QTabWidget()
+        # Six original preview/analysis plots, the separate SpectrogramView,
+        # and one new read-only spacing diagnostic are grouped in THREE tabs.
         self._canvases: List[PlotCanvas] = [None] * len(_PLOTS)
         self._tab_pages = [None] * len(_PLOTS)
-        for index in _TAB_ORDER:
-            name, _file = _PLOTS[index]
-            page = QWidget(self.plot_tabs)
-            play = QVBoxLayout(page)
-            play.setContentsMargins(2, 2, 2, 2)
-            export_row = QHBoxLayout()
-            if index == GRID:
-                self.chk_exaggerate = QCheckBox("Exaggerate the displacement")
-                self.chk_exaggerate.setChecked(True)
-                self.chk_exaggerate.setToolTip("Draw the grid displacement from straight times G so small "
-                                               "bends are visible (off = true scale)")
-                self.chk_exaggerate.toggled.connect(lambda _on: self._plot_grid(self.result))
-                export_row.addWidget(self.chk_exaggerate)
-            export_row.addStretch()
-            canvas = PlotCanvas(page)
-            try:
-                from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT
-                toolbar = NavigationToolbar2QT(canvas, page, coordinates=True)
-                toolbar.setIconSize(toolbar.iconSize() * 0.8)
-                toolbar.setStyleSheet("QToolBar { border: 0px; }")
-                export_row.addWidget(toolbar)
-            except Exception:  # noqa: BLE001  (no toolbar: plots still work)
-                pass
-            button = QPushButton("Export PNG")
-            button.setToolTip("Export this plot as a presentation-quality PNG (300 dpi).")
-            button.clicked.connect(lambda _checked=False, i=index: self._on_export_plot(i))
-            export_row.addWidget(button)
-            play.addLayout(export_row)
-            self._canvases[index] = canvas
-            self._tab_pages[index] = page
-            play.addWidget(canvas, stretch=1)
-            self.plot_tabs.addTab(page, name)
-        from .spectrogram_view import SpectrogramView
-        self.spectrogram = SpectrogramView(self.plot_tabs)
-        self.plot_tabs.insertTab(0, self.spectrogram, "Spectrogram")
-        self.plot_tabs.setCurrentIndex(0)
+        self.plot_tabs = QTabWidget()
+        self.plot_tabs.setDocumentMode(True)
+        self.plot_tabs.tabBar().setElideMode(Qt.ElideNone)     # never cut a tab name
+
+        # Spectrogram: the interactive bar view over the whole tab (bar selection, dy(lambda)).
+        spectro = QWidget()
+        slay = QVBoxLayout(spectro)
+        slay.setContentsMargins(4, 4, 4, 4)
+        self.spectrogram = SpectrogramView(spectro)
+        slay.addWidget(self.spectrogram)
+        self.plot_tabs.addTab(spectro, "1  Spectrogram")
+
+        # Target check: the preview over the full width; deviation and white below it, side by side.
+        target = QWidget()
+        tlay = QVBoxLayout(target)
+        tlay.setContentsMargins(4, 4, 4, 4)
+        target_split = QSplitter(Qt.Vertical)
+        target_split.addWidget(self._make_plot_panel(PREVIEW, minimum=260))
+        lower = QSplitter(Qt.Horizontal)
+        lower.addWidget(self._make_plot_panel(DEVIATION, minimum=220))
+        lower.addWidget(self._make_plot_panel(WHITE, minimum=220))
+        lower.setStretchFactor(0, 3)
+        lower.setStretchFactor(1, 2)
+        lower.setSizes([600, 400])
+        target_split.addWidget(lower)
+        target_split.setStretchFactor(0, 1)
+        target_split.setStretchFactor(1, 1)
+        tlay.addWidget(target_split)
+        self.plot_tabs.addTab(target, "2  Target check")
+
+        # Correction: original Before/After and Re-trace are retained; spacing added.
+        correction = QWidget()
+        clay = QHBoxLayout(correction)
+        clay.setContentsMargins(4, 4, 4, 4)
+        correction_split = QSplitter(Qt.Horizontal)
+        correction_split.addWidget(self._make_plot_panel(BEFORE_AFTER, minimum=400))
+        spacing_panel = self._make_plot_panel(SPACING, minimum=250)
+        retrace_panel = self._make_plot_panel(RETRACE, minimum=440)    # two stacked plots (bars, lamp lines)
+        correction_split.addWidget(self._scroll_panels(spacing_panel, retrace_panel))
+        correction_split.setStretchFactor(0, 3)
+        correction_split.setStretchFactor(1, 2)
+        correction_split.setSizes([560, 440])
+        clay.addWidget(correction_split)
+        self.plot_tabs.addTab(correction, "3  Correction result")
+
+        # Geometry: displacement heatmap / original grid together, not separate tabs.
+        geometry = QWidget()
+        glay = QHBoxLayout(geometry)
+        glay.setContentsMargins(4, 4, 4, 4)
+        geometry_split = QSplitter(Qt.Horizontal)
+        geometry_split.addWidget(self._make_plot_panel(SHIFT_MAP, minimum=400))
+        grid_panel = self._make_plot_panel(GRID, minimum=310)
+        coverage_panel = QFrame()
+        coverage_panel.setObjectName("ksPlotPanel")
+        cov_lay = QVBoxLayout(coverage_panel)
+        self.coverage_note = QLabel("Median traced bar width: not available")
+        self.coverage_value = QProgressBar()
+        self.coverage_value.setRange(0, 100)
+        self.coverage_value.setValue(0)
+        self.coverage_value.setFormat("%p%")
+        self.coverage_value.setToolTip("Median fraction of spectral width traced by each bar; "
+                                       "not a measured 2D area fraction")
+        cov_lay.addWidget(self.coverage_note)
+        cov_lay.addWidget(self.coverage_value)
+        tilt_note = QLabel("Detector tilt is an optical/image-coordinate estimate, not an inclinometer. "
+                           "The pictogram above is exaggerated for readability.")
+        tilt_note.setWordWrap(True)
+        tilt_note.setStyleSheet(f"color:{palette['muted']}; padding:6px;")
+        geometry_split.addWidget(self._scroll_panels(grid_panel, coverage_panel, tilt_note))
+        geometry_split.setStretchFactor(0, 3)
+        geometry_split.setStretchFactor(1, 2)
+        geometry_split.setSizes([560, 440])
+        glay.addWidget(geometry_split)
+        self.plot_tabs.addTab(geometry, "4  Geometry analysis")
+        self._group_pages = (spectro, target, correction, geometry)     # where an expanded plot panel stops
+        self.plot_tabs.setCurrentIndex(TAB_SPECTROGRAM)
+        for tab in _ANALYSIS_TABS:
+            self.plot_tabs.setTabEnabled(tab, False)
         rlay.addWidget(self.plot_tabs, stretch=1)
+
+        self.lbl_spacing_status = QLabel("Spacing variation: after analysis (diagnostic only)")
+        self.lbl_spacing_status.setStyleSheet(f"color:{palette['muted']};")
+        rlay.addWidget(self.lbl_spacing_status)
         split.addWidget(right)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([440, 1000])
+        split.setSizes([360, 1140])
         root.addWidget(split, stretch=1)
-
+        self.lbl_ready = QLabel("TARGET INSPECTION  ·  Load / grab a target, then Analyze Keystone")
+        self.lbl_ready.setObjectName("ksReady")
+        self.lbl_ready.setWordWrap(True)
+        root.addWidget(self.lbl_ready)
         self.lbl_state = QLabel()
         self.lbl_state.setWordWrap(True)
-        self.lbl_state.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.lbl_state.setStyleSheet(f"color:{colors(self)['text']};")
+        self.lbl_state.setStyleSheet(f"color:{palette['muted']};")
         root.addWidget(self.lbl_state)
+        self._spacing_stats = None
         self.report.setPlainText("Keystone: with the fore-lens ON, grab or load a line target (bars across the "
                                  "slit). The smile model stored for this bin (measured with the lens OFF and "
                                  "applied on the Smile tab) is used as it is; Analyze fits only the keystone, "
                                  "Apply writes ONE smile + keystone model.")
 
+    def _toggle_report(self, on: bool) -> None:
+        self.btn_report.setText("Technical report ▾" if on else "Technical report ▸")
+        self.report.setVisible(on)
+
     def show_plot(self, index: int) -> None:
-        """Bring one plot tab (canvas index) to the front."""
-        self.plot_tabs.setCurrentWidget(self._tab_pages[index])
+        """Navigate to the group containing an existing canvas index."""
+        self.plot_tabs.setCurrentIndex(_GROUP.get(index, TAB_SPECTROGRAM))
+
+    def _sync_analysis_tabs(self) -> None:
+        """Correction / geometry tabs open only with an analysis result (a loaded model opens geometry)."""
+        enabled = self.result is not None
+        for tab in _ANALYSIS_TABS:
+            self.plot_tabs.setTabEnabled(tab, enabled)
+        if not enabled and self.plot_tabs.currentIndex() in _ANALYSIS_TABS:
+            self.plot_tabs.setCurrentIndex(TAB_SPECTROGRAM)
 
     # ------------------------------------------------------------- context
     def set_calibration_source(self, store, current_setting: Optional[Callable[[], object]] = None) -> None:
@@ -743,7 +1132,9 @@ class KeystonePage(QWidget):
         self.result_setting = None
         self.result_source = None
         self._applied = ""
-        self._clear_plots("Run Analyze Keystone to see the check plots", (BEFORE_AFTER, SHIFT_MAP, RETRACE, GRID))
+        self._clear_plots("Run Analyze Keystone to see the check plots", (BEFORE_AFTER, SHIFT_MAP, RETRACE, GRID, SPACING))
+        self._spacing_stats = None
+        self._sync_analysis_tabs()
         if reason:
             self.report.setPlainText(reason)
         self._refresh(reason)
@@ -807,12 +1198,15 @@ class KeystonePage(QWidget):
         setattr(self, "_%s_source" % kind, source if frame is not None else "")
         setattr(self, "_%s_dark" % kind, dark_applied if frame is not None else None)
 
+    _DARK_TIP = ("No dark subtracted: the host's dark correction was off or had no dark for this bin. "
+                 "Load a dark in the main window and grab again.")
+
     def _dark_note(self, kind: str) -> str:
-        """Warning line for a grabbed frame the host did not dark-subtract ("" otherwise)."""
+        """Short warning line for a grabbed frame the host did not dark-subtract ("" otherwise);
+        the full advice is ``_DARK_TIP`` (the step's tooltip)."""
         if getattr(self, "_%s_dark" % kind, None) is not False:
             return ""
-        return (f"<br><span style='color:{_c('warn')}'>No dark subtracted: the host's dark correction was off "
-                "or had no dark for this bin. Load a dark in the main window and grab again.</span>")
+        return f"<br><span style='color:{_c('warn')}'>No dark subtracted (hover for details)</span>"
 
     def set_frame(self, kind: str, frame: Optional[np.ndarray], setting=None, source: str = "",
                   dark_applied: Optional[bool] = None) -> None:
@@ -841,7 +1235,7 @@ class KeystonePage(QWidget):
         self._start_preview()
         if frame is not None:
             if self.target is not None:
-                self.plot_tabs.setCurrentWidget(self.spectrogram)
+                self.plot_tabs.setCurrentIndex(TAB_SPECTROGRAM)
             else:
                 self.show_plot(WHITE)
         self._refresh()
@@ -1298,7 +1692,9 @@ class KeystonePage(QWidget):
         self._plot_shift_map(k.map_y, k.model.dy.box, k.row_margin, k.margin)
         self._plot_retrace(k.qc)
         self._plot_grid(k)
-        self.show_plot(GRID)
+        self._plot_spacing(k)
+        self._sync_analysis_tabs()
+        self.show_plot(BEFORE_AFTER)
         s = k.summary
         self._status(f"Keystone: max {s['keystone_max_px']:.2f} px, tilt {s['tilt_deg']:.3f} deg, "
                      f"{len(k.warnings)} warning(s)")
@@ -1353,8 +1749,10 @@ class KeystonePage(QWidget):
         self.result_setting = None
         self.result_source = None
         self._applied = ""
-        self._clear_plots("Loaded model: the target plots need Analyze Keystone", (BEFORE_AFTER, SHIFT_MAP, RETRACE,
-                                                                                    GRID))
+        self._clear_plots("Loaded model: target and spacing plots need Analyze Keystone", (BEFORE_AFTER, SHIFT_MAP,
+                                                                                    RETRACE, GRID, SPACING))
+        self._spacing_stats = None
+        self._sync_analysis_tabs()
         if not keystone:
             self.report.setPlainText(f"Loaded model {source}: smile only (no keystone).")
             self._refresh()
@@ -1367,6 +1765,7 @@ class KeystonePage(QWidget):
         model = keystone.get("model") or {}
         dy = (model.get("dy") or {}).get("box")
         if map_y is not None:
+            self.plot_tabs.setTabEnabled(TAB_GEOMETRY, True)
             self._plot_shift_map(np.asarray(map_y), dy, keystone.get("row_margin") or (0, 0),
                                  keystone.get("margin") or (0, 0))
         self._plot_retrace(keystone.get("qc") or {})
@@ -1513,8 +1912,8 @@ class KeystonePage(QWidget):
         elif self.btn_apply.isEnabled():
             setting = self.result_setting
             where = f" for bin {setting.camera_bin}" if setting is not None else ""
-            self.step_apply.set_state(_TODO, f"Ready: store the smile + keystone model{where} "
-                                             "(previous file kept in history/).")
+            self.step_apply.set_state(_TODO, f"Ready{where}",
+                                      tip="Stores the smile + keystone model; the previous file is kept in history/.")
         else:
             self.step_apply.set_state(_WARN, "Apply needs a known camera setting (grab the target from the "
                                              "camera) - or use Save Matrix.")
@@ -1543,40 +1942,46 @@ class KeystonePage(QWidget):
         state, detail, hint = self._smile_text()
         self.step_smile.set_state(state, detail, hint)
         # step 2: target
+        muted = lambda s: f"<span style='color:{_c('muted')}'>{s}</span>"
         if self.target is None:
             self.step_target.set_state(_TODO, "None yet.")
         else:
             h, w = self.target.shape
             src = html.escape(self._target_source or "array")
+            source = muted(f"{w}x{h} &middot; {src}")
+            dark = self._dark_note("target")
             if self._preview_worker is not None:
-                self.step_target.set_state(_BUSY, f"{w}x{h} ({src})<br>Detecting bars...")
+                self.step_target.set_state(_BUSY, f"Detecting bars...<br>{source}")
             elif self.preview is not None:
                 p = self.preview
                 n = len(p["bars"])
                 cov = p.get("coverage", float("nan"))
-                extra = f", coverage {100 * cov:.0f} %" if np.isfinite(cov) else ""
-                extra += f", saturated {p.get('saturated_pct', 0):.2f} %"
+                extra = f" &middot; coverage {100 * cov:.0f} %" if np.isfinite(cov) else ""
+                sat = p.get("saturated_pct", 0)
+                extra += f" &middot; saturated {sat:.2f} %" if sat > 0 else ""
                 state = _GOOD if n >= 5 else (_WARN if n >= 3 else _BAD)
-                text = f"{w}x{h} ({src})<br><b>{n} bars found</b>{extra}"
+                text = f"<b>{n} bars found</b>{extra}<br>{source}"
+                tips = []
                 if p.get("error"):
                     text += f"<br><span style='color:{_c('bad')}'>{html.escape(p['error'])}</span>"
                 if p.get("alt"):
                     text += (f"<br><span style='color:{_c('warn')}'>Try 'Bars: {p['alt'][0]}' "
                              f"({p['alt'][1]} bars found that way)</span>")
                 span_warns = p.get("span_warnings") or []
-                if span_warns and state == _GOOD:
-                    state = _WARN
-                for msg in span_warns:
-                    text += f"<br><span style='color:{_c('warn')}'>{html.escape(msg)}</span>"
-                note = self._dark_note("target")
-                if note and state == _GOOD:
-                    state = _WARN
-                self.step_target.set_state(state, text + note)
+                if span_warns:                           # long advice: one line here, the text as tooltip
+                    state = _WARN if state == _GOOD else state
+                    tips += span_warns
+                    text += (f"<br><span style='color:{_c('warn')}'>Bars missing near the slit ends in part "
+                             f"of the spectrum (hover for details)</span>")
+                if dark:
+                    state = _WARN if state == _GOOD else state
+                    tips.append(self._DARK_TIP)
+                self.step_target.set_state(state, text + dark, tip="\n\n".join(tips))
             elif self._preview_error:
-                self.step_target.set_state(_BAD, f"{w}x{h} ({src})<br>" + html.escape(self._preview_error))
+                self.step_target.set_state(_BAD, html.escape(self._preview_error) + f"<br>{source}")
             else:
-                note = self._dark_note("target")
-                self.step_target.set_state(_WARN if note else _GOOD, f"{w}x{h} ({src})" + note)
+                self.step_target.set_state(_WARN if dark else _GOOD, source + dark,
+                                           tip=self._DARK_TIP if dark else "")
         # step 3: white
         if self.white is None:
             self.step_white.set_state(_OPTIONAL, "None (optional, recommended).")
@@ -1584,12 +1989,13 @@ class KeystonePage(QWidget):
             h, w = self.white.shape
             lit = ""
             if self.preview is not None and np.isfinite(self.preview.get("lit_pct", float("nan"))):
-                lit = f", lit {self.preview['lit_pct']:.0f} % of the frame"
+                lit = f"lit {self.preview['lit_pct']:.0f} % of the frame<br>"
             mismatch = self.target is not None and self.white.shape != self.target.shape
-            note = self._dark_note("white")
-            self.step_white.set_state(_WARN if mismatch or note else _GOOD,
-                                      f"{w}x{h} ({html.escape(self._white_source or 'array')}){lit}"
-                                      + ("<br>size differs from the target" if mismatch else "") + note)
+            dark = self._dark_note("white")
+            self.step_white.set_state(_WARN if mismatch or dark else _GOOD,
+                                      lit + muted(f"{w}x{h} &middot; {html.escape(self._white_source or 'array')}")
+                                      + (f"<br><span style='color:{_c('warn')}'>size differs from the target</span>"
+                                         if mismatch else "") + dark, tip=self._DARK_TIP if dark else "")
         # step 4: analyze
         if busy:
             self.step_analyze.set_state(_BUSY, "Running" + (" (keystone onto the stored smile)..."
@@ -1601,14 +2007,13 @@ class KeystonePage(QWidget):
             real = [x for x in self.result.warnings if not x.startswith("Smile taken from the stored model")]
             self.step_analyze.set_state(
                 _GOOD if not real or (len(real) == 1 and real[0].startswith("No white frame")) else _WARN,
-                f"Keystone max <b>{s['keystone_max_px']:.2f} px</b>, tilt {s['tilt_deg']:.3f} deg ({onto}); "
-                f"{n_warn} warning(s) - see the report and plots")
+                f"Done ({onto}): keystone max <b>{s['keystone_max_px']:.2f} px</b>, tilt {s['tilt_deg']:.3f}&deg;",
+                tip="%d warning(s); the quality summary, banner and technical report give them" % n_warn)
         elif self._failure and ok:
             self.step_analyze.set_state(_BAD, html.escape("Failed: " + self._failure))
         elif ok:
-            self.step_analyze.set_state(_TODO, "Ready: press Analyze Keystone"
-                                        + (" (keystone onto the stored smile)." if mode == "stored"
-                                           else " (smile + keystone joint fit)."))
+            self.step_analyze.set_state(_TODO, "Ready" + (" (keystone onto the stored smile)" if mode == "stored"
+                                                         else " (smile + keystone joint fit)"))
         else:
             self.step_analyze.set_state(_TODO, html.escape(why))
         if self.result is None:
@@ -1629,6 +2034,7 @@ class KeystonePage(QWidget):
             self.lbl_state.setText("Keystone analysis failed: " + self._failure)
         else:
             self.lbl_state.setText("Ready: Analyze Keystone")
+        self._update_dashboard()
 
     # ------------------------------------------------------------- plots
     @staticmethod
@@ -2030,6 +2436,40 @@ class KeystonePage(QWidget):
         ax2.grid(alpha=.2)
         if lamps:
             ax2.legend(fontsize=7)
+        _draw(canvas)
+
+    def _plot_spacing(self, k) -> None:
+        """Spacing change of adjacent bars against the reference column, from the MEASURED centres.
+
+        An inspection aid only (:func:`modules.smile.keystone_spacing.spacing_variation`): it does
+        not assert the physical target's bar pitch, and never alters the model or marks a result
+        safe to Apply.
+        """
+        canvas = self._canvases[SPACING]
+        canvas.clear()
+        self._spacing_stats = None
+        if k is None or len(k.target_lines) < 2:
+            self._clear_plots("Need at least two traced target bars for spacing variation", (SPACING,))
+            return
+        try:
+            stats = spacing_variation(k.target_lines, k.model)
+        except (ValueError, RuntimeError, FloatingPointError) as exc:
+            self._clear_plots("Spacing variation unavailable: " + str(exc), (SPACING,))
+            return
+        self._spacing_stats = stats
+        if not stats["points"]:
+            self._clear_plots("Too few overlapping bar positions", (SPACING,))
+            return
+        ax = canvas.fig.add_subplot(111)
+        ax.plot(stats["x"], stats["before"], lw=1.6, color="#e67e22",
+                label=f"Before ({stats['before_rms']:.3f} px RMS)")
+        ax.plot(stats["x"], stats["after"], lw=1.6, color="#088e82",
+                label=f"After ({stats['after_rms']:.3f} px RMS)")
+        ax.axhline(0, color="#6b7d8c", lw=.8, ls="--")
+        ax.set(xlabel="Spectral column", ylabel="Spacing change (px)",
+               title="Bar spacing vs reference column, measured centres (%d pairs)" % stats["pairs"])
+        ax.grid(alpha=.18)
+        ax.legend(loc="best", fontsize=7)
         _draw(canvas)
 
     def _on_export_plot(self, index: int) -> None:

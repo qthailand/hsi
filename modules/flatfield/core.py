@@ -32,7 +32,7 @@ import warnings
 
 import numpy as np
 
-__all__ = ["compute_flatfield", "apply_flatfield", "check_profile", "DEFAULT_MIN_COVERAGE",
+__all__ = ["compute_flatfield", "apply_flatfield", "evening_factors", "check_profile", "DEFAULT_MIN_COVERAGE",
            "DEFAULT_MAX_SATURATED", "DEFAULT_STEP_THRESHOLD"]
 
 #: Smallest share of the slit rows the target must cover (the rest is interpolated or held).
@@ -298,6 +298,19 @@ def check_profile(profile, lines=None, bands=None):
         raise ValueError(f"Flat-field profile for {profile.shape[1]} bands does not fit {int(bands)} bands: "
                          "make one at the same camera setting.")
     return profile
+
+
+def evening_factors(profile):
+    """Factors ``1 / profile`` (float32, read-only) that even counts along the slit when multiplied
+    in (frame by frame, as radiometric factors are): the same result as :func:`apply_flatfield`.
+
+    Raises:
+        ValueError: The profile is not finite and positive everywhere.
+    """
+    profile = check_profile(profile)
+    factors = np.ascontiguousarray(1.0 / np.asarray(profile, np.float64), dtype=np.float32)
+    factors.setflags(write=False)
+    return factors
 
 
 def apply_flatfield(cube, profile, rows_per_chunk=64, progress_callback=None):

@@ -53,6 +53,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from scipy import sparse
+from scipy.interpolate import BSpline
 from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import find_peaks
 
@@ -62,7 +64,8 @@ from .debug_log import logged_analysis
 __all__ = [
     "KEYSTONE_SCHEMA", "TargetLine", "GeometrySurface", "GeometryModel", "KeystoneAnalysis",
     "normalize_target", "detect_polarity", "frames_same_scene", "trace_target_lines", "bar_coverage",
-    "coverage_warnings", "lamp_points_from_analysis", "fit_geometry",
+    "coverage_warnings", "lamp_points_from_analysis", "fit_geometry", "SplineSurface", "TensorSurface",
+    "recover_bar_gaps", "keystone_candidates", "select_keystone_fitter",
     "analyze_keystone", "analyze_keystone_from_smile", "row_margin_from_map", "keystone_report",
 ]
 
@@ -79,6 +82,25 @@ MIN_LAMP_COVERAGE = 0.5
 RETRACE_WARN_PX = 0.25
 #: Highest keystone degree along the slit tried by ``dy_ydeg="auto"``.
 MAX_DY_YDEG = 4
+#: Keystone model: ``"auto"`` (default: the candidate fitter with the fewest held-out bar errors over
+#: 1 px, see :func:`select_keystone_fitter`), a candidate name (:func:`keystone_candidates`),
+#: ``"spline"`` (= ``"anchored_bspline"``) or ``"poly"`` (the earlier polynomial with its slit degree
+#: chosen by leave-one-bar-out). A low-order polynomial cannot bend where the bars are lost (a weak /
+#: defocused part of the spectrum) and extrapolates them along a straight line; on a real target
+#: (bin 2, 1024 x 1280) that was 3-7 px off the gap-recovered bar centres, which the spline follows.
+DEFAULT_DY_MODEL = "auto"
+#: Automatic fitter choice: folds of whole bars held out, and the error counted (px).
+SELECT_FOLDS = 3
+SELECT_ERROR_PX = 1.0
+#: Spline knot spacing (px) along the spectrum / the slit, and the most intervals per axis.
+SPLINE_KNOT_PX = 64.0
+SPLINE_MAX_INTERVALS = (20, 16)                 # (along the spectrum, along the slit)
+#: Spline smoothness: weight of the second-difference penalty per 10 000 units of point weight.
+SPLINE_REG = 0.04
+#: Weight of a gap-recovered bar centre in the keystone fit (a tracer centre weighs 1).
+RECOVERED_WEIGHT = 0.35
+#: Smallest row spacing of the corrected map (d map_y / d Y) before a warning (a fold is <= 0).
+ROW_JACOBIAN_WARN = 0.5
 
 
 # ----------------------------------------------------------------------------------------------- basis
@@ -92,6 +114,9 @@ class GeometrySurface:
     (``y_rule="linear"``), or is clamped too (``y_rule="hold"``, the rule of a stored smile-only
     :class:`~modules.smile.surface.Surface2D`).
     """
+
+    #: Robust weights in the keystone solvers: Huber with rejection (the earlier polynomial behaviour).
+    robust = "huber"
 
     def __init__(self, xpows, ypows, x0, sx, y0, sy, coef=None, box=None, y_rule="linear"):
         self.xpows = [int(v) for v in xpows]
@@ -193,6 +218,232 @@ class GeometrySurface:
                    0.5 * (y0 + y1), max(1e-9, 0.5 * (y1 - y0)), coef, box, y_rule="hold")
 
 
+def _clamped_knots(lo: float, hi: float, n: int) -> np.ndarray:
+    br = np.linspace(float(lo), float(hi), int(n) + 1)
+    return np.r_[np.repeat(br[0], 3), br, np.repeat(br[-1], 3)]
+
+
+def _bspline_basis(v, t: np.ndarray) -> sparse.csr_matrix:
+    return BSpline.design_matrix(np.asarray(v, float).ravel(), t, 3, extrapolate=True)
+
+
+class SplineSurface:
+    """Keystone ``f(X, Y) = sum_jk C[j, k] * By_j(Y) * (Bx_k(X) - Bx_k(x_ref))``: cubic B-splines.
+
+    The spectral basis is differenced against its value at ``x_ref``, so ``f(x_ref, Y) = 0`` for
+    every ``Y`` exactly, as the polynomial keystone. The coefficients are fitted by weighted least
+    squares with a penalty on their second differences along both axes (smooth where the data are
+    sparse, local where they are dense). Same interface as :class:`GeometrySurface` (``fit``,
+    ``raw``, ``at``, ``grid``, ``box``, ``to_json``), and the same box rule: ``X`` clamped to the
+    measured columns, ``Y`` continued linearly beyond the outer bars.
+    """
+
+    kind = "bspline"
+    robust = "soft"
+
+    def __init__(self, x_ref, tx, ty, reg: float = SPLINE_REG, coef=None, box=None, y_rule: str = "linear"):
+        self.x_ref = float(x_ref)
+        self.tx = np.asarray(tx, float); self.ty = np.asarray(ty, float)
+        self.nbx, self.nby = len(self.tx) - 4, len(self.ty) - 4
+        self.reg = float(reg)
+        n = (self.nby, self.nbx)
+        self.C = np.zeros(n) if coef is None else np.asarray(coef, float).reshape(n)
+        self.box = None if box is None else [float(v) for v in box]
+        if y_rule not in ("linear", "hold"):
+            raise ValueError("y_rule must be 'linear' or 'hold'")
+        self.y_rule = y_rule
+        self._pen = None
+
+    @classmethod
+    def for_frame(cls, shape, x_ref: float, period: Optional[float] = None, reg: float = SPLINE_REG) -> "SplineSurface":
+        """Uniform knots over the frame: ~``SPLINE_KNOT_PX`` apart (at most ``SPLINE_MAX_INTERVALS``),
+        and never closer than three bar periods along the slit."""
+        h, w = (int(v) for v in shape)
+        nx = int(np.clip(round((w - 1) / SPLINE_KNOT_PX), 4, SPLINE_MAX_INTERVALS[0]))
+        ny = int(np.clip(round((h - 1) / SPLINE_KNOT_PX), 4, SPLINE_MAX_INTERVALS[1]))
+        if period and period > 0:
+            ny = max(4, min(ny, int((h - 1) // (3.0 * period))))
+        return cls(x_ref, _clamped_knots(0, w - 1, nx), _clamped_knots(0, h - 1, ny), reg)
+
+    # -- basis
+    def _bx(self, X) -> np.ndarray:
+        return _bspline_basis(X, self.tx).toarray() - _bspline_basis([self.x_ref], self.tx).toarray()[0]
+
+    def _by(self, Y, deriv: bool = False) -> np.ndarray:
+        if not deriv:
+            return _bspline_basis(Y, self.ty).toarray()
+        Y = np.asarray(Y, float).ravel()
+        return (_bspline_basis(Y + 0.5, self.ty) - _bspline_basis(Y - 0.5, self.ty)).toarray()
+
+    def design(self, X, Y) -> sparse.csr_matrix:
+        X = np.asarray(X, float).ravel(); Y = np.asarray(Y, float).ravel()
+        n = X.size
+        bx = self._bx(X)
+        by = _bspline_basis(Y, self.ty)
+        if by.nnz != 4 * n:                             # always 4 per row for a cubic; dense fallback
+            byd = by.toarray()
+            return sparse.csr_matrix((byd[:, :, None] * bx[:, None, :]).reshape(n, -1))
+        iy = by.indices.reshape(n, 4); vy = by.data.reshape(n, 4)
+        cols = (iy[:, :, None] * self.nbx + np.arange(self.nbx)[None, None, :]).ravel()
+        vals = (vy[:, :, None] * bx[:, None, :]).ravel()
+        rows = np.repeat(np.arange(n), 4 * self.nbx)
+        return sparse.csr_matrix((vals, (rows, cols)), shape=(n, self.nby * self.nbx))
+
+    def _penalty(self) -> np.ndarray:
+        if self._pen is None:
+            def d2(m):
+                return sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(max(1, m - 2), m))
+            dx = sparse.kron(sparse.eye(self.nby), d2(self.nbx))
+            dy = sparse.kron(d2(self.nby), sparse.eye(self.nbx))
+            self._pen = (dx.T @ dx + dy.T @ dy).toarray() + 0.002 * np.eye(self.nby * self.nbx)
+        return self._pen
+
+    def raw(self, X, Y):
+        """Spline value at points, no box rule."""
+        X, Y = np.broadcast_arrays(np.asarray(X, float), np.asarray(Y, float))
+        return (self.design(X, Y) @ self.C.ravel()).reshape(X.shape)
+
+    def fit(self, X, Y, values, weights=None):
+        A = self.design(X, Y)
+        v = np.asarray(values, float).ravel()
+        wt = np.ones(v.size) if weights is None else np.asarray(weights, float).ravel()
+        Aw = sparse.diags(wt) @ A
+        AtA = (A.T @ Aw).toarray()
+        self.C = np.linalg.solve(AtA + self._reg_matrix(A, wt), Aw.T @ v).reshape(self.C.shape)
+        return self
+
+    def _reg_matrix(self, A, wt) -> np.ndarray:
+        lam = self.reg * max(float(np.sum(wt)), 1.0) / 1e4
+        return lam * self._penalty() + 1e-9 * np.eye(self.nby * self.nbx)
+
+    # -- evaluation with the box rule
+    def _clamped(self, X, Y):
+        return GeometrySurface._clamped(self, X, Y)
+
+    def at(self, X, Y):
+        """Value at points with the box rule."""
+        X, Y = np.broadcast_arrays(np.asarray(X, float), np.asarray(Y, float))
+        Xc, Yc, dY = self._clamped(X.ravel(), Y.ravel())
+        f = self.raw(Xc, Yc)
+        if np.any(dY):
+            f = f + (self.raw(Xc, Yc + 0.5) - self.raw(Xc, Yc - 0.5)) * dY
+        return f.reshape(X.shape)
+
+    def grid(self, xs, ys):
+        """Values on the grid ``ys`` (rows) x ``xs`` (columns), box rule."""
+        Xc, Yc, dY = self._clamped(np.asarray(xs, float), np.asarray(ys, float))
+        by = self._by(Yc) + self._by(Yc, True) * np.asarray(dY, float).ravel()[:, None]
+        return by @ self.C @ self._bx(Xc).T
+
+    def to_json(self) -> dict:
+        return dict(kind=self.kind, x_ref=self.x_ref, tx=self.tx.tolist(), ty=self.ty.tolist(), reg=self.reg,
+                    coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
+
+    @classmethod
+    def from_json(cls, d: dict) -> "SplineSurface":
+        return cls(d["x_ref"], d["tx"], d["ty"], d.get("reg", SPLINE_REG), d["coef"], d.get("box"),
+                   d.get("y_rule", "linear"))
+
+
+class TensorSurface:
+    """Keystone ``f(X, Y) = sum_jk C[j, k] * Py_j(v) * (Px_k(u) - Px_k(u_ref))`` on ``u, v`` in [-1, 1].
+
+    Families of the spectral basis ``Px``: ``"polynomial"`` (powers 1..x_degree), ``"chebyshev"``
+    (T1..T_x_degree) and ``"piecewise"`` (powers 1..3 plus truncated cubics ``(u - k)_+^3`` at
+    interior *knots*: C2 continuous). ``Py`` is powers (polynomial / piecewise) or Chebyshev
+    T0..T_y_degree. The anchor ``f(x_ref, Y) = 0`` is exact. Fitted by weighted least squares with a
+    ridge on every coefficient (``reg`` x the column's RMS, at least 0.03): high degrees cannot run
+    away where the bars are sparse. Same interface and box rule as :class:`SplineSurface`.
+    """
+
+    kind = "tensor"
+    robust = "soft"
+
+    def __init__(self, family: str, x_degree: int, y_degree: int, x_ref: float, shape, knots=(), reg: float = 0.0,
+                 coef=None, box=None, y_rule: str = "linear"):
+        if family not in ("polynomial", "chebyshev", "piecewise"):
+            raise ValueError("family must be 'polynomial', 'chebyshev' or 'piecewise'")
+        self.family, self.x_degree, self.y_degree = family, int(x_degree), int(y_degree)
+        self.x_ref = float(x_ref)
+        self.shape = tuple(int(v) for v in shape)
+        self.knots = [float(k) for k in knots]
+        self.reg = float(reg)
+        n = (self.y_degree + 1, self.x_degree + len(self.knots))
+        self.C = np.zeros(n) if coef is None else np.asarray(coef, float).reshape(n)
+        self.box = None if box is None else [float(v) for v in box]
+        if y_rule not in ("linear", "hold"):
+            raise ValueError("y_rule must be 'linear' or 'hold'")
+        self.y_rule = y_rule
+
+    def _u(self, X):
+        return 2.0 * np.asarray(X, float).ravel() / max(self.shape[1] - 1, 1) - 1.0
+
+    def _px(self, u):
+        if self.family == "chebyshev":
+            return np.polynomial.chebyshev.chebvander(u, self.x_degree)[:, 1:]
+        cols = [u ** i for i in range(1, self.x_degree + 1)]
+        for k in self.knots:
+            kk = 2.0 * k / max(self.shape[1] - 1, 1) - 1.0
+            cols.append(np.maximum(0.0, u - kk) ** 3)
+        return np.column_stack(cols)
+
+    def _bx(self, X):
+        return self._px(self._u(X)) - self._px(self._u([self.x_ref]))[0]
+
+    def _by(self, Y, deriv: bool = False):
+        if deriv:
+            Y = np.asarray(Y, float).ravel()
+            return self._by(Y + 0.5) - self._by(Y - 0.5)
+        v = 2.0 * np.asarray(Y, float).ravel() / max(self.shape[0] - 1, 1) - 1.0
+        if self.family == "chebyshev":
+            return np.polynomial.chebyshev.chebvander(v, self.y_degree)
+        return np.column_stack([v ** i for i in range(self.y_degree + 1)])
+
+    def design(self, X, Y):
+        bx, by = self._bx(X), self._by(Y)
+        return (by[:, :, None] * bx[:, None, :]).reshape(len(bx), -1)
+
+    def raw(self, X, Y):
+        X, Y = np.broadcast_arrays(np.asarray(X, float), np.asarray(Y, float))
+        return np.sum((self._by(Y) @ self.C) * self._bx(X), axis=1).reshape(X.shape)
+
+    def fit(self, X, Y, values, weights=None):
+        A = self.design(X, Y)
+        v = np.asarray(values, float).ravel()
+        wt = np.ones(v.size) if weights is None else np.asarray(weights, float).ravel()
+        self.C = np.linalg.solve(A.T @ (A * wt[:, None]) + self._reg_matrix(A, wt),
+                                 A.T @ (wt * v)).reshape(self.C.shape)
+        return self
+
+    def _reg_matrix(self, A, wt) -> np.ndarray:
+        ridge = np.maximum(np.sqrt(np.mean(np.asarray(A) ** 2, axis=0)), 0.03) ** 2 * self.reg
+        return np.diag(ridge + 1e-9)
+
+    _clamped = GeometrySurface._clamped
+    at = SplineSurface.at
+    grid = SplineSurface.grid
+
+    def to_json(self) -> dict:
+        return dict(kind=self.kind, family=self.family, x_degree=self.x_degree, y_degree=self.y_degree,
+                    x_ref=self.x_ref, shape=list(self.shape), knots=self.knots, reg=self.reg,
+                    coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
+
+    @classmethod
+    def from_json(cls, d: dict) -> "TensorSurface":
+        return cls(d["family"], d["x_degree"], d["y_degree"], d["x_ref"], d["shape"], d.get("knots", ()),
+                   d.get("reg", 0.0), d["coef"], d.get("box"), d.get("y_rule", "linear"))
+
+
+def surface_from_json(d: dict):
+    """A stored dx / dy surface: :class:`SplineSurface`, :class:`TensorSurface` or :class:`GeometrySurface`."""
+    kind = d.get("kind")
+    if kind == SplineSurface.kind:
+        return SplineSurface.from_json(d)
+    if kind == TensorSurface.kind:
+        return TensorSurface.from_json(d)
+    return GeometrySurface.from_json(d)
+
+
 @dataclass
 class GeometryModel:
     """The joint smile + keystone model of one frame layout.
@@ -257,7 +508,7 @@ class GeometryModel:
         if d.get("schema") != KEYSTONE_SCHEMA:
             raise ValueError(f"Not a smile + keystone geometry model ({d.get('schema')!r}).")
         return cls(shape=tuple(int(v) for v in d["shape"]), y_ref=float(d["y_ref"]), x_ref=float(d["x_ref"]),
-                   dx=GeometrySurface.from_json(d["dx"]), dy=GeometrySurface.from_json(d["dy"]),
+                   dx=surface_from_json(d["dx"]), dy=surface_from_json(d["dy"]),
                    lamp_X=list(d.get("lamp_X", [])), target_Y=list(d.get("target_Y", [])),
                    dx_rows=d.get("dx_rows", "destination"))
 
@@ -275,6 +526,9 @@ class TargetLine:
         coverage: Share of the frame width followed.
         halfwin: Centroid half-window (rows) used for this bar (never reaches a neighbour).
         span: Half distance (rows) between the outer dips of a merged pair (0 for a single bar).
+        recovered: Per point of ``x`` / ``y``: True for a centre added by :func:`recover_bar_gaps`
+            (measured on the image, not predicted), ``None`` when all come from the tracer. ``coef``
+            and ``coverage`` always describe the tracer's points.
     """
 
     y_seed: float
@@ -284,6 +538,7 @@ class TargetLine:
     coverage: float
     halfwin: int = 0
     span: float = 0.0
+    recovered: Optional[np.ndarray] = None
 
     def y_at(self, x, w: int) -> np.ndarray:
         xc, sx = (w - 1) / 2.0, max(1.0, (w - 1) / 2.0)
@@ -771,6 +1026,196 @@ def trace_target_lines(target, polarity: str = "dark", white=None, dark=None, ba
     return out, info
 
 
+# ----------------------------------------------------------------------------------------------- gap recovery
+#: Gap recovery: columns averaged per slit profile, slit smoothing (px), trough / crest prominence and
+#: minimum trough depth (normalised units), search radius around the prediction (px).
+GAP_AVG_COLUMNS = 21
+GAP_SMOOTH_Y = 1.05
+GAP_TROUGH_PROMINENCE = 0.014
+GAP_CREST_PROMINENCE = 0.012
+GAP_MIN_DEPTH = 0.035
+GAP_SEARCH_RADIUS = 3.8
+
+
+def _gap_features(prof_img: np.ndarray, xs: np.ndarray, period: float):
+    """Per column: trough rows, their sub-pixel centres (3-point quadratic) and the crest rows."""
+    h = prof_img.shape[0]
+    dist = max(5, int(round(0.6 * period)))
+    out = {}
+    for x in xs:
+        p = prof_img[:, int(x)]
+        dips, _ = find_peaks(-p, distance=dist, prominence=GAP_TROUGH_PROMINENCE)
+        crests, _ = find_peaks(p, distance=dist, prominence=GAP_CREST_PROMINENCE)
+        dips = dips[(dips > 8) & (dips < h - 9)]
+        cen = []
+        for d in dips:
+            v0, v1, v2 = p[d - 1], p[d], p[d + 1]
+            den = v0 - 2 * v1 + v2
+            off = 0.5 * (v0 - v2) / den if abs(den) > 1e-9 else 0.0
+            cen.append(float(d + np.clip(off, -0.5, 0.5)))
+        out[int(x)] = (dips, np.asarray(cen, float), crests)
+    return out
+
+
+def _gap_observe(x: int, pred: float, feats, prof_img, period: float):
+    """The one trough near *pred* at column *x*, bounded by a crest on each side and deep enough."""
+    dips, cen, crests = feats[x]
+    if not len(dips):
+        return None
+    near = np.flatnonzero(np.abs(cen - pred) < GAP_SEARCH_RADIUS)
+    if near.size != 1:                                  # none, or ambiguous: no measurement
+        return None
+    d = int(dips[int(near[0])]); y = float(cen[int(near[0])])
+    left, right = crests[crests < d], crests[crests > d]
+    if not len(left) or not len(right):
+        return None
+    lo, hi = int(left[-1]), int(right[0])
+    if min(d - lo, hi - d) < 1.5 or hi - lo > 1.8 * period:
+        return None
+    depth = float(min(prof_img[lo, x] - prof_img[d, x], prof_img[hi, x] - prof_img[d, x]))
+    return (y, depth) if depth >= GAP_MIN_DEPTH else None
+
+
+def _gap_grow(obs: Dict[int, float], feats, prof_img, xs, period: float) -> Dict[int, tuple]:
+    """Walk both ways along the sampled columns; where the bar has no centre, look for its trough
+    at the position predicted from the last (up to 7) centres; never more than one candidate."""
+    found: Dict[int, tuple] = {}
+    for seq in (xs, xs[::-1]):
+        hist: List[Tuple[int, float]] = []
+        for x in seq:
+            x = int(x)
+            if x in obs:
+                hist.append((x, obs[x])); continue
+            if len(hist) < 2:
+                continue
+            last = hist[-7:]
+            xx = np.array([p[0] for p in last], float); yy = np.array([p[1] for p in last], float)
+            slope = float(np.median(np.diff(yy) / np.diff(xx))) if len(last) >= 3 else \
+                (yy[-1] - yy[-2]) / (xx[-1] - xx[-2])
+            slope = float(np.clip(slope, -0.10, 0.10))
+            got = _gap_observe(x, float(yy[-1] + slope * (x - xx[-1])), feats, prof_img, period)
+            if got is None or abs(got[0] - yy[-1]) > max(1.6, 0.20 * abs(x - xx[-1])):
+                continue
+            if x not in found or got[1] > found[x][1]:
+                found[x] = got
+            hist.append((x, got[0]))
+    return found
+
+
+def recover_bar_gaps(bars: List[TargetLine], info: dict, normalized: np.ndarray) -> Tuple[List[TargetLine], dict]:
+    """Add MEASURED bar centres where :func:`trace_target_lines` lost a bar (one pass).
+
+    Where the bar contrast fades (a weak or defocused part of the spectrum) the tracer's 5-column
+    centroid stops, although the bars are still visible over a wider average. Starting from each
+    traced bar (its identity and points are kept), the slit profile is averaged over
+    ``GAP_AVG_COLUMNS`` columns and smoothed; at every sampled column the bar has no centre, the
+    single trough near the position predicted from its last centres is taken when two crests bound
+    it and it is deep enough (3-point quadratic sub-pixel centre). Candidates are then checked
+    against the neighbouring bars (0.60-1.48 periods apart), against a local line through the
+    nearby centres (spikes over 1.25 px), and by the tracer's robust cubic per bar. Nothing
+    predicted is ever stored: a column without a qualifying trough stays empty.
+
+    The recovered centres go into ``x`` / ``y`` with ``recovered`` set; the keystone fit weighs them
+    ``RECOVERED_WEIGHT``. Recovery stays within the columns where the tracer found bars.
+
+    Args:
+        bars: Output of :func:`trace_target_lines`.
+        info: Its ``info`` (``period``, ``step``, ``seed_column``, ``polarity``).
+        normalized: :func:`normalize_target` output used for the tracing.
+
+    Returns:
+        ``(bars, stats)``: new :class:`TargetLine` objects (the input is not changed) sorted by row,
+        and ``candidates`` / ``accepted`` / ``rejected_neighbour`` / ``rejected_spike`` /
+        ``rejected_robust`` counts.
+    """
+    stats = dict(candidates=0, accepted=0, rejected_neighbour=0, rejected_spike=0, rejected_robust=0)
+    bars = sorted(bars, key=lambda b: b.y_seed)
+    if len(bars) < 2:
+        return [copy.copy(b) for b in bars], stats
+    norm = np.asarray(normalized, np.float32)
+    h, w = norm.shape
+    period, step = float(info["period"]), int(info["step"])
+    # troughs = the bars: dark bars as they are, bright bars inverted
+    sign = 1.0 if info.get("polarity", "dark") == "dark" else -1.0
+    prof_img = gaussian_filter1d(uniform_filter1d(sign * norm, size=GAP_AVG_COLUMNS, axis=1, mode="nearest"),
+                                 GAP_SMOOTH_Y, axis=0)
+    lo = min(float(b.x.min()) for b in bars); hi = max(float(b.x.max()) for b in bars)
+    xs = np.arange(int(info["seed_column"]) % step, w, step)
+    xs = xs[(xs >= lo) & (xs <= hi)]
+    if xs.size < 3:
+        return [copy.copy(b) for b in bars], stats
+    feats = _gap_features(prof_img, xs, period)
+    obs = [{int(round(x)): float(y) for x, y in zip(b.x, b.y) if int(round(x)) in feats} for b in bars]
+    recs = [_gap_grow(o, feats, prof_img, xs, period) for o in obs]
+    # neighbour order: a recovered centre must sit 0.60-1.48 periods from the next bar up / down
+    for x in xs:
+        x = int(x)
+        for i, rec in enumerate(recs):
+            if x not in rec:
+                continue
+            y = rec[x][0]
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(recs):
+                    other = obs[j].get(x, recs[j].get(x, (None, 0))[0])
+                    if other is not None:
+                        delta = y - other if j < i else other - y
+                        if not 0.60 * period < delta < 1.48 * period:
+                            del rec[x]; stats["rejected_neighbour"] += 1
+                            break
+    # spikes against a local line through the centres two steps either side
+    for o, rec in zip(obs, recs):
+        for x in list(rec):
+            near = []
+            for u in (x - 2 * step, x - step, x + step, x + 2 * step):
+                if u in o:
+                    near.append((u, o[u]))
+                elif u in rec:
+                    near.append((u, rec[u][0]))
+            if len(near) >= 2:
+                xx = np.array([p[0] for p in near], float); yy = np.array([p[1] for p in near], float)
+                if abs(np.polyval(np.polyfit(xx, yy, 1), x) - rec[x][0]) > 1.25:
+                    del rec[x]; stats["rejected_spike"] += 1
+    out: List[TargetLine] = []
+    for b, rec in zip(bars, recs):
+        stats["candidates"] += len(rec)
+        nb = copy.copy(b)
+        if rec:
+            old = {int(round(x)): float(y) for x, y in zip(b.x, b.y)}
+            new = {x: v[0] for x, v in rec.items() if x not in old}
+            allx = np.array(sorted(set(old) | set(new)), float)
+            ally = np.array([old.get(int(x), new.get(int(x))) for x in allx], float)
+            xn = (allx - (w - 1) / 2.0) / max(1.0, (w - 1) / 2.0)
+            _, keep = _robust_poly(xn, ally, 3)
+            is_new = np.array([int(x) in new and int(x) not in old for x in allx])
+            acc = is_new & keep
+            stats["rejected_robust"] += int(np.sum(is_new & ~keep))
+            if acc.any():
+                x = np.r_[b.x, allx[acc]]; y = np.r_[b.y, ally[acc]]
+                r = np.r_[np.zeros(b.x.size, bool) if b.recovered is None else b.recovered, np.ones(int(acc.sum()), bool)]
+                o = np.argsort(x, kind="stable")
+                nb.x, nb.y, nb.recovered = x[o], y[o], r[o]
+                stats["accepted"] += int(acc.sum())
+        out.append(nb)
+    return out, stats
+
+
+def _recover(bars, tinfo, norm, enabled: bool, notes: List[str]):
+    """:func:`recover_bar_gaps` when *enabled*; returns ``(bars, stats or None)`` and adds a note."""
+    if not enabled:
+        return bars, None
+    bars, gap = recover_bar_gaps(bars, tinfo, norm)
+    n_trace = sum(int(b.x.size - (0 if b.recovered is None else b.recovered.sum())) for b in bars)
+    notes.append("gap recovery: %d bar centres measured where the tracer lost the bars (%d traced; weight %.2f "
+                 "in the fit)" % (gap["accepted"], n_trace, RECOVERED_WEIGHT))
+    return bars, gap
+
+
+def _point_weights(bars: List[TargetLine]) -> np.ndarray:
+    """Base weight of every bar point in the keystone fit: 1, or ``RECOVERED_WEIGHT`` for a recovered centre."""
+    return np.concatenate([np.where(b.recovered, RECOVERED_WEIGHT, 1.0) if b.recovered is not None
+                           else np.ones(b.x.size) for b in bars])
+
+
 # ----------------------------------------------------------------------------------------------- coverage
 #: A spectral zone is covered when its bars span at least this share of the bars' full span along the slit.
 ZONE_SPAN_MIN = 0.9
@@ -913,6 +1358,21 @@ def _huber_weights(r: np.ndarray, keep: np.ndarray, k: float = 1.5, reject: floa
     return w
 
 
+def _soft_weights(r: np.ndarray, keep: np.ndarray, k: float = 2.5, floor: float = 0.12, low: float = 0.15):
+    """Robust weights of the spline keystone: ``clip(k * scale / |r|, low, 1)``, ``scale`` the MAD
+    sigma (at least *floor* px). Nothing is dropped and no bar as a whole is weighted down: with
+    the spline a bar that scatters more is mostly a bar measured in a weak part of the spectrum,
+    exactly where the keystone needs the data (block cross-validation on a real target)."""
+    v = r[keep] if keep.any() else r
+    scale = max(floor, 1.4826 * float(np.median(np.abs(v - np.median(v))))) if v.size else floor
+    return np.clip(k * scale / np.maximum(np.abs(r), 1e-8), low, 1.0)
+
+
+def _downweighted(r: np.ndarray, keep: np.ndarray) -> int:
+    """Bar points the spline's soft weights cut below half (residual over ~5 robust sigma)."""
+    return int(np.sum(_soft_weights(r, keep) < 0.5))
+
+
 #: Floor (px) of a feature's scatter in the inverse-variance weights (no single line dominates).
 FEATURE_SIGMA_FLOOR = 0.05
 
@@ -941,6 +1401,247 @@ def _feature_weights(r: np.ndarray, keep: np.ndarray, idx: np.ndarray, n: int,
     return w, sig
 
 
+#: Candidate fitters of :func:`keystone_candidates`: name -> (family, x_degree, y_degree, reg, piecewise knots).
+KEYSTONE_FITTERS = {
+    "legacy_poly_x3_y1": ("polynomial", 3, 1, 0.003, 0),
+    "legacy_poly_x3_y4": ("polynomial", 3, 4, 0.008, 0),
+    "chebyshev_x3_y2": ("chebyshev", 3, 2, 0.004, 0),
+    "chebyshev_x5_y3": ("chebyshev", 5, 3, 0.015, 0),
+    "chebyshev_x6_y4": ("chebyshev", 6, 4, 0.025, 0),
+    "piecewise_cubic_y2": ("piecewise", 3, 2, 0.02, 4),
+    "piecewise_cubic_y4": ("piecewise", 3, 4, 0.04, 4),
+    "anchored_bspline": ("spline", 0, 0, SPLINE_REG, 0),
+}
+
+
+def keystone_candidates(shape, x_ref: float, period: Optional[float] = None,
+                        columns: Optional[Tuple[float, float]] = None) -> Dict[str, Tuple[object, int]]:
+    """The keystone fitters :func:`select_keystone_fitter` chooses from: ``name -> (factory, complexity)``.
+
+    Four families (polynomial, Chebyshev, C2 piecewise cubic along the spectrum, 2-D B-spline),
+    each anchored exactly at *x_ref*. The piecewise knots are spread evenly over the measured
+    *columns* (default: the frame), at 1/5 .. 4/5.
+    """
+    h, w = (int(v) for v in shape)
+    lo, hi = columns if columns is not None else (0.0, w - 1.0)
+    out: Dict[str, Tuple[object, int]] = {}
+    for name, (fam, xd, yd, reg, nk) in KEYSTONE_FITTERS.items():
+        if fam == "spline":
+            out[name] = ((lambda: SplineSurface.for_frame((h, w), x_ref, period)), 999)
+            continue
+        knots = tuple(lo + (hi - lo) * np.arange(1, nk + 1) / (nk + 1)) if nk else ()
+        out[name] = ((lambda fam=fam, xd=xd, yd=yd, reg=reg, knots=knots:
+                      TensorSurface(fam, xd, yd, x_ref, (h, w), knots, reg)), (xd + len(knots)) * (yd + 1))
+    return out
+
+
+def _check_dy_model(dy_model: str) -> str:
+    if dy_model == "spline":
+        return "anchored_bspline"
+    if dy_model in ("auto", "poly") or dy_model in KEYSTONE_FITTERS:
+        return dy_model
+    raise ValueError("dy_model must be 'auto', 'poly', 'spline' or one of: " + ", ".join(KEYSTONE_FITTERS))
+
+
+def _fitter_note(qc: dict) -> str:
+    """One line naming the keystone fitter and, for ``"auto"``, how it won."""
+    name, rows = qc.get("dy_fitter"), [r for r in (qc.get("dy_selection") or []) if r.get("valid")]
+    if not rows:
+        return "keystone fitter: %s" % name
+    r = next((r for r in rows if r["name"] == name), None)
+    runner = sorted(rows, key=lambda r: (r["above"], r["max_px"]))
+    other = next((o for o in runner if o["name"] != name), None)
+    s = "keystone fitter: %s (auto, whole bars held out: %d of %d points over %.0f px, max %.2f px" % (
+        name, r["above"], r["n"], SELECT_ERROR_PX, r["max_px"]) if r else "keystone fitter: %s (auto" % name
+    if other:
+        s += "; next %s: %d" % (other["name"], other["above"])
+    return s + ")"
+
+
+def _bar_rows(s, X, ty, idx: np.ndarray, w: Optional[np.ndarray], Ym: np.ndarray, iterations: int = 3) -> np.ndarray:
+    """Row of every bar at the reference column implied by the keystone surface *s*.
+
+    With ``f(x_ref, Y) = 0`` a bar of destination row ``Y`` sits at raw ``ty = Y + f(X, Y)`` in
+    every column, so ``Y = mean(ty - f(X, Y))`` over the bar's points (weights *w*; the median
+    without). All of the bar's centres are used, not a cubic along the spectrum through them: a
+    bar curved more than a cubic (mustache-type distortion) has a cubic that misses its row at
+    ``x_ref`` (0.3-0.5 px on a test target), which then shifts the whole bar. Bars without points
+    keep their value in *Ym*.
+    """
+    Ym = np.asarray(Ym, float).copy()
+    n = Ym.size
+    for _ in range(iterations):
+        r = ty - s.raw(X, Ym[idx])
+        if w is None:
+            for k in np.unique(idx):
+                Ym[k] = float(np.median(r[idx == k]))
+        else:
+            num = np.bincount(idx, w * r, n); den = np.bincount(idx, w, n)
+            Ym = np.where(den > 0, num / np.maximum(den, 1e-12), Ym)
+    return Ym
+
+
+def _fit_rows(s, X, ty, idx: np.ndarray, w: np.ndarray, Ym: np.ndarray, passes: int = 2) -> np.ndarray:
+    """Fit surface *s* and every bar's reference row in ONE weighted least squares; returns the rows.
+
+    Model per bar point: ``ty = Y_k + f(X, Y_k)``, unknowns the surface coefficients and one
+    ``Y_k`` per bar (the basis is evaluated at the previous ``Y_k``; *passes* re-linearise). Solving
+    them together matters for a local basis (B-spline): its anchor holds only near ``x_ref``, so
+    a bar offset and a dip of the surface at ``x_ref`` nearly trade places, and alternating
+    between the two creeps along that valley (0.17 px left on a test target after 12 rounds);
+    jointly, the centres near ``x_ref`` fix the rows at once. Bars without weight keep *Ym*.
+    """
+    Ym = np.asarray(Ym, float).copy()
+    n = Ym.size
+    idx = np.asarray(idx, int); w = np.asarray(w, float); ty = np.asarray(ty, float)
+    E = sparse.csr_matrix((np.ones(idx.size), (np.arange(idx.size), idx)), shape=(idx.size, n))
+    Wd = sparse.diags(w)
+    den = np.bincount(idx, w, n)
+    empty = den <= 0
+    for _ in range(passes):
+        A = s.design(X, Ym[idx])
+        As = A if sparse.issparse(A) else sparse.csr_matrix(A)
+        p = As.shape[1]
+        M = np.zeros((p + n, p + n))
+        M[:p, :p] = (As.T @ Wd @ As).toarray() + s._reg_matrix(A, w)
+        AtWE = (As.T @ Wd @ E).toarray()
+        M[:p, p:] = AtWE; M[p:, :p] = AtWE.T
+        M[p:, p:] = np.diag(np.where(empty, 1.0, den))
+        rhs = np.r_[As.T @ (w * ty), np.where(empty, Ym, np.bincount(idx, w * ty, n))]
+        sol = np.linalg.solve(M, rhs)
+        s.C = sol[:p].reshape(s.C.shape)
+        Ym = sol[p:]
+    return Ym
+
+
+def _robust_fit_rows(s, X, ty, idx: np.ndarray, w0: np.ndarray, Ym: np.ndarray, iterations: int = 8):
+    """:func:`_fit_rows` inside the soft x per-bar robust re-weighting; returns ``(weights, rows)``."""
+    n = Ym.size
+    wt = w0.copy()
+    for it in range(iterations):
+        new_ym = _fit_rows(s, X, ty, idx, wt, Ym)
+        moved = float(np.max(np.abs(new_ym - Ym))); Ym = new_ym
+        r = ty - (Ym[idx] + s.raw(X, Ym[idx]))
+        sw = _soft_weights(r, wt > 0)
+        ft, _ = _feature_weights(r, sw > 0, idx, n)
+        new = sw * ft[idx] * w0
+        if it >= 2 and moved < 1e-4 and np.allclose(new, wt, rtol=1e-3, atol=1e-6):
+            wt = new
+            break
+        wt = new
+    return wt, _fit_rows(s, X, ty, idx, wt, Ym)
+
+
+def _robust_fit(s, X, Y, v, idx: np.ndarray, n: int, w0: np.ndarray, iterations: int = 8) -> np.ndarray:
+    """Fit surface *s* with the solvers' robust weights (soft x per-bar x base, or Huber); returns the weights."""
+    wt = w0.copy()
+    for it in range(iterations):
+        s.fit(X, Y, v, wt)
+        r = v - s.raw(X, Y)
+        pw = _soft_weights(r, wt > 0) if getattr(s, "robust", "huber") == "soft" else _huber_weights(r, wt > 0)
+        ft, _ = _feature_weights(r, pw > 0, idx, n)
+        new = pw * ft[idx] * w0
+        if it >= 2 and np.array_equal(new > 0, wt > 0) and np.allclose(new, wt, rtol=1e-3, atol=1e-6):
+            wt = new
+            break
+        wt = new
+    s.fit(X, Y, v, wt)
+    return wt
+
+
+def _map_check(s, shape, x_ref: float, min_jac: float = 0.1, max_jac: float = 2.0) -> dict:
+    """Coarse safety of a keystone surface: row Jacobian, largest shift, anchor."""
+    h, w = shape
+    xs = np.unique(np.r_[np.linspace(0, w - 1, 90), x_ref]); ys = np.linspace(0, h - 1, 85)
+    g = s.grid(xs, ys)
+    jac = 1.0 + np.diff(g, axis=0) / (ys[1] - ys[0])
+    anchor = float(np.max(np.abs(s.at(np.full_like(ys, x_ref), ys))))
+    shift = float(np.max(np.abs(g)))
+    ok = bool(np.isfinite(g).all() and min_jac <= jac.min() and jac.max() <= max_jac
+              and shift <= max(30.0, 0.03 * h) and anchor < 1e-5)
+    return dict(valid=ok, jacobian_min=float(jac.min()), jacobian_max=float(jac.max()), max_shift_px=shift,
+                anchor_px=anchor)
+
+
+def _corrected_row_error(s, X, ty, Yt) -> np.ndarray:
+    """|destination row of a raw bar point - its bar's row|, the surface inverted by fixed point (uncensored)."""
+    est = ty.copy()
+    for _ in range(10):
+        est = ty - s.at(X, est)
+    return np.abs(est - Yt)
+
+
+def select_keystone_fitter(candidates: Dict[str, Tuple[object, int]], Xt, Yt, ty, tm, w0, shape, x_ref: float,
+                           folds: int = SELECT_FOLDS, limit: float = SELECT_ERROR_PX) -> Tuple[Optional[str], List[dict]]:
+    """Choose the keystone fitter by cross-validation over WHOLE bars (one pass, no re-tracing).
+
+    The bars (sorted along the slit) are dealt round-robin into *folds*; each fold's bars are left
+    out entirely, every candidate is fitted on the other bars with the same robust weights as the
+    final fit (the training bars' rows estimated with its own surface, :func:`_bar_rows`), and
+    the held-out bar points are corrected (the surface inverted) and compared with their bar's
+    row, one value per held-out bar (the median): what is scored is how well the candidate
+    predicts the SHAPE of a bar it never saw. Nothing is censored. A candidate whose map folds (row Jacobian outside 0.1-2),
+    jumps more than 30 px or leaves the anchor is invalid. Ranking: the count of held-out errors
+    over *limit* px, then the 95th percentile, the largest error, the complexity, the name. (The
+    95th percentile before the largest error: when the counts tie, the largest error is one point,
+    usually of one biased bar, and on a test target it picked a fitter 3.5x worse at the 95th
+    percentile and 0.14 px off the true map, against 0.003-0.012 px for the others.)
+
+    These are consistency errors on the same target (tracker / bar-identity errors included), not
+    optical ground truth.
+
+    Returns:
+        ``(name or None, rows)``: ``None`` when fewer than ``3 * folds`` bars or no valid candidate.
+    """
+    tm = np.asarray(tm, int)
+    ids = np.unique(tm)
+    rows: List[dict] = []
+    if ids.size < 3 * folds:
+        return None, rows
+    n = int(tm.max()) + 1
+    ym0 = np.zeros(n)                                   # starting row of every bar (from the given Yt)
+    ym0[tm] = Yt
+    for name, (factory, complexity) in candidates.items():
+        errs = []; kinds = []; checks = []
+        try:
+            for f in range(folds):
+                held = np.isin(tm, ids[np.arange(ids.size) % folds == f])
+                tr = ~held
+                s = factory()
+                if getattr(s, "robust", "huber") == "soft":     # training bars' rows solved with the surface
+                    _, ym = _robust_fit_rows(s, Xt[tr], ty[tr], tm[tr], w0[tr], ym0.copy())
+                else:
+                    ym = ym0.copy()
+                    _robust_fit(s, Xt[tr], ym[tm[tr]], ty[tr] - ym[tm[tr]], tm[tr], n, w0[tr])
+                y_tr = ym[tm[tr]]
+                s.box = [float(np.percentile(Xt[tr], 0.5)), float(np.percentile(Xt[tr], 99.5)),
+                         float(y_tr.min()), float(y_tr.max())]
+                chk = _map_check(s, shape, x_ref)
+                checks.append(chk)
+                if not chk["valid"]:
+                    raise ValueError("unsafe map: jacobian %.2f-%.2f, shift %.1f px, anchor %.1e px"
+                                     % (chk["jacobian_min"], chk["jacobian_max"], chk["max_shift_px"], chk["anchor_px"]))
+                # held-out bars: one row each (median, no shape), so the error is the bar's SHAPE misfit
+                ym_h = _bar_rows(s, Xt[held], ty[held], tm[held], None, ym)
+                e = _corrected_row_error(s, Xt[held], ty[held], ym_h[tm[held]])
+                if not np.all(np.isfinite(e)):
+                    raise ValueError("non-finite held-out errors")
+                errs.append(e); kinds.append(w0[held] < 1.0)
+            e = np.concatenate(errs); rec = np.concatenate(kinds)
+            rows.append(dict(name=name, valid=True, above=int(np.sum(e > limit)),
+                             above_recovered=int(np.sum((e > limit) & rec)), above_2px=int(np.sum(e > 2.0)),
+                             above_5px=int(np.sum(e > 5.0)), max_px=float(e.max()), p95_px=float(np.percentile(e, 95)),
+                             median_px=float(np.median(e)), n=int(e.size), complexity=int(complexity),
+                             jacobian_min=float(min(c["jacobian_min"] for c in checks))))
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            rows.append(dict(name=name, valid=False, reason=str(exc)))
+    valid = [r for r in rows if r["valid"]]
+    if not valid:
+        return None, rows
+    best = min(valid, key=lambda r: (r["above"], round(r["p95_px"], 4), r["max_px"], r["complexity"], r["name"]))
+    return best["name"], rows
+
+
 def _surfaces(shape, y_ref, x_ref, dx_deg, dy_deg):
     h, w = shape
     sx, sy = max(1.0, (w - 1) / 2.0), max(1.0, (h - 1) / 2.0)
@@ -963,6 +1664,7 @@ class _Data:
         self.lk = np.concatenate([np.full(t.y.size, i) for i, t in enumerate(lamp)])
         self.tx = np.concatenate([t.x for t in target]); self.ty = np.concatenate([t.y for t in target])
         self.tm = np.concatenate([np.full(t.x.size, i) for i, t in enumerate(target)])
+        self.tw0 = _point_weights(target)
 
     def lamp_x_at(self, k: int, y: float) -> float:
         return float(np.polynomial.polynomial.polyval((y - self.y_ref) / self.sy, self.lamp[k].coef))
@@ -975,7 +1677,7 @@ def _solve(data: _Data, sdx: GeometrySurface, sdy: GeometrySurface, x_ref: float
     y_ref = data.y_ref
     Xk = np.array([data.lamp_x_at(k, y_ref) for k in range(len(data.lamp))])
     Ym = np.array([data.bar_y_at(m, x_ref) for m in range(len(data.target))])
-    wl = np.ones(data.lx.size); wt = np.ones(data.tx.size)
+    wl = np.ones(data.lx.size); wt = data.tw0.copy()
     for it in range(iterations):
         Xl = Xk[data.lk]
         Yl = data.ly.copy()
@@ -986,18 +1688,30 @@ def _solve(data: _Data, sdx: GeometrySurface, sdy: GeometrySurface, x_ref: float
         Xt = data.tx.copy()
         for _ in range(3):
             Xt = data.tx - sdx.raw(Xt, Yt)
-        sdy.fit(Xt, Yt, data.ty - Yt, wt)
+        soft = getattr(sdy, "robust", "huber") == "soft"
+        if soft:                                        # surface and bar rows in one solve (see _fit_rows)
+            newY = _fit_rows(sdy, Xt, data.ty, data.tm, wt, Ym)
+        else:
+            sdy.fit(Xt, Yt, data.ty - Yt, wt)
         newX = np.array([data.lamp_x_at(k, y_ref + float(sdy.raw(Xk[k], y_ref))) for k in range(len(data.lamp))])
-        newY = np.array([data.bar_y_at(m, x_ref + float(sdx.raw(x_ref, Ym[m]))) for m in range(len(data.target))])
+        if not soft:                                    # the earlier polynomial: each bar's cubic at x_ref
+            newY = np.array([data.bar_y_at(m, x_ref + float(sdx.raw(x_ref, Ym[m]))) for m in range(len(data.target))])
         moved = max(float(np.max(np.abs(newX - Xk))), float(np.max(np.abs(newY - Ym))))
         Xk, Ym = newX, newY
         if it >= 1:
             rl = data.lx - (Xl + sdx.raw(Xl, Yl))
             rt = data.ty - (Yt + sdy.raw(Xt, Yt))
-            hl = _huber_weights(rl, wl > 0); ht = _huber_weights(rt, wt > 0)
+            hl = _huber_weights(rl, wl > 0)
             fl, _ = _feature_weights(rl, hl > 0, data.lk, len(data.lamp))
-            ft, _ = _feature_weights(rt, ht > 0, data.tm, len(data.target))
-            wl = hl * fl[data.lk]; wt = ht * ft[data.tm]
+            wl = hl * fl[data.lk]
+            if getattr(sdy, "robust", "huber") == "soft":
+                st_ = _soft_weights(rt, wt > 0)
+                ft, _ = _feature_weights(rt, st_ > 0, data.tm, len(data.target))
+                wt = st_ * ft[data.tm] * data.tw0
+            else:
+                ht = _huber_weights(rt, wt > 0)
+                ft, _ = _feature_weights(rt, ht > 0, data.tm, len(data.target))
+                wt = ht * ft[data.tm] * data.tw0
         if it >= 3 and moved < 1e-4:
             break
     # final destination coordinates and residuals with the final anchors
@@ -1043,7 +1757,8 @@ def _loo(data: _Data, sol: dict, make, which: str):
 
 
 def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: float, x_ref: Optional[float] = None,
-                 dx_deg: Tuple[int, int] = (2, 1), dy_xdeg: int = 3, dy_ydeg="auto") -> Tuple[GeometryModel, dict]:
+                 dx_deg: Tuple[int, int] = (2, 1), dy_xdeg: int = 3, dy_ydeg="auto", dy_model: str = DEFAULT_DY_MODEL,
+                 period: Optional[float] = None) -> Tuple[GeometryModel, dict]:
     """Joint smile + keystone model from lamp-line and target-bar traces of one optical state.
 
     Args:
@@ -1056,6 +1771,10 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
         dy_xdeg: Degree of the keystone along the spectrum (>= 1).
         dy_ydeg: Degree along the slit, or ``"auto"`` (0 to ``MAX_DY_YDEG`` by leave-one-bar-out:
             the lowest degree within 10 % of the best).
+        dy_model: ``"auto"`` (:func:`select_keystone_fitter` over :func:`keystone_candidates`), a
+            candidate name, ``"spline"`` or ``"poly"`` (the earlier polynomial: *dy_xdeg* / *dy_ydeg*;
+            unused otherwise).
+        period: Bar period (px), keeps the spline knots at least three periods apart along the slit.
 
     Returns:
         ``(model, qc)``; ``qc`` holds fit / leave-one-line-out residuals in px.
@@ -1077,7 +1796,25 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
     Ym0 = [data.bar_y_at(m, x_ref) for m in range(len(target))]
     if np.any(np.diff(Xk0) < 1) or np.any(np.diff(sorted(Ym0)) < 1):
         raise ValueError("Lamp lines or target bars are duplicated / unresolved. Remove merged lines and rebuild.")
-    if dy_ydeg == "auto":
+    mode = _check_dy_model(dy_model)
+    fitter, selection = None, []
+    if mode != "poly":
+        cands = keystone_candidates((h, w), x_ref, period,
+                                    (float(np.percentile(data.tx, 0.5)), float(np.percentile(data.tx, 99.5))))
+        if mode == "auto":
+            sdx0 = _surfaces((h, w), y_ref, x_ref, dx_deg, (0, 1))[0]
+            sol0 = _solve(data, sdx0, cands["anchored_bspline"][0](), x_ref)
+            fitter, selection = select_keystone_fitter(cands, sol0["Xt"], sol0["Yt"], data.ty, data.tm, data.tw0,
+                                                       (h, w), x_ref)
+            fitter = fitter or "anchored_bspline"
+        else:
+            fitter = mode
+        factory = cands[fitter][0]
+
+        def surfaces(d=None):
+            return _surfaces((h, w), y_ref, x_ref, dx_deg, (0, 1))[0], factory()
+        cand, d_y = [], None
+    elif dy_ydeg == "auto":
         # odd powers along the slit are lens distortion of the slit image that changes with
         # wavelength (lateral colour); a real GigE spectrograph needed y**3..y**4
         cand = [d for d in range(0, MAX_DY_YDEG + 1) if d <= max(0, len(target) - 3)]
@@ -1085,12 +1822,14 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
     else:
         cand = [max(0, min(int(dy_ydeg), len(target) - 2))]
         d_y = cand[0]
-    sdx, sdy = _surfaces((h, w), y_ref, x_ref, dx_deg, (d_y, dy_xdeg))
+    if fitter is None:
+        def surfaces(d=None):
+            return _surfaces((h, w), y_ref, x_ref, dx_deg, (d_y if d is None else d, dy_xdeg))
+    sdx, sdy = surfaces()
     sol = _solve(data, sdx, sdy, x_ref)
     choice = {}
     if len(cand) > 1:
-        res = {d: _loo(data, sol, lambda d=d: _surfaces((h, w), y_ref, x_ref, dx_deg, (d, dy_xdeg))[1], "y")[0]
-               for d in cand}
+        res = {d: _loo(data, sol, lambda d=d: surfaces(d)[1], "y")[0] for d in cand}
         valid = {d: v for d, v in res.items() if v is not None and np.isfinite(v)}
         if valid:
             best = min(valid, key=valid.get)
@@ -1100,14 +1839,14 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
                     break
             d_y = best
         choice = {str(k): v for k, v in res.items()}
-    sdx, sdy = _surfaces((h, w), y_ref, x_ref, dx_deg, (d_y, dy_xdeg))
+    sdx, sdy = surfaces()
     sol = _solve(data, sdx, sdy, x_ref)
     # measured boxes (destination coordinates)
     sdx.box = [float(sol["Xk"].min()), float(sol["Xk"].max()), float(sol["Yl"].min()), float(sol["Yl"].max())]
     sdy.box = [float(np.percentile(sol["Xt"], 0.5)), float(np.percentile(sol["Xt"], 99.5)),
                float(sol["Ym"].min()), float(sol["Ym"].max())]
-    loo_x, per_x = _loo(data, sol, lambda: _surfaces((h, w), y_ref, x_ref, dx_deg, (d_y, dy_xdeg))[0], "x")
-    loo_y, per_y = _loo(data, sol, lambda: _surfaces((h, w), y_ref, x_ref, dx_deg, (d_y, dy_xdeg))[1], "y")
+    loo_x, per_x = _loo(data, sol, lambda: surfaces()[0], "x")
+    loo_y, per_y = _loo(data, sol, lambda: surfaces()[1], "y")
     kl, kt = sol["wl"] > 0, sol["wt"] > 0
     qc = dict(
         lamp_lines=len(lamp), target_bars=len(target),
@@ -1116,8 +1855,10 @@ def fit_geometry(lamp: List[_LampLine], target: List[TargetLine], shape, y_ref: 
         fit_lamp_max_px=float(np.max(np.abs(sol["rl"][kl]))) if kl.any() else float("nan"),
         fit_target_max_px=float(np.max(np.abs(sol["rt"][kt]))) if kt.any() else float("nan"),
         loo_lamp_rms_px=loo_x, loo_target_rms_px=loo_y, loo_lamp_per_line_px=per_x, loo_target_per_bar_px=per_y,
-        rejected_points=int((~kl).sum() + (~kt).sum()), degrees=dict(dx=list(dx_deg), dy=[d_y, dy_xdeg]),
-        dy_ydeg_loo=choice,
+        rejected_points=int((~kl).sum() + (~kt).sum()),
+        downweighted_points=_downweighted(sol["rt"], kt) if fitter else 0,
+        degrees=dict(dx=list(dx_deg), dy=(fitter or [d_y, dy_xdeg])), dy_model=dy_model, dy_fitter=fitter or "poly",
+        dy_selection=selection, dy_ydeg_loo=choice,
         fit_lamp_per_line_px=[float(v) for v in sol["lamp_sigma"]],
         fit_target_per_bar_px=[float(v) for v in sol["bar_sigma"]],
         lamp_weight=[float(v) for v in sol["lamp_weight"]], bar_weight=[float(v) for v in sol["bar_weight"]])
@@ -1214,7 +1955,8 @@ def _summary(model: GeometryModel, map_x, map_y) -> dict:
     span = max(1, c1 - c0)
     tilt = float(dy[mid, c1] - dy[mid, c0])
     top = float(dy[r0, c1] - dy[r0, c0]); bottom = float(dy[r1, c1] - dy[r1, c0])
-    out = dict(smile_max_px=smile, keystone_max_px=keystone, tilt_px=tilt,
+    jac = float(np.min(np.diff(map_y[:, c0:c1 + 1], axis=0))) if c1 >= c0 and h > 1 else 1.0
+    out = dict(smile_max_px=smile, keystone_max_px=keystone, tilt_px=tilt, row_jacobian_min=jac,
                tilt_deg=float(math.degrees(math.atan2(tilt, span))), keystone_top_bottom_px=float(top - bottom),
                lamp_columns=[bx[0], bx[1]], target_columns=[by[0], by[1]], target_rows=[by[2], by[3]],
                extrapolated_columns=float((max(0.0, bx[0]) + max(0.0, (w - 1) - bx[1])) / max(1, w)))
@@ -1295,7 +2037,7 @@ def _jsonable(v):
 def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "auto", x_ref: Optional[float] = None,
                      dy_xdeg: int = 3, dy_ydeg="auto", band: int = 5, step: Optional[int] = None,
                      snr_min: Optional[float] = None, interp: Optional[str] = None, inputs: Optional[dict] = None,
-                     wavelength=None) -> KeystoneAnalysis:
+                     wavelength=None, dy_model: str = DEFAULT_DY_MODEL, gap_recovery: bool = True) -> KeystoneAnalysis:
     """Joint smile + keystone geometry from a smile analysis and a line-target frame.
 
     Args:
@@ -1312,6 +2054,9 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "a
         interp: Remap interpolation for the check images; ``None``: the smile analysis's.
         inputs: Free description of the input files (stored in the model).
         wavelength: Optional ``callable(column) -> nm`` to name the spectral range in coverage warnings.
+        dy_model: Keystone fitter, ``"auto"`` (default), a candidate name, ``"spline"`` or ``"poly"``
+            (see :func:`fit_geometry`).
+        gap_recovery: Add measured bar centres where the tracer lost a bar (:func:`recover_bar_gaps`).
 
     Returns:
         :class:`KeystoneAnalysis`.
@@ -1319,6 +2064,7 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "a
     Raises:
         ValueError: Unusable frames (sizes differ, too few lines / bars, coverage too small).
     """
+    _check_dy_model(dy_model)
     lamp = analysis.frame_orig
     h, w = lamp.shape
     t = np.asarray(target, np.float32)
@@ -1338,9 +2084,15 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "a
     notes.append(_polarity_note(tinfo))
     for y, why in tinfo["rejected"]:
         notes.append("target bar near row %.0f not used: %s" % (y, why))
+    if x_ref is None and bars:                          # from the tracer's span, as without recovery
+        x_ref = float(np.clip((w - 1) / 2.0, np.median([b.x.min() for b in bars]), np.median([b.x.max() for b in bars])))
+    bars, gap = _recover(bars, tinfo, norm, gap_recovery, notes)
     sm = analysis.surface
     model, qc = fit_geometry(lamp_lines, bars, (h, w), analysis.y_ref, x_ref=x_ref,
-                             dx_deg=(max(1, sm.deg_y), sm.deg_x), dy_xdeg=dy_xdeg, dy_ydeg=dy_ydeg)
+                             dx_deg=(max(1, sm.deg_y), sm.deg_x), dy_xdeg=dy_xdeg, dy_ydeg=dy_ydeg,
+                             dy_model=dy_model, period=tinfo["period"])
+    qc["gap_recovery"] = gap
+    notes.append(_fitter_note(qc))
     mx, my = model.maps()
     from .calibration import margin_from_map
     margin = margin_from_map(mx, interp)
@@ -1375,6 +2127,10 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "a
                                                                where_name, where))
     summ = _summary(model, mx, my)
     warn: List[str] = []
+    if summ["row_jacobian_min"] < ROW_JACOBIAN_WARN:
+        warn.append("The row map compresses the slit to %.2f of its spacing somewhere (folds below 0): the "
+                    "keystone surface follows inconsistent bar centres there; check the target / focus."
+                    % summ["row_jacobian_min"])
     for key, label in (("retrace_lamp_median_line_px", "lamp lines"), ("retrace_target_median_bar_px", "target bars")):
         v = qc.get(key)
         if v is None or not np.isfinite(v):
@@ -1402,7 +2158,9 @@ def _solve_dy(bars: List[TargetLine], dx: GeometrySurface, sdy: GeometrySurface,
 
     A bar point measured at raw ``(x, y)`` belongs to the destination column ``X = x - dx(X, y)``
     (the row is the raw row, so this does not involve dy); its destination row is the bar's ``Ym``,
-    fixed by ``dy(x_ref, Ym) = 0``: ``Ym = bar_y(x_ref + dx(x_ref, Ym))``.
+    fixed by ``dy(x_ref, Ym) = 0``. It starts as ``bar_y(x_ref + dx(x_ref, Ym))`` (the bar's cubic);
+    for the soft-weighted fitters (all but the earlier polynomial) it is then re-estimated from
+    all the bar's points with the surface, alternating with the fit (:func:`_bar_rows`).
     """
     tx = np.concatenate([t.x for t in bars]); ty = np.concatenate([t.y for t in bars])
     tm = np.concatenate([np.full(t.x.size, i) for i, t in enumerate(bars)])
@@ -1413,21 +2171,26 @@ def _solve_dy(bars: List[TargetLine], dx: GeometrySurface, sdy: GeometrySurface,
     for _ in range(6):
         Ym = np.array([float(b.y_at([x_ref + float(dx.at(x_ref, y))], w)[0]) for b, y in zip(bars, Ym)])
     Yt = Ym[tm]
-    wt = np.ones(tx.size)
-    for it in range(iterations):
-        sdy.fit(Xt, Yt, ty - Yt, wt)
-        rt = ty - (Yt + sdy.raw(Xt, Yt))
-        ht = _huber_weights(rt, wt > 0)
-        ft, _ = _feature_weights(rt, ht > 0, tm, len(bars))
-        new = ht * ft[tm]
-        if it >= 2 and np.array_equal(new > 0, wt > 0) and np.allclose(new, wt, rtol=1e-3, atol=1e-6):
+    w0 = _point_weights(bars)
+    wt = w0.copy()
+    if getattr(sdy, "robust", "huber") == "soft":       # surface and bar rows solved together
+        wt, Ym = _robust_fit_rows(sdy, Xt, ty, tm, w0, Ym, max(iterations, 12))
+        Yt = Ym[tm]
+    else:                                               # the earlier polynomial: rows from each bar's cubic
+        for it in range(iterations):
+            sdy.fit(Xt, Yt, ty - Yt, wt)
+            rt = ty - (Yt + sdy.raw(Xt, Yt))
+            ht = _huber_weights(rt, wt > 0)
+            ft, _ = _feature_weights(rt, ht > 0, tm, len(bars))
+            new = ht * ft[tm] * w0
+            if it >= 2 and np.array_equal(new > 0, wt > 0) and np.allclose(new, wt, rtol=1e-3, atol=1e-6):
+                wt = new
+                break
             wt = new
-            break
-        wt = new
-    sdy.fit(Xt, Yt, ty - Yt, wt)
+        sdy.fit(Xt, Yt, ty - Yt, wt)
     rt = ty - (Yt + sdy.raw(Xt, Yt))
     ft, st = _feature_weights(rt, wt > 0, tm, len(bars))
-    return dict(Ym=Ym, Xt=Xt, Yt=Yt, ty=ty, tm=tm, rt=rt, wt=wt, bar_weight=ft, bar_sigma=st)
+    return dict(Ym=Ym, Xt=Xt, Yt=Yt, ty=ty, tm=tm, rt=rt, wt=wt, w0=w0, bar_weight=ft, bar_sigma=st)
 
 
 def _loo_dy(sol: dict, make, n: int):
@@ -1479,7 +2242,8 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
                                 x_ref: Optional[float] = None, dy_xdeg: int = 3, dy_ydeg="auto", band: int = 5,
                                 step: Optional[int] = None, snr_min: float = 5.0, interp: str = "cubic",
                                 inputs: Optional[dict] = None, smile_info: Optional[dict] = None,
-                                lamp=None, wavelength=None) -> KeystoneAnalysis:
+                                lamp=None, wavelength=None, dy_model: str = DEFAULT_DY_MODEL,
+                                gap_recovery: bool = True) -> KeystoneAnalysis:
     """Keystone from a line-target frame onto a STORED smile (no lamp frame needed).
 
     For a spectrograph whose fore-lens is taken off to measure the smile (lamp at the slit) and put
@@ -1500,6 +2264,7 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
         smile_info: Where the smile came from (file, created, ...), stored in the result.
         lamp: Optional lamp frame of the same setting to CHECK the stored smile (not fitted).
         wavelength: Optional ``callable(column) -> nm`` to name the spectral range in coverage warnings.
+        dy_model, gap_recovery: As :func:`analyze_keystone`.
 
     Returns:
         :class:`KeystoneAnalysis` with ``model.dx_rows == "source"`` (``lamp_corr`` only with *lamp*).
@@ -1526,16 +2291,35 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
         notes.append("target bar near row %.0f not used: %s" % (y, why))
     t_lo = float(np.median([b.x.min() for b in bars])); t_hi = float(np.median([b.x.max() for b in bars]))
     x_ref = float(np.clip((w - 1) / 2.0, t_lo, t_hi)) if x_ref is None else float(x_ref)
+    bars, gap = _recover(bars, tinfo, norm, gap_recovery, notes)
     dx = GeometrySurface.from_smile(smile)
     dy_xdeg = max(1, int(dy_xdeg))
     sx, sy = max(1.0, (w - 1) / 2.0), max(1.0, (h - 1) / 2.0)
-    make = lambda d: GeometrySurface(range(1, dy_xdeg + 1), range(0, d + 1), x_ref, sx, (h - 1) / 2.0, sy)
-    if dy_ydeg == "auto":
-        cand = [d for d in range(0, MAX_DY_YDEG + 1) if d <= max(0, len(bars) - 3)]
-        d_y = min(1, cand[-1])
+    mode = _check_dy_model(dy_model)
+    fitter, selection = None, []
+    if mode != "poly":
+        tx_all = np.concatenate([b.x for b in bars])
+        cands = keystone_candidates((h, w), x_ref, tinfo["period"],
+                                    (float(np.percentile(tx_all, 0.5)), float(np.percentile(tx_all, 99.5))))
+        if mode == "auto":
+            # the bar points' destination coordinates depend only on the stored smile: one solve gives them
+            sol0 = _solve_dy(bars, dx, cands["anchored_bspline"][0](), x_ref, w)
+            fitter, selection = select_keystone_fitter(cands, sol0["Xt"], sol0["Yt"], sol0["ty"], sol0["tm"],
+                                                       sol0["w0"], (h, w), x_ref)
+            fitter = fitter or "anchored_bspline"
+        else:
+            fitter = mode
+        factory = cands[fitter][0]
+        make = lambda d=None: factory()
+        cand, d_y = [], None
     else:
-        cand = [max(0, min(int(dy_ydeg), len(bars) - 2))]
-        d_y = cand[0]
+        make = lambda d: GeometrySurface(range(1, dy_xdeg + 1), range(0, d + 1), x_ref, sx, (h - 1) / 2.0, sy)
+        if dy_ydeg == "auto":
+            cand = [d for d in range(0, MAX_DY_YDEG + 1) if d <= max(0, len(bars) - 3)]
+            d_y = min(1, cand[-1])
+        else:
+            cand = [max(0, min(int(dy_ydeg), len(bars) - 2))]
+            d_y = cand[0]
     sol = _solve_dy(bars, dx, make(d_y), x_ref, w)
     choice = {}
     if len(cand) > 1:
@@ -1566,14 +2350,17 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
     rt = _retrace(model, np.zeros((h, w), np.float32), target_corr, valid, [], None, None, snr_min, polarity,
                   tinfo["band"], [b.halfwin or tinfo["halfwin"] for b in bars], tinfo["step"])
     med = lambda per: (float(np.nanmedian([p["rms_px"] for p in per])) if per else float("nan"))
+    notes.append(_fitter_note(dict(dy_fitter=fitter or "poly", dy_selection=selection)))
     qc = dict(
         smile_source="stored", lamp_lines=0, target_bars=len(bars),
-        degrees=dict(dx=[smile.deg_y, smile.deg_x], dy=[d_y, dy_xdeg]), dy_ydeg_loo=choice,
+        degrees=dict(dx=[smile.deg_y, smile.deg_x], dy=(fitter or [d_y, dy_xdeg])),
+        dy_model=dy_model, dy_fitter=fitter or "poly", dy_selection=selection, gap_recovery=gap, dy_ydeg_loo=choice,
         before_lamp_rms_px=None, before_target_rms_px=_rms(sol["ty"] - sol["Yt"]),
         fit_lamp_rms_px=None, fit_target_rms_px=_rms(sol["rt"][kt]),
         fit_lamp_max_px=None, fit_target_max_px=float(np.max(np.abs(sol["rt"][kt]))) if kt.any() else float("nan"),
         loo_lamp_rms_px=None, loo_target_rms_px=loo_y, loo_lamp_per_line_px=[], loo_target_per_bar_px=per_y,
-        rejected_points=int((~kt).sum()), fit_lamp_per_line_px=[], fit_target_per_bar_px=[float(v) for v in sol["bar_sigma"]],
+        rejected_points=int((~kt).sum()), downweighted_points=_downweighted(sol["rt"], kt) if fitter else 0,
+        fit_lamp_per_line_px=[], fit_target_per_bar_px=[float(v) for v in sol["bar_sigma"]],
         lamp_weight=[], bar_weight=[float(v) for v in sol["bar_weight"]],
         retrace_lamp_rms_px=None, retrace_lamp_max_px=None, retrace_lamp_p95_px=None, retrace_lamp_per_line=[],
         retrace_lamp_median_line_px=None,
@@ -1600,6 +2387,10 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
                                                             ", ".join("%.0f" % p["Y"] for p in weak[:12])))
     summ = _summary(model, mx, my)
     warn: List[str] = []
+    if summ["row_jacobian_min"] < ROW_JACOBIAN_WARN:
+        warn.append("The row map compresses the slit to %.2f of its spacing somewhere (folds below 0): the "
+                    "keystone surface follows inconsistent bar centres there; check the target / focus."
+                    % summ["row_jacobian_min"])
     created = (smile_info or {}).get("created")
     warn.append("Smile taken from the stored model%s: it was not re-measured here. Check it with a lamp frame "
                 "now and then (lens off is fine)." % (" of %s" % created if created else ""))

@@ -72,6 +72,23 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
 
 
+#: ``flatfield_mode`` header value of a scan flat-fielded while recorded (no reflectance).
+FLATFIELD_FRAME_MODE = "frame by frame (counts evened along the slit, no reflectance)"
+
+
+class FlatFieldFrame:
+    """A flat-field profile multiplied into every recorded frame as ``1 / profile`` (counts evened
+    along the slit; ``counts_from_reflectance`` rebuilds the counts exactly)."""
+
+    kind = "flatfield"
+
+    def __init__(self, profile, factors):
+        self.profile = profile                     # modules.flatfield.FlatFieldProfile
+        factors = np.array(factors, dtype=np.float32, order="C")
+        factors.setflags(write=False)
+        self.factors = factors
+
+
 class ScanController:
     """Glue between the scan window, the camera/stage and the GUI-free scan session.
 
@@ -157,6 +174,8 @@ class ScanController:
         self.preview_thread.error.connect(self.on_preview_error)
         self.preview_thread.finished.connect(self._on_preview_thread_finished)
         self.preview_thread.correction_status.connect(self.win.correction_status.update_status)
+        self.preview_thread.correction_status.connect(self.win.update_geometry)
+        self.win.geometry_requested.connect(self.preview_thread.set_geometry)
         self.preview_thread.saturation_ready.connect(self._on_saturation)
         self.preview_thread.set_raw_inverted(self.config.raw_inverted)
         # A Smile model measured at another camera setting is refused (worker thread).
@@ -1394,9 +1413,13 @@ class ScanController:
         """
         box = getattr(self.win, "auto_radiometric_box", None)
         profile = getattr(self, "camera_profile", None)
-        if (box is None or not box.isChecked() or profile is None
-                or self.session.reference_preview_id is not None):   # a visual-selection scan stays in counts
+        flat_switch = getattr(self.win, "flatfield_enabled", None)       # absent: flat-field as before (in the reference)
+        flat_on = True if flat_switch is None else bool(flat_switch())
+        if profile is None or self.session.reference_preview_id is not None:   # a visual-selection scan stays in counts
             return None, None
+        if box is None or not box.isChecked():
+            # no reflectance: the flat-field profile alone evens the counts along the slit
+            return self._plan_flatfield_frame(start_temp) if (flat_switch is not None and flat_on) else (None, None)
         try:
             from modules.radiometric import RadiometricReferenceStore
             from modules.radiometric.auto import plan_frame_calibration
@@ -1407,18 +1430,77 @@ class ScanController:
         except Exception as exc:
             logger.exception("Radiometric references cannot be read")
             return None, ("failed", f"This scan: recorded in counts - references cannot be read ({exc})")
+        without_flat = ""
+        if frame is not None and not flat_on:
+            frame, without_flat = self._without_flatfield(frame)
         if frame is not None:
             problem = self._frame_calibration_memory_problem(frame.factors.shape)
             if problem:      # recorded in counts (half the memory); calibrated after it if that fits
                 return None, ("not_applied", f"This scan: recorded in counts - {problem}")
-            logger.info("Scan calibrated frame by frame with radiometric reference %s", frame.reference.id)
-            return frame, ("working", f"This scan: calibrated frame by frame with {frame.reference.id}")
+            logger.info("Scan calibrated frame by frame with radiometric reference %s%s", frame.reference.id,
+                        without_flat)
+            return frame, ("working", f"This scan: calibrated frame by frame with {frame.reference.id}{without_flat}")
         if plan.ok:      # factors with NaN (bands outside the table): calibrated after the scan
             return None, ("working", f"This scan: recorded in counts, calibrated with {plan.reference.id} "
                                      "after it (its factors have bands without reflectance)")
         if plan.wanted:
             return None, ("not_applied", f"This scan: recorded in counts - {plan.summary()}")
         return None, None
+
+    def _flatfield_store(self):
+        profile = getattr(self, "camera_profile", None)
+        if profile is None:
+            return None
+        from modules.flatfield import FlatFieldStore
+        return FlatFieldStore(profile.flatfield_folder)
+
+    def _plan_flatfield_frame(self, start_temp):
+        """Flat-field switched on without radiometric calibration: every frame of the scan is
+        divided by the newest flat-field profile that fits (counts evened along the slit; the counts
+        are rebuilt exactly when asked for). Returns ``(frame or None, note or None)``."""
+        try:
+            from modules.flatfield import evening_factors
+            from modules.radiometric import ReferenceKey
+            store = self._flatfield_store()
+            if store is None:
+                return None, None
+            key = ReferenceKey.from_scan(self.scan_reference_metadata(at_start=True, start_temperature_c=start_temp),
+                                         self.preview_thread.binner_lambda_out, self._last_spatial_height or None)
+            match = store.find(key)
+            if not match.ok:
+                return None, (("not_applied", f"This scan: counts, not flat-fielded - {match.reason()}")
+                              if match.rejected else None)
+            factors = evening_factors(match.profile.profile())
+        except Exception as exc:
+            logger.exception("Flat-field profiles cannot be read")
+            return None, ("failed", f"This scan: counts, not flat-fielded - profiles cannot be read ({exc})")
+        problem = self._frame_calibration_memory_problem(factors.shape)
+        if problem:
+            return None, ("not_applied", f"This scan: counts, not flat-fielded - {problem}")
+        logger.info("Scan flat-fielded frame by frame with %s", match.profile.id)
+        return (FlatFieldFrame(match.profile, factors),
+                ("working", f"This scan: flat-fielded frame by frame with {match.profile.id} (counts evened, "
+                            "no reflectance)"))
+
+    def _without_flatfield(self, frame):
+        """Flat-field switched off with radiometric calibration on: the reference's factors with its
+        flat-field profile taken out (``factors x F``: the reference's scale per band only, the same
+        for every slit row). A reference made without a profile is returned as it is."""
+        flat_id = frame.reference.info.get("flatfield")
+        if not flat_id:
+            return frame, ""
+        try:
+            store = self._flatfield_store()
+            flat = store.load(flat_id).profile()
+            factors = np.asarray(frame.factors, np.float32) * np.asarray(flat, np.float32)
+            if factors.shape != frame.factors.shape or not np.all(np.isfinite(factors)) or np.any(factors <= 0):
+                raise ValueError("the profile does not fit the reference")
+        except Exception as exc:
+            logger.warning("Flat-field %s cannot be taken out of %s: %s", flat_id, frame.reference.id, exc)
+            return frame, f" (flat-field kept: {flat_id} unreadable)"
+        from modules.radiometric.auto import FrameCalibration
+        factors.setflags(write=False)
+        return FrameCalibration(frame.plan, factors), f" without its flat-field {flat_id}"
 
     def _frame_calibration_memory_problem(self, factor_shape):
         """Why the expected scan should not be recorded as float32 reflectance (``None`` = it may):
@@ -1458,6 +1540,16 @@ class ScanController:
         from modules.radiometric.auto import AUTO_FRAME_MODE, finish_frame_calibration
         recorder = getattr(self.preview_thread, "recorder", None)
         error = getattr(recorder, "factor_error", None)
+        if isinstance(frame_cal, FlatFieldFrame):
+            if error or any(f.dtype != np.float32 for f in frames):
+                logger.warning("Frame-by-frame flat-field with %s dropped: %s", frame_cal.profile.id,
+                               error or "some frames were recorded in counts")
+                self._frames_to_counts(frames, frame_cal.factors)
+                return frames, None
+            header = {"flatfield_profile": frame_cal.profile.id, "flatfield_mode": FLATFIELD_FRAME_MODE}
+            return frames, {"header": header, "factors": frame_cal.factors, "kind": "flatfield",
+                            "text": f"Last scan: flat-fielded with {frame_cal.profile.id}, frame by frame "
+                                    "(counts evened, no reflectance)"}
         try:
             plan, problems = finish_frame_calibration(frame_cal, self.scan_reference_metadata())
         except Exception as exc:                    # never leave reflectance frames unlabelled

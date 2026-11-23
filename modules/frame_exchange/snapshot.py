@@ -34,6 +34,11 @@ class FrameSnapshot:
         dark_enabled: Whether dark correction was enabled when captured.
         dark_applied: Whether dark correction was actually applied to ``image``.
         stage: Processing stage of ``image``.
+        clipped: Optional boolean mask, same shape and orientation as ``image``: pixels at the
+            sensor's full scale in the RAW frame (before dark subtraction, which moves a
+            saturated pixel below full scale and hides it). ``None`` when the producer does not
+            know.
+        saturation_level: Optional raw full-scale level (DN) the mask was taken against.
     """
     request_id: int
     image: object
@@ -43,3 +48,5 @@ class FrameSnapshot:
     dark_enabled: bool
     dark_applied: bool
     stage: str = 'post_dark_hot_pixel_orientation'
+    clipped: object = None
+    saturation_level: object = None

@@ -72,6 +72,7 @@ class FocusMapWidget(QWidget):
         self._peak = 0.0
         self._last: Optional[FocusMap] = None
         self._im = None
+        self._clip_im = None
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._request_next)
@@ -194,7 +195,7 @@ class FocusMapWidget(QWidget):
         if not self._waiting or packet.request_id != self._request_id:
             return
         self._waiting = False
-        self.set_frame(packet.image, getattr(packet, "camera_bin", None))
+        self.set_frame(packet.image, getattr(packet, "camera_bin", None), getattr(packet, "clipped", None))
         self._schedule()
 
     def snapshot_failed(self, request_id, message: str) -> None:
@@ -206,8 +207,11 @@ class FocusMapWidget(QWidget):
         if self.btn_live.isChecked():
             self._timer.start(1000)
 
-    def set_frame(self, image: np.ndarray, camera_bin: Optional[int] = None) -> Optional[FocusMap]:
-        """Compute and show the focus map of ``image``; returns it (``None`` if it could not be measured)."""
+    def set_frame(self, image: np.ndarray, camera_bin: Optional[int] = None, clipped=None) -> Optional[FocusMap]:
+        """Compute and show the focus map of ``image``; returns it (``None`` if it could not be measured).
+
+        ``clipped``: optional mask of saturated pixels taken on the raw frame (``FrameSnapshot.clipped``).
+        """
         self._to_nm = None
         if self._wavelength_provider is not None:
             try:
@@ -215,9 +219,12 @@ class FocusMapWidget(QWidget):
             except Exception:  # noqa: BLE001 - a missing calibration only drops the nm labels
                 self._to_nm = None
         try:
-            fm = focus_map(image)
+            fm = focus_map(image, clipped=clipped)
         except ValueError as exc:
-            self.lab_status.setText(f"Cannot measure this frame: {exc}")
+            sat = ""
+            if clipped is not None and np.shape(clipped) == np.shape(image) and np.any(clipped):
+                sat = f" - and {100 * float(np.mean(clipped)):.1f} % of the frame is SATURATED: lower the exposure"
+            self.lab_status.setText(f"Cannot measure this frame: {exc}{sat}")
             return None
         self._last = fm
         self._show(fm)
@@ -284,6 +291,14 @@ class FocusMapWidget(QWidget):
             self._im.set_data(fm.contrast)
             self._im.set_clim(0, vmax)
             self._im.set_extent(extent)
+        # saturated areas: cyan, on top (no contrast measured there)
+        if self._clip_im is not None:
+            self._clip_im.remove()
+            self._clip_im = None
+        if fm.clip_map is not None and fm.clip_map.any():
+            rgba = np.zeros(fm.clip_map.shape + (4,), np.float32)
+            rgba[fm.clip_map] = (0.0, 0.9, 1.0, 0.75)
+            self._clip_im = self.ax_map.imshow(rgba, aspect="auto", extent=extent, interpolation="nearest", zorder=2)
         self.ax_map.set_xlim(-0.5, w - 0.5)
         self.ax_map.set_ylim(h - 0.5, -0.5)
         self._pts.set_data(fm.best_col, fm.row_samples)
@@ -318,7 +333,7 @@ class FocusMapWidget(QWidget):
 
         near_peak = score >= 0.97 * self._peak
         self.lab_score.setText(f"{score:.2f}")
-        self.lab_score.setStyleSheet(f"color: {_GOOD if near_peak else _TEXT};")
+        self.lab_score.setStyleSheet(f"color: {_BAD if fm.clipped > 0.001 else (_GOOD if near_peak else _TEXT)};")
         if len(ys) >= 6:
             d = ys[-3:].mean() - ys[-6:-3].mean()
             tol = 0.02 * max(1e-6, self._peak)
@@ -334,7 +349,8 @@ class FocusMapWidget(QWidget):
         light += f", noise {fm.noise_dn:.0f} DN"
         colour = _DIM
         if fm.clipped > 0.001:
-            light += f" - {100 * fm.clipped:.1f} % clipped: lower the exposure"
+            light += (f" - SATURATED {100 * fm.clipped:.1f} % (cyan on the map, left out of the CNR): lower the "
+                      "exposure until none is left")
             colour = _BAD
         elif fm.level_fraction is not None and fm.level_fraction < 0.15:
             light += " - dim: average frames for calibration, or slow the line rate for scans"

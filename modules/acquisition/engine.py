@@ -216,6 +216,10 @@ class AcquisitionEngine:
         self._pending_processed = False
         self._pending_smile_model = None
         self._last_correction_status = None
+        # geometry switches (Smile card): smile remap on/off, keystone on/off within it
+        self._smile_enabled = True
+        self._keystone_enabled = True
+        self._smile_only_cache = (None, None)       # (model, its smile-only view)
         self._wavelength_lookup = None
         self._smile_setting_check = None
         # where config.m/c came from ('wavelength_*' header keys; see correction_info)
@@ -634,7 +638,7 @@ class AcquisitionEngine:
         info["smile_corrected"] = bool(model_id != id(None) and not smile_error)
         if info["smile_corrected"] and smile_path:
             info["smile_model"] = Path(smile_path).name
-            created = getattr(getattr(getattr(self, "_smile", None), "calibration", None), "created", None)
+            created = getattr(self._active_calibration(), "created", None)
             if created:
                 info["smile_model_created"] = str(created)
         if info["smile_corrected"]:
@@ -642,7 +646,7 @@ class AcquisitionEngine:
             kept = getattr(full, "source_bins", None)          # a plain read, as the other fields
             if kept is not None:
                 info["smile_border_bands"] = [int(v) for v in kept]
-            cal = getattr(getattr(self, "_smile", None), "calibration", None)
+            cal = self._active_calibration()
             if getattr(cal, "has_keystone", False):
                 info["keystone_corrected"] = True
                 try:
@@ -712,6 +716,32 @@ class AcquisitionEngine:
         """Queue loading a Smile model file for the current bin."""
         with self._lock:
             self._pending_smile_model = str(path)
+
+    def set_geometry(self, smile: bool = True, keystone: bool = True):
+        """Switch the geometric correction: ``smile`` off = no remap at all; ``keystone`` off =
+        the loaded model's smile alone (rows untouched, nothing cropped). Any thread; the next frame
+        uses it. A model without keystone ignores ``keystone``."""
+        with self._lock:
+            self._smile_enabled = bool(smile)
+            self._keystone_enabled = bool(keystone)
+
+    def geometry(self) -> tuple:
+        """``(smile, keystone)`` switches as set by :meth:`set_geometry`."""
+        return bool(getattr(self, '_smile_enabled', True)), bool(getattr(self, '_keystone_enabled', True))
+
+    def _active_calibration(self):
+        """The model to apply now: ``None`` when the smile is switched off (or none is loaded),
+        its smile-only view when the keystone is switched off, else the model itself."""
+        cal = getattr(getattr(self, '_smile', None), 'calibration', None)
+        if cal is None or not getattr(self, '_smile_enabled', True):
+            return None
+        if getattr(cal, 'has_keystone', False) and not getattr(self, '_keystone_enabled', True):
+            cached, view = getattr(self, '_smile_only_cache', (None, None))
+            if cached is not cal:
+                view = cal.smile_only()
+                self._smile_only_cache = (cal, view)
+            return view
+        return cal
 
     # ── pending changes (worker thread) ───────────────────
 
@@ -861,7 +891,7 @@ class AcquisitionEngine:
         with self._lock:
             return self._pending_snapshot is not None
 
-    def _publish_snapshot_if_requested(self, frame):
+    def _publish_snapshot_if_requested(self, frame, raw=None):
         with self._lock:
             request_id = self._pending_snapshot
             self._pending_snapshot = None
@@ -871,10 +901,28 @@ class AcquisitionEngine:
         image.setflags(write=False)
         dark = getattr(self.backend, '_dark_mean', None)
         enabled = bool(getattr(self.backend, '_dark_enabled', False))
+        clipped, level = self._raw_clip_mask(raw, image.shape)
         packet = FrameSnapshot(request_id, image, time.monotonic(),
             int(self.backend.current_bin), self._raw_inverted, enabled,
-            enabled and dark is not None and dark.shape == frame.shape)
+            enabled and dark is not None and dark.shape == frame.shape,
+            clipped=clipped, saturation_level=level)
         self.sink.snapshot(packet)
+
+    def _raw_clip_mask(self, raw, shape):
+        """``(mask, level)``: raw pixels at >= 98 % of full scale, oriented like the snapshot (the
+        slit axis flipped when the raw frames are inverted); ``(None, None)`` when unknown."""
+        if raw is None or getattr(raw, 'ndim', 0) != 2 or tuple(raw.shape) != tuple(shape):
+            return None, None
+        try:
+            level = float(self._saturation_level(raw))
+            mask = np.asarray(raw) >= 0.98 * level
+            if self._raw_inverted:
+                mask = mask[::-1]
+            mask = np.ascontiguousarray(mask)
+            mask.setflags(write=False)
+            return mask, level
+        except Exception:                     # a mask is a convenience; the snapshot goes out without
+            return None, None
 
     def _processed_requested(self) -> bool:
         with self._lock:
@@ -924,12 +972,13 @@ class AcquisitionEngine:
         """Observe the last processed frame; build payload only on a change."""
         reference = getattr(self.backend, '_dark_mean', None)
         enabled = bool(getattr(self.backend, '_dark_enabled', False))
-        model = self._smile.calibration
+        loaded = self._smile.calibration
+        model = self._active_calibration()
         bin_value = int(self.backend.current_bin)
         matches = reference is not None and reference.shape == frame.shape
         warnings = dict(getattr(self, '_calibration_warnings', {}))
         wavelength = dict(getattr(self, '_wavelength_provenance', {}))
-        key = (dark_capture, enabled, id(reference), matches, id(model),
+        key = (dark_capture, enabled, id(reference), matches, id(model), id(loaded),
                self._smile.path, bin_value, smile_error,
                tuple(sorted(warnings.items())), tuple(sorted(wavelength.items())))
         if key == self._last_correction_status:
@@ -949,15 +998,20 @@ class AcquisitionEngine:
                 dark = ('Applied', f'Reference matched · bin {bin_value}')
             if smile_error:
                 smile = ('Missing', 'Model could not process frame')
-            elif model is None and 'smile' in warnings:
+            elif loaded is None and 'smile' in warnings:
                 smile = ('Missing', 'Model for another setting')
-            elif model is None:
+            elif loaded is None:
                 smile = ('Missing', f'No model · bin {bin_value}')
+            elif model is None:
+                smile = ('Off', f'Switched off · {Path(self._smile.path).name}')
             else:
                 name = Path(self._smile.path).name
                 if getattr(model, 'has_keystone', False):
                     name = f'Smile + keystone · {name}'
-                smile = ('Applied', f'{name} · setting unverified' if 'smile' in warnings else name)
+                elif getattr(loaded, 'has_keystone', False):
+                    name = f'Keystone switched off · {name}'
+                state = 'Smile only' if model is not loaded else 'Applied'
+                smile = (state, f'{name} · setting unverified' if 'smile' in warnings else name)
         source = wavelength.get('wavelength_source', 'config')
         if source == 'stored':
             wl = ('Applied', wavelength.get('wavelength_profile', f'Stored · bin {bin_value}'))
@@ -967,7 +1021,11 @@ class AcquisitionEngine:
             wl = ('Missing', f"bin {bin_value}: using {wavelength.get('wavelength_kept_from', 'old m/c')}")
         else:
             wl = ('Off', 'Config m/c (no stored calibration)')
-        status = {'dark': dark, 'smile': smile, 'wavelength': wl}
+        status = {'dark': dark, 'smile': smile, 'wavelength': wl,
+                  'geometry': dict(model=loaded is not None,
+                                   keystone_available=bool(getattr(loaded, 'has_keystone', False)),
+                                   smile=bool(getattr(self, '_smile_enabled', True)),
+                                   keystone=bool(getattr(self, '_keystone_enabled', True)))}
         if warnings:
             status['warnings'] = tuple(warnings.values())
         self.sink.correction_status(status)
@@ -1346,7 +1404,7 @@ class AcquisitionEngine:
             reference = getattr(correction, 'dark_reference', correction)
             dark = getattr(reference, '_dark_mean', None)
             hot = getattr(reference, '_hot_coords', None)
-            calibration = self._smile.calibration
+            calibration = self._active_calibration()
             refs = (dark, hot, calibration, binner)
             key = ('display', frame.shape, frame.dtype.str, level,
                    bool(getattr(correction, '_dark_enabled', False)), self._raw_inverted,
@@ -1361,8 +1419,8 @@ class AcquisitionEngine:
             elif key[0] == 'display':
                 ceiling, _, _ = self._preprocessor.process_binned(
                     full, correction, self._ensure_binner(frame.shape[1]),
-                    calibration=self._smile.calibration, inverted=self._raw_inverted)
-                ceiling = crop_keystone_rows(ceiling, self._smile.calibration)   # same rows as the frames
+                    calibration=calibration, inverted=self._raw_inverted)
+                ceiling = crop_keystone_rows(ceiling, calibration)   # same rows as the frames
         except Exception as exc:
             logger.warning("Saturation ceiling unavailable: %s", exc)
         self._ceiling_key = key
@@ -1454,7 +1512,7 @@ class AcquisitionEngine:
                     binner = self._ensure_binner(frame.shape[1])
                     try:
                         correction = self.backend if self._shared_preprocessing else self._passthrough_dark
-                        calibration = self._smile.calibration
+                        calibration = self._active_calibration()
                         # On a GPU backend correction and binning stay on the device; the
                         # unbinned image is downloaded only for a processed-frame request.
                         emit_frame, corrected, grabbed = self._preprocessor.process_binned(
@@ -1462,7 +1520,7 @@ class AcquisitionEngine:
                             inverted=self._raw_inverted, snapshot=self._snapshot_requested(),
                             full=self._processed_requested(), profiler=prof)
                         if grabbed is not None:
-                            self._publish_snapshot_if_requested(grabbed)
+                            self._publish_snapshot_if_requested(grabbed, raw=frame)
                         if corrected is not None:
                             self._publish_processed_if_requested(corrected, calibration is not None)
                     except Exception as exc:

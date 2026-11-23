@@ -543,6 +543,19 @@ class SmileCalibration:
         """True for a smile + keystone model (rows are remapped too)."""
         return self.map_y is not None
 
+    def smile_only(self) -> "SmileCalibration":
+        """This model with the keystone switched off: the stored smile surface alone
+        (``map_x = X + S(Y, X)``, rows untouched, no row margin). Returns ``self`` for a smile-only
+        model. The copy shares the frames and metadata; its remap engine is its own."""
+        if not self.has_keystone:
+            return self
+        import dataclasses
+        h, w = (int(v) for v in self.image_shape)
+        map_x, _map_y, _s = build_maps((h, w), self.surface())
+        out = dataclasses.replace(self, map_x=map_x, map_y=None, keystone=None)
+        out.margin = margin_from_map(out.map_x, out.interp)
+        return out
+
     @property
     def row_margin(self) -> Tuple[int, int]:
         """``(top, bottom)`` rows without a full source (``(0, 0)`` for smile only)."""
