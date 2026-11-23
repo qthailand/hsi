@@ -1334,13 +1334,17 @@ class AcquisitionEngine:
         return binner
 
     def _smile_border(self, width: int) -> tuple:
-        """``(left, right)`` spectral columns the loaded Smile model zero-fills in some slit rows.
+        """``(left, right)`` spectral columns the applied Smile model zero-fills in some slit rows.
 
         The remap reads past the sensor edge there (the smile is largest at the slit ends), so
-        those columns hold zeros or a partial interpolation in part of the slit. ``(0, 0)``
-        without a model, or for a model of another frame width.
+        those columns hold zeros or a partial interpolation in part of the slit. Taken from the
+        model actually applied (:meth:`_active_calibration`): the smile-only view (its own margin)
+        when the keystone is switched off, ``(0, 0)`` when the smile is switched off (nothing is
+        remapped). Because it follows :meth:`set_geometry`, a switch changes it and
+        :meth:`_ensure_binner` refits the bins (outside a scan). ``(0, 0)`` also without a model,
+        or for a model of another frame width.
         """
-        cal = getattr(getattr(self, "_smile", None), "calibration", None)
+        cal = self._active_calibration()
         if cal is None:
             return (0, 0)
         try:

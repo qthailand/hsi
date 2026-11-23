@@ -825,12 +825,32 @@ class SpectralResolutionWidget(QWidget):
         except Exception as exc:  # noqa: BLE001
             self.error(exc)
 
+    def _keystone_row_margin(self) -> tuple:
+        """``(top, bottom)`` slit rows a smile + keystone model fills from outside the sensor,
+        ``(0, 0)`` without a model or keystone (or when the margin would leave no rows)."""
+        cal = self.smile
+        if cal is None or not getattr(cal, "has_keystone", False):
+            return (0, 0)
+        top, bottom = (max(0, int(v)) for v in cal.row_margin)
+        if top + bottom >= int(cal.image_shape[0]):
+            return (0, 0)
+        return (top, bottom)
+
+    def _keystone_rows_cropped(self, corrected):
+        """*corrected* without the keystone row margin, like the acquisition cube
+        (``crop_keystone_rows``): those rows hold zeros or kernels mixed with the zero border in
+        some columns and would cut :func:`usable_columns` and bias the preview and the end blocks."""
+        top, bottom = self._keystone_row_margin()
+        if top + bottom <= 0:
+            return corrected
+        return corrected[top:corrected.shape[0] - bottom]
+
     def _update_corrected(self):
         """Apply the smile model (if any), refresh the image, the preview and the auto-selection."""
         if self.frame is None:
             return
         f = np.ascontiguousarray(self.frame, dtype=np.float32)
-        self.corrected = self.smile.apply_native(f) if self.smile is not None else f
+        self.corrected = self._keystone_rows_cropped(self.smile.apply_native(f)) if self.smile is not None else f
         self.image.setImage(self.corrected, autoLevels=True)
         if self.smile is None and self.rows_per_block.value() != 1 and self._rows_saved is None:
             self._rows_saved = self.rows_per_block.value()
@@ -1512,6 +1532,7 @@ class SpectralResolutionWidget(QWidget):
                 "wavelength_profile": self.profile_source or "none (pixels only)",
                 "smile_model": self.smile_source or "none (not corrected)",
                 "smile_corrected": self.smile is not None,
+                "keystone_rows_cropped": list(self._keystone_row_margin()),
                 "baseline_label": BASELINE_LABELS[method],
                 "preview_rows": list(self.preview_rows) if self.preview_rows else None,
                 "peak_selection": self._selection_source or "none",

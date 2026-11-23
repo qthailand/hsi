@@ -515,7 +515,6 @@ class MainWindow(QMainWindow):
             viewer = CubeViewerWindow(
                 cube,
                 wavelengths=wavelengths,
-                resolution=self.config.resolution,
                 display_mapper=mapper,
                 config=cfg,
                 camera_bin=self.scan_controller.camera_bin if self.scan_controller is not None else 1,

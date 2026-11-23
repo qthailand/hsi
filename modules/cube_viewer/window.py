@@ -101,6 +101,29 @@ _MARKER_SWEEP_MS = 250
 _AXIS_ORDER = "(slit, scan, wavelength) = (rows, columns, bands)"
 _CONFIG_SCALARS = ("m", "c", "pixel_size", "resolution", "bit_depth", "sensor_bit_depth",
                    "full_scale")
+#: Wavelength decimals when the cube has no usable band spacing (none or one band).
+_DEFAULT_WL_DECIMALS = 2
+
+
+def wavelength_decimals(wavelengths) -> int:
+    """Decimals that show the band spacing of ``wavelengths`` (nm): one digit below it, 1-3.
+
+    A 2 nm spacing gives 1 (``551.4 nm``), 0.5 nm gives 2, 0.05 nm gives 3. Without a
+    positive finite median spacing (``None``, one band, all equal) it is 2.
+
+    >>> wavelength_decimals([400.0, 402.0, 404.0]), wavelength_decimals([400.0, 400.5, 401.0])
+    (1, 2)
+    >>> wavelength_decimals(None), wavelength_decimals([550.0])
+    (2, 2)
+    """
+    if wavelengths is None:
+        return _DEFAULT_WL_DECIMALS
+    wl = np.asarray(wavelengths, dtype=np.float64).ravel()
+    steps = np.abs(np.diff(wl[np.isfinite(wl)]))
+    steps = steps[steps > 0]
+    if steps.size == 0:
+        return _DEFAULT_WL_DECIMALS
+    return int(np.clip(math.ceil(-math.log10(float(np.median(steps)))) + 1, 1, 3))
 _TOOL_HINTS = {
     "point": "Point tool: click a pixel to add its spectrum",
     "rect": "Rect tool: drag over the image (Esc cancels)",
@@ -466,7 +489,8 @@ class CubeViewerWindow(QWidget):
     Args:
         cube: 3-D array ``(slit, scan, wavelength)``; kept by reference.
         wavelengths: 1-D band wavelengths in nm (length ``bands``) or ``None``.
-        resolution: Decimals shown for wavelengths in labels.
+        resolution: Decimals shown for wavelengths in labels (not the spectral bin width);
+            ``None`` (default) derives them from the band spacing (:func:`wavelength_decimals`).
         display_mapper: Optional ``DisplayMapper`` whose ``bit_depth`` initialises
             the display controls (default 16 bit).
         config: Calibration dict forwarded to the export (``m``, ``c``, ``pixel_size``);
@@ -512,7 +536,7 @@ class CubeViewerWindow(QWidget):
         self,
         cube: np.ndarray,
         wavelengths: np.ndarray | None = None,
-        resolution: int = 2,
+        resolution: int | None = None,
         display_mapper: DisplayMapper | None = None,
         config: dict | None = None,
         camera_bin: int | None = None,
@@ -526,7 +550,8 @@ class CubeViewerWindow(QWidget):
         self.cube = cube
         self.h, self.w, self.bands = cube.shape
         self.wavelengths = wavelengths
-        self.resolution = int(resolution)
+        self.resolution = (wavelength_decimals(wavelengths) if resolution is None
+                           else int(resolution))
         self.config = config or {}
         self.camera_bin = int(camera_bin or 1)
         self.source_path = os.fspath(source_path) if source_path else None

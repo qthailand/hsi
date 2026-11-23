@@ -205,11 +205,10 @@ class SmileCorrector:
         self._keystone = self._keystone_json = self._geometry = None
         self._map_y = None
         self._map_x, _, _ = build_maps(self._image_shape, self._surface)
-        if self._analysis is not None:
-            self._margin = tuple(self._analysis.margin)
-        else:
-            from .calibration import margin_from_map
-            self._margin = margin_from_map(self._map_x, self.interp)
+        # Always for the current kernel: the analysis' margin is for the fit-time interpolation,
+        # which set_params(interp=...) may have changed since.
+        from .calibration import margin_from_map
+        self._margin = margin_from_map(self._map_x, self.interp)
         return self
 
     @property
@@ -494,13 +493,14 @@ class SmileCorrector:
         if "interp" in params and self.is_fitted:
             # The fitted map is interpolation-independent; only the remap
             # kernel changes. Recompute the valid crop for the new kernel.
-            from .calibration import margin_from_map
-            self._margin = margin_from_map(self._map_x, self.interp)
             if self._map_y is not None and self._keystone_json is not None:
-                from .keystone import row_margin_from_map
-                w = self._map_x.shape[1]
-                self._keystone_json["row_margin"] = list(row_margin_from_map(
-                    self._map_y, self.interp, (self._margin[0], w - 1 - self._margin[1])))
+                from .keystone import valid_rect
+                self._margin, row_margin = valid_rect(self._map_x, self._map_y, self.interp)
+                self._keystone_json["margin"] = list(self._margin)
+                self._keystone_json["row_margin"] = list(row_margin)
+            else:
+                from .calibration import margin_from_map
+                self._margin = margin_from_map(self._map_x, self.interp)
         return self
 
     # ─── Introspection ───

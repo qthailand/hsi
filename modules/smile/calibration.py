@@ -531,12 +531,13 @@ class SmileCalibration:
             )
         self.interp = interp
         self._engine = None
-        self.margin = margin_from_map(self.map_x, interp)
         if self.map_y is not None and self.keystone is not None:
-            from .keystone import row_margin_from_map
-            w = self.map_x.shape[1]
-            self.keystone["row_margin"] = list(row_margin_from_map(
-                self._get_map_y(), interp, (self.margin[0], w - 1 - self.margin[1])))
+            from .keystone import valid_rect
+            self.margin, row_margin = valid_rect(self.map_x, self._get_map_y(), interp)
+            self.keystone["margin"] = list(self.margin)
+            self.keystone["row_margin"] = list(row_margin)
+        else:
+            self.margin = margin_from_map(self.map_x, interp)
 
     @property
     def has_keystone(self) -> bool:

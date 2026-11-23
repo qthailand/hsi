@@ -66,7 +66,7 @@ __all__ = [
     "normalize_target", "detect_polarity", "frames_same_scene", "trace_target_lines", "bar_coverage",
     "coverage_warnings", "lamp_points_from_analysis", "fit_geometry", "SplineSurface", "TensorSurface",
     "recover_bar_gaps", "keystone_candidates", "select_keystone_fitter",
-    "analyze_keystone", "analyze_keystone_from_smile", "row_margin_from_map", "keystone_report",
+    "analyze_keystone", "analyze_keystone_from_smile", "row_margin_from_map", "valid_rect", "keystone_report",
 ]
 
 KEYSTONE_SCHEMA = "hsi-smile-keystone/1"
@@ -1891,6 +1891,50 @@ def row_margin_from_map(map_y: np.ndarray, interp: str = "cubic", columns: Optio
     return int(idx[0]), int(h - 1 - idx[-1])
 
 
+def valid_rect(map_x: np.ndarray, map_y: np.ndarray, interp: str = "cubic"
+               ) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Crop of a joint (smile + keystone) remap: ``((left, right), (top, bottom))``.
+
+    Both maps are joined first: a pixel is valid when its interpolation kernel lies inside the
+    frame along both axes (``map_x`` within the columns, ``map_y`` within the rows, with the
+    same bounds as :func:`~modules.smile.calibration.margin_from_map` and
+    :func:`row_margin_from_map`). The rows come from the valid columns of ``map_x`` over every
+    row, as before; the columns are then widened as far as the joint mask stays valid in the rows
+    kept. The slit-end rows the row margin removes carry the largest smile, so they no longer
+    narrow the spectral range. The rectangle is never smaller than the separate crop along either
+    axis, and every pixel in it is valid.
+
+    Args:
+        map_x: Column map ``(H, W)``.
+        map_y: Row map ``(H, W)``.
+        interp: Interpolation name.
+
+    Returns:
+        ``((left, right), (top, bottom))`` column and row counts to remove.
+
+    Raises:
+        ValueError: No valid column or row.
+    """
+    from .calibration import margin_from_map
+    h, w = map_x.shape
+    left, right = margin_from_map(map_x, interp)
+    top, bottom = row_margin_from_map(map_y, interp, (left, w - 1 - right))
+    _, pad_l, pad_r = _INTERP[interp]
+
+    def inside(m, n):
+        hi = n - 1.0 if interp == "linear" else n - pad_r - 1e-3
+        return (m >= float(pad_l)) & (m <= hi)
+
+    rows = slice(top, h - bottom)
+    ok = (inside(map_x[rows], w) & inside(map_y[rows], h)).all(axis=0)
+    first, last = left, w - 1 - right            # all valid already (rows chosen inside them)
+    while first > 0 and ok[first - 1]:
+        first -= 1
+    while last < w - 1 and ok[last + 1]:
+        last += 1
+    return (int(first), int(w - 1 - last)), (int(top), int(bottom))
+
+
 def _remap(img, mx, my, interp="cubic"):
     return cv2.remap(np.ascontiguousarray(img, np.float32), mx, my, interpolation=_INTERP[interp][0],
                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
@@ -2094,9 +2138,7 @@ def analyze_keystone(analysis, target, white=None, dark=None, polarity: str = "a
     qc["gap_recovery"] = gap
     notes.append(_fitter_note(qc))
     mx, my = model.maps()
-    from .calibration import margin_from_map
-    margin = margin_from_map(mx, interp)
-    row_margin = row_margin_from_map(my, interp, (margin[0], w - 1 - margin[1]))
+    margin, row_margin = valid_rect(mx, my, interp)
     lamp_corr = _remap(lamp, mx, my, interp)
     target_corr = _remap(norm, mx, my, interp)
     valid = (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
@@ -2342,9 +2384,7 @@ def analyze_keystone_from_smile(smile, y_ref: float, target, white=None, dark=No
     model = GeometryModel(shape=(h, w), y_ref=float(y_ref), x_ref=x_ref, dx=dx, dy=sdy, lamp_X=[],
                           target_Y=[float(v) for v in sol["Ym"]], dx_rows="source")
     mx, my = model.maps()
-    from .calibration import margin_from_map
-    margin = margin_from_map(mx, interp)
-    row_margin = row_margin_from_map(my, interp, (margin[0], w - 1 - margin[1]))
+    margin, row_margin = valid_rect(mx, my, interp)
     target_corr = _remap(norm, mx, my, interp)
     valid = (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
     rt = _retrace(model, np.zeros((h, w), np.float32), target_corr, valid, [], None, None, snr_min, polarity,
