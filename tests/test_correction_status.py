@@ -45,6 +45,28 @@ def test_transitions_and_no_duplicate_events():
     report(worker, frame, smile_error=True)
     assert events[-1]['smile'][0] == 'Missing'
 
+@pytest.mark.parametrize('camera_bin', [1, 2, 4])
+def test_correction_info_reads_the_status_the_reporter_stores(camera_bin):
+    """correction_info unpacks the key _report_corrections stores: at any bin a smile + keystone
+    frame is recorded as Smile- and keystone-corrected (a misaligned unpack once read the bin as
+    smile_error, so every scan at bin >= 1 was recorded smile_corrected=False)."""
+    report, worker, events = reporter()
+    cal = SimpleNamespace(has_keystone=True, row_margin=(14, 4), created='2026-11-18T10:47:32')
+    worker.backend = SimpleNamespace(current_bin=camera_bin, _dark_mean=SimpleNamespace(shape=(10, 20)),
+                                     _dark_enabled=True, _hot_coords=None)
+    worker._smile = SimpleNamespace(calibration=cal, path='C:/maps/smile_model_bin2.npz')
+    worker._camera_hz = None
+    worker._active_calibration = lambda: cal
+    report(worker, SimpleNamespace(shape=(10, 20)))
+    info = worker.correction_info()
+    assert info['dark_corrected'] is True and info['smile_corrected'] is True
+    assert info['smile_model'] == 'smile_model_bin2.npz'
+    assert info['smile_model_created'] == '2026-11-18T10:47:32'
+    assert info['keystone_corrected'] is True and info['keystone_row_margin'] == [14, 4]
+    report(worker, SimpleNamespace(shape=(10, 20)), smile_error=True)
+    assert worker.correction_info()['smile_corrected'] is False
+
+
 def test_generic_card_accepts_arbitrary_values_and_palette():
     app = QApplication.instance() or QApplication([])
     card = StatusCard('Storage')

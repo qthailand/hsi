@@ -629,7 +629,9 @@ class AcquisitionEngine:
         status = self._last_correction_status
         if status is None or status[0]:
             return info
-        _, enabled, _, matches, model_id, smile_path, _, smile_error = status[:8]
+        # the key of _report_corrections: (dark_capture, enabled, id(reference), matches,
+        # id(model), id(loaded), smile path, bin, smile_error, warnings, wavelength)
+        _, enabled, _, matches, model_id, _, smile_path, _, smile_error = status[:9]
         hot = getattr(self.backend, '_hot_coords', None)
         info["dark_corrected"] = bool(enabled and matches)
         info["hot_pixel_corrected"] = bool(enabled and hot is not None)

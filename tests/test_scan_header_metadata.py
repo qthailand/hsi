@@ -139,17 +139,19 @@ def test_correction_info_reports_what_the_last_frame_went_through():
     from modules.acquisition.engine import AcquisitionEngine   # noqa: F401
     model = object()
     hot = np.zeros((5, 2), int)
-    applied = (False, True, 1, True, id(model), 'C:/maps/smile_model_bin2.npz', 2, False)
+    # the key of _report_corrections: (dark_capture, enabled, id(reference), matches, id(model),
+    # id(loaded), smile path, bin, smile_error)
+    applied = (False, True, 1, True, id(model), id(model), 'C:/maps/smile_model_bin2.npz', 2, False)
     assert _engine(applied, hot).correction_info() == {
         'frame_rate_hz': 80.0, 'dark_corrected': True, 'hot_pixel_corrected': True,
         'hot_pixel_count': 5, 'smile_corrected': True, 'smile_model': 'smile_model_bin2.npz'}
     # dark off, no smile model
-    off = (False, False, 1, True, id(None), None, 2, False)
+    off = (False, False, 1, True, id(None), id(None), None, 2, False)
     assert _engine(off, hot).correction_info() == {
         'frame_rate_hz': 80.0, 'dark_corrected': False, 'hot_pixel_corrected': False,
         'smile_corrected': False}
     # dark enabled but the reference does not match; smile model failed on the frame
-    mismatch = (False, True, 1, False, id(model), 'x.npz', 2, True)
+    mismatch = (False, True, 1, False, id(model), id(model), 'x.npz', 2, True)
     info = _engine(mismatch, None).correction_info()
     assert info['dark_corrected'] is False and info['hot_pixel_corrected'] is False
     assert info['smile_corrected'] is False and 'smile_model' not in info
@@ -160,7 +162,7 @@ def test_correction_info_marks_keystone_only_with_a_keystone_model(has_keystone)
     """``keystone_corrected`` is written only when the model corrects keystone, never ``False``:
     scans without keystone keep the key of references and flat-fields made before keystone."""
     calibration = NS(has_keystone=has_keystone, row_margin=(3, 4), created='2026-11-18T09:00:00')
-    status = (False, True, 1, True, id(calibration), 'C:/maps/smile_model_bin2.npz', 2, False)
+    status = (False, True, 1, True, id(calibration), id(calibration), 'C:/maps/smile_model_bin2.npz', 2, False)
     engine = _engine(status, np.zeros((5, 2), int))
     engine._smile = NS(calibration=calibration)
     info = engine.correction_info()
