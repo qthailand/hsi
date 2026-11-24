@@ -56,7 +56,7 @@ __all__ = ["FlatFieldProfile", "FlatFieldStore", "FlatFieldMatch", "flatfield_mi
 #: ``format_version`` of ``flatfield.json``.
 FLATFIELD_FORMAT_VERSION = 1
 #: Key values that scale every slit row alike and are therefore not compared.
-IGNORED_KEY_FIELDS = ("exposure_ms", "stage_type", "full_scale")
+IGNORED_KEY_FIELDS = ("exposure_ms", "stage_type", "full_scale", "dark_reference")
 
 _PROFILE_ID = re.compile(r"^flat_\d{8}_\d{6}(?:_\d+)?$")
 _INFO_FILE = "flatfield.json"

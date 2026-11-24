@@ -415,7 +415,15 @@ class MainWindow(QMainWindow):
     def _on_status_card_clicked(self, key: str):
         """A status card of the scan window was clicked: open that module's profile view."""
         from windows.integrations import RadiometricIntegration, SmileIntegration, WavelengthIntegration
-        target, method = {"smile": (SmileIntegration, "open"), "wavelength": (WavelengthIntegration, "open"),
+        if key == "dark":
+            if self.scan_controller is not None:
+                self.scan_controller.view_dark()
+            return
+        if key == "smile" and self.scan_controller is not None:
+            # the loaded model's viewer, whose button opens the Smile page; no model: the page itself
+            if self.scan_controller.view_smile(open_page=lambda: self._on_status_card_clicked("smile_page")):
+                return
+        target, method = {"smile": (SmileIntegration, "open"), "smile_page": (SmileIntegration, "open"), "wavelength": (WavelengthIntegration, "open"),
                           "flatfield": (RadiometricIntegration, "view_flatfield"),
                           "radiometric": (RadiometricIntegration, "view_reference")}.get(key, (None, None))
         for integration in self.integrations:

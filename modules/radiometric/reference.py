@@ -206,6 +206,11 @@ class ReferenceKey:
         dark_corrected: Whether dark subtraction was applied (required: factors need it).
         hot_pixel_corrected: Whether hot pixels were repaired.
         stage_type: ``"linear"``, ``"rotation"`` or ``"free"`` (no stage).
+        dark_reference: The dark frame the counts were corrected with: ``<dark file> @ <capture
+            time>`` (header ``dark reference`` + ``dark reference captured``). Compared only when
+            both sides know it (references made before it was recorded have none): factors fitted
+            on counts of one dark do not fit counts of another (a dark that caught light removes
+            lines from the counts, and the reflectance then shows false peaks and dips).
     """
 
     camera_backend: Optional[str] = None
@@ -228,6 +233,7 @@ class ReferenceKey:
     dark_corrected: Optional[bool] = None
     hot_pixel_corrected: Optional[bool] = None
     stage_type: Optional[str] = None
+    dark_reference: Optional[str] = None
 
     @classmethod
     def from_scan(cls, metadata: dict, wavelengths: Optional[Sequence[float]], lines: Optional[int]) -> "ReferenceKey":
@@ -263,6 +269,7 @@ class ReferenceKey:
             dark_corrected=_bool(metadata.get("dark_corrected")),
             hot_pixel_corrected=_bool(metadata.get("hot_pixel_corrected")),
             stage_type=_text(metadata.get("stage_type")),
+            dark_reference=_dark_reference(metadata),
         )
 
     def to_dict(self) -> dict:
@@ -297,6 +304,7 @@ class ReferenceKey:
             dark_corrected=_bool(data.get("dark_corrected")),
             hot_pixel_corrected=_bool(data.get("hot_pixel_corrected")),
             stage_type=_text(data.get("stage_type")),
+            dark_reference=_text(data.get("dark_reference")),
         )
 
     def missing(self) -> List[str]:
@@ -362,6 +370,9 @@ class ReferenceKey:
         compare("dark correction", self.dark_corrected, scan.dark_corrected)
         compare("hot-pixel correction", self.hot_pixel_corrected, scan.hot_pixel_corrected)
         compare("stage type", self.stage_type, scan.stage_type, lambda a, b: a.lower() == b.lower())
+        if self.dark_reference is not None and scan.dark_reference is not None                 and self.dark_reference != scan.dark_reference:
+            problems.append(f"dark reference: scan {scan.dark_reference}, reference {self.dark_reference}"
+                            " - make a new reference with the current dark")
         return problems
 
     def _keystone_mismatch(self, scan: "ReferenceKey") -> List[str]:
@@ -389,6 +400,17 @@ class ReferenceKey:
         except ValueError as exc:
             return [f"bands: {exc}"]
         return []
+
+
+def _dark_reference(metadata: dict) -> Optional[str]:
+    """``<dark file> @ <capture time>`` of a scan's metadata, or ``None`` when either is unknown or
+    dark subtraction was off."""
+    if _bool(metadata.get("dark_corrected")) is False:
+        return None
+    file, captured = _text(metadata.get("dark_file")), _text(metadata.get("dark_captured"))
+    if not file or not captured:
+        return None
+    return f"{file} @ {captured}"
 
 
 # ── a stored reference ─────────────────────────────────────────────────────

@@ -204,10 +204,11 @@ class ScanWindow(QWidget):
         # a click on a card opens that module's profile; Smile and Wavelength always have a
         # window to open, Flat-field and Radiometric only while there is a profile to show
         self._card_keys = {"smile": self.correction_status.smile, "wavelength": self.correction_status.wavelength,
+                           "dark": self.correction_status.dark,
                            "flatfield": self.flatfield_card, "radiometric": self.radiometric_card}
         for key, card in self._card_keys.items():
             card.clicked.connect(lambda key=key: self.status_card_clicked.emit(key))
-        self.correction_status.smile.set_clickable(True, "Open ▸")
+        self.correction_status.smile.set_clickable(True, "View ▸")   # the loaded model, else the Smile page
         self.correction_status.wavelength.set_clickable(True, "Open ▸")
 
         # ── Stage — rotation ─────────────────────────────────────
@@ -1043,6 +1044,16 @@ class ScanWindow(QWidget):
             return
         self._geometry = dict(geo)
         self._update_card_switches()
+
+    def set_dark_viewable(self, on: bool, warning: str = ""):
+        """The Dark card opens the dark viewer (``View ▸``) while a dark is loaded; ``warning`` (e.g. a
+        light leak found in it) is added to the card's tooltip."""
+        card = self.correction_status.dark
+        card.set_clickable(bool(on), "View ▸")
+        tip = "Click to view the dark reference" if on else ""
+        if warning:
+            tip = f"⚠ {warning}\n\n{tip}"
+        card.setToolTip(tip)
 
     def _on_dark_card_switch(self):
         if self._scanning:

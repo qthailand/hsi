@@ -31,6 +31,7 @@ Wavelength range:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import time
@@ -669,6 +670,7 @@ class ScanController:
     def _load_dark_reference_for_current_params(self):
         self._dark_path = None
         self._dark_provenance = {}
+        self._set_dark_viewable(False)
         try:
             bin_value, exposure_ms, gain = self._current_dark_params()
             info = self.backend.info
@@ -701,6 +703,10 @@ class ScanController:
                                "capture a dark for this camera", dark_file)
             if selection.dark_temperature is not None:
                 self._dark_provenance["dark_temperature_c"] = float(selection.dark_temperature)
+            self._dark_provenance["dark_captured"] = self._dark_capture_time(result)
+            leak = self._stored_dark_leak(result)
+            if leak is not None:
+                self._dark_provenance["dark_light_leak"] = self._light_leak_text(leak)
             n_hot = selection.n_hot
             self.win.dark_panel.set_loaded(
                 bin_value=bin_value,
@@ -721,6 +727,12 @@ class ScanController:
                 result["n_frames"], result["mean"].shape, n_hot,
                 selection.dark_temperature, selection.temperature,
             )
+            self._set_dark_viewable(True, self._dark_provenance.get("dark_light_leak", ""))
+            if leak is not None:
+                text = self._light_leak_text(leak)
+                logger.warning("Dark %s shows %s: light reached the sensor when it was captured", dark_file, text)
+                self.win.set_status(f"Warning: dark {os.path.basename(result['path'])} shows {text} - light reached "
+                                    "the sensor when it was captured. Capture it again with the lens capped.")
         except Exception as e:
             self.dark_reference = None
             self._dark_path = None
@@ -728,6 +740,88 @@ class ScanController:
             self.backend.set_dark_reference(None, None)
             self.win.dark_panel.set_error("Load failed")
             logger.exception("Failed to load dark frame: %s", e)
+
+    def _set_dark_viewable(self, on: bool, warning: str = "") -> None:
+        """Dark card clickable (``View ▸``) while a dark is loaded; a light leak goes into its tooltip."""
+        setter = getattr(self.win, "set_dark_viewable", None)
+        if setter is None:
+            return
+        try:
+            setter(on, f"Light leak: {warning}" if warning else "")
+        except Exception:
+            logger.debug("Dark card state not updated", exc_info=True)
+
+    def view_dark(self):
+        """Dark card clicked: plot the dark in use (column profile, replaced darks, spectral
+        structure along the slit, light-leak verdict) in a non-modal dialog. Returns it, or ``None``."""
+        dark = getattr(self, "dark_reference", None)
+        if not dark or dark.get("mean") is None:
+            self.win.set_status("No dark reference loaded")
+            return None
+        try:
+            from modules.dark.view import DarkViewDialog
+            wavelength = None
+            try:
+                camera_bin = int(dark.get("bin") or self.win.selected_bin())
+                wavelength = (float(self.config.m) * camera_bin, float(self.config.c))
+            except Exception:
+                logger.debug("No wavelength calibration for the dark view", exc_info=True)
+            dialog = DarkViewDialog(dark, wavelength=wavelength, parent=self.win)
+        except Exception as exc:
+            logger.exception("Cannot show the dark reference")
+            self.win.set_status(f"Cannot show the dark reference: {exc}")
+            return None
+        self._dark_view = dialog                    # kept alive while shown
+        dialog.show()
+        return dialog
+
+    def view_smile(self, open_page=None):
+        """Smile card clicked: plot the loaded Smile (or Smile + keystone) model - distortion grid and
+        shift maps - in a non-modal dialog. ``open_page`` is called by its *Open Smile page* button.
+        Returns the dialog, or ``None`` when no model is loaded (the caller then opens the Smile page)."""
+        runtime = getattr(getattr(self, "preview_thread", None), "_smile", None)
+        cal = getattr(runtime, "calibration", None)
+        if cal is None:
+            return None
+        try:
+            from modules.smile.model_view import SmileModelViewDialog
+            dialog = SmileModelViewDialog(cal, str(getattr(runtime, "path", "") or ""), open_page=open_page,
+                                          parent=self.win)
+        except Exception as exc:
+            logger.exception("Cannot show the Smile model")
+            self.win.set_status(f"Cannot show the Smile model: {exc}")
+            return None
+        self._smile_view = dialog                   # kept alive while shown
+        dialog.show()
+        return dialog
+
+    @staticmethod
+    def _dark_capture_time(result: dict) -> str:
+        """When the loaded dark was captured (its ``captured_at``), or for an older file without it
+        ``modified <ISO time>`` of the file: either way it changes when the file is replaced."""
+        captured = result.get("captured_at")
+        if captured:
+            return str(captured)
+        try:
+            stamp = datetime.datetime.fromtimestamp(os.path.getmtime(result["path"])).astimezone()
+            return "modified " + stamp.isoformat(timespec="seconds")
+        except (OSError, KeyError, TypeError, ValueError):
+            return ""
+
+    def _stored_dark_leak(self, result: dict):
+        """:func:`~modules.dark.library.light_leak` of a loaded dark, cached per file and capture time
+        (a dark is reloaded whenever the temperature moves to another file)."""
+        from modules.dark.library import light_leak
+        key = (result.get("path"), self._dark_capture_time(result))
+        cache = getattr(self, "_dark_leak_cache", None)
+        if cache is None or cache[0] != key:
+            try:
+                leak = light_leak(result["mean"])
+            except Exception:
+                logger.exception("Light-leak check of the dark failed")
+                leak = None
+            self._dark_leak_cache = cache = (key, leak)
+        return cache[1]
 
     def _follow_dark_temperature(self):
         """In preview, switch to another stored dark once it is nearer the current temperature."""
@@ -1023,11 +1117,29 @@ class ScanController:
             if done:
                 self._load_dark_reference_for_current_params()
                 self.preview_thread.set_dark_capture_mode(False)
+                outcome = getattr(self.dark_lib, "last_capture", None) or {}
+                if outcome.get("saved") is None and outcome.get("light_leak"):
+                    text = self._light_leak_text(outcome["light_leak"])
+                    self.win.dark_panel.set_error("Dark not saved: light reached the sensor")
+                    self.win.set_status(f"Dark capture refused - {text}. Cap the lens and switch off room "
+                                        "lights, then capture again (the stored dark is unchanged).")
         except Exception as e:
             logger.exception("Dark capture failed: %s", e)
             self.dark_lib.cancel()
             self.preview_thread.set_dark_capture_mode(False)
             self.win.dark_panel.set_error("Capture failed")
+
+    def _light_leak_text(self, leak: dict) -> str:
+        """``spectral lines at ~912, 966 nm (1537 counts)`` for a :func:`light_leak` result; the
+        columns are given in nm with the wavelength calibration of the current bin, else as columns."""
+        cols = list(leak.get("columns") or [])[:4]
+        try:
+            camera_bin = int(self.win.selected_bin())
+            m, c = float(self.config.m) * camera_bin, float(self.config.c)
+            where = "~" + ", ".join(f"{c + m * col:.0f}" for col in cols) + " nm"
+        except Exception:
+            where = "columns " + ", ".join(str(col) for col in cols)
+        return f"spectral lines at {where} ({float(leak.get('peak_counts', 0)):.0f} counts)"
 
     def toggle_dark_subtraction(self, enabled: bool):
         self.backend.set_dark_enabled(enabled)

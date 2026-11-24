@@ -48,7 +48,9 @@ def test_recapture_at_same_degree_replaces_and_legacy_is_only_a_fallback(tmp_pat
     assert lib.load(1, 10.0, 1.0, temperature=25.0)['temperature'] is None
     capture(lib, 8, 25.2)
     capture(lib, 9, 24.8)                                   # same whole degree: replaces
-    assert sorted(os.listdir(tmp_path)) == ['dark_b1_e10.0_g1.0.npz', 'dark_b1_e10.0_g1.0_t+25.npz']
+    assert sorted(os.listdir(tmp_path)) == ['dark_b1_e10.0_g1.0.npz', 'dark_b1_e10.0_g1.0_t+25.npz', 'history']
+    kept = os.listdir(tmp_path / 'history')                 # the replaced capture is kept, not lost
+    assert len(kept) == 1 and kept[0].startswith('dark_b1_e10.0_g1.0_t+25.')
     assert lib.load(1, 10.0, 1.0, temperature=90.0)['mean'][0, 0] == 9         # legacy never preferred
     lib.delete(1, 10.0, 1.0, temperature=25.0)
     assert lib.load(1, 10.0, 1.0, temperature=25.0)['mean'][0, 0] == 7

@@ -58,9 +58,19 @@ proc.set_dark_reference(ref["mean"], ref["hot_pixel_map"])
   `(bin, exposure, gain)`, and is never written or deleted.
 * File `dark_b{bin}_e{exposure:.1f}_g{gain:.1f}_t{temperature:+d}.npz` (temperature
   = mean over the capture in °C, rounded to whole degrees; a recapture in the same degree
-  replaces the file) with arrays `mean`, `hot_pixel_map`, `bin` (int32), `exposure` (ms,
+  replaces the file, and the replaced file is moved to `history/<stem>.<YYYYMMDD-HHMMSS>.npz`
+  after its own capture time) with arrays `mean`, `hot_pixel_map`, `bin` (int32), `exposure` (ms,
   float32), `gain` (float32), `n_frames` (int32), and `temperature`, `temperature_min`,
-  `temperature_max` (°C, float64), `camera_model`, `camera_serial` (str, when known).
+  `temperature_max` (°C, float64), `camera_model`, `camera_serial` (str, when known),
+  `captured_at` (local ISO time; absent in older files).
+* Light leak: `light_leak(mean)` finds narrow spectral lines in a dark (light reached the
+  sensor through the slit, e.g. argon lines of room fluorescent tubes at 912 / 966 / 1047 nm).
+  Subtracting such a dark removes those counts from every pixel, and reflectance then shows
+  false peaks (targets brighter than the reference panel) and dips (darker ones). A capture
+  with lines is not stored (`reject_light_leak`, default True; `last_capture` says why), and
+  the application warns when it loads a stored dark that has them. The scan header records
+  `dark reference captured` (and `dark reference light leak`), and a radiometric reference
+  made with another dark is refused (`ReferenceKey.dark_reference`).
   Without a temperature (camera reports `-999`, or an older file) the name has no `_t` part
   and the temperature arrays are absent; such a file is used only when its `(bin, exposure, gain)` has no file with a temperature.
   Note: no `format_version` key is stored.
@@ -74,8 +84,8 @@ proc.set_dark_reference(ref["mean"], ref["hot_pixel_map"])
   `dark_reference` returns the current immutable `DarkReference` (dark mean and hot-pixel tables).
 * `DarkFrameLibrary(folder, n_frames=50, fallback_folder=None, camera_model=None, camera_serial=None)`:
   `start_capture`, `add_frame(frame, temperature)`, `cancel`, `progress`, `is_collecting`,
-  `find`/`load(bin, exposure, gain, temperature)` (`load` adds `camera_model`, `camera_serial`
-  and the full `path`), `exists`, `delete(..., temperature=None)` and `list_keys` (both
+  `find`/`load(bin, exposure, gain, temperature)` (`load` adds `camera_model`, `camera_serial`,
+  `captured_at` and the full `path`), `last_capture`, `reject_light_leak`, `exists`, `delete(..., temperature=None)` and `list_keys` (both
   `folder` only).
 * `UNKNOWN_TEMPERATURE_C` (60.0) and
   `valid_temperature(value)` (``None`` for ``-999``/NaN) are exported too.

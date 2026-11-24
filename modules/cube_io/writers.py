@@ -85,6 +85,10 @@ SCAN_HEADER_FIELDS = (
     ('hot_pixel_count', 'hot pixel count', int),
     ('dark_file', 'dark reference', str),          # its temperature: 'dark temperature' above
     ('dark_frames', 'dark reference frames', int),
+    # when that dark was captured ('modified <time>' for an older file): with the file name it
+    # identifies the frame, since a new capture replaces the file (the old one goes to history/)
+    ('dark_captured', 'dark reference captured', str),
+    ('dark_light_leak', 'dark reference light leak', str),     # spectral lines found in the dark
     ('smile_corrected', 'smile corrected', bool),
     ('smile_model', 'smile model', str),
     ('smile_model_created', 'smile model created', str),
