@@ -32,7 +32,7 @@ Example:
     >>> win.load_from_memory(cube, wavelengths)                 # doctest: +SKIP
 """
 from .workers import Worker
-from .core import _apply_spatial_binning, rowwise_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, fluo_calculation_heavy_logic, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles, check_factor_bands, save_factor_profile, load_factor_profile
+from .core import _apply_spatial_binning, rowwise_calculation_heavy_logic, create_datacube_logic, create_datacube_resampled_logic, build_raw_cube_tmp, build_cal_cube_tmp, fluo_calculation_heavy_logic, REFLECTANCE_PROFILE_DIR, list_reflectance_profiles, check_factor_bands, save_factor_profile, load_factor_profile, processed_cube_problem
 from modules.cube_io.envi import parse_envi_header, _read_envi_band_float32, release_band_maps
 from modules.cube_io.writers import acquisition_time_utc, metadata_header_lines
 # -*- coding: utf-8 -*-
@@ -755,7 +755,13 @@ class CalibrationWindow(QWidget):
         self._post_build_actions.clear()
 
     def _reference_refused(self, ref_meta) -> bool:
-        """Warn and return True if factors from ``ref_meta``'s bands would not fit the loaded cube."""
+        """Warn and return True if factors cannot be fitted on ``ref_meta``'s cube: it is already
+        flat-fielded or reflectance (:func:`processed_cube_problem`), or its bands would not fit
+        the loaded cube."""
+        problem = processed_cube_problem(ref_meta)
+        if problem:
+            QMessageBox.warning(self, 'Reference not used', f'The reference cube cannot be used: {problem}')
+            return True
         if not self.raw_meta:
             return False                        # checked when a cube is loaded
         try:
@@ -943,9 +949,24 @@ class CalibrationWindow(QWidget):
     #  Create Datacube
     # =====================================================================
 
+    def _calibration_refused(self) -> bool:
+        """Warn and return True when factors are set but the loaded cube is already flat-fielded or
+        reflectance (:func:`processed_cube_problem`): they would divide it a second time. Without
+        factors it is only cropped / binned / resampled, which is allowed."""
+        has_factors = self.rowwise_factors is not None or getattr(self, 'factors', None) is not None
+        problem = processed_cube_problem(self.raw_meta) if has_factors else None
+        if problem:
+            QMessageBox.warning(self, 'Not calibrated',
+                                f'This cube cannot be calibrated: {problem}\n\nClear the factors to export it '
+                                'cropped / binned only.')
+            return True
+        return False
+
     def event_create_dispatch(self):
         """Create Datacube button: export resampled or original-band cube depending on the Resample check box.
         """
+        if self.raw_filepath and self._calibration_refused():
+            return
         if self.chk_resample.isChecked():
             self.event_create_resampled()
         else:

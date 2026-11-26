@@ -207,6 +207,11 @@ class RadiometricIntegration(Integration):
                                   "No active radiometric reference uses it yet: scan the Spectralon and press "
                                   "Save as Radiometric Reference.\n")
                                + "Make a new profile after moving a lamp or changing the working distance.")
+                    from modules.flatfield.store import next_scan_text
+                    _level, advice = next_scan_text(store.next_scan(profile), profile.info.get("leave_one_out"),
+                                                    combined=bool(profile.combined_from))
+                    if advice:
+                        tooltip += "\n" + advice
         except Exception as exc:
             logger.exception("Cannot read the flat-field profiles")
             state, text = "off", f"Flat-field: profiles unreadable ({exc})"
@@ -245,17 +250,39 @@ class RadiometricIntegration(Integration):
         dialog.show()
         return dialog
 
+    def flatfield_peek_data(self):
+        """:class:`~modules.profile_peek.PeekData` of the profile the Flat-field card reports (its
+        peek), or ``None`` without one."""
+        profile = self.refresh_flatfield_status()
+        if profile is None:
+            return None
+        from modules.profile_peek import flatfield_peek
+        return flatfield_peek(profile)
+
+    def _newest_active_reference(self):
+        """The newest active radiometric reference of the open camera, or ``None``."""
+        controller = self.host.scan_controller
+        store = self.reference_store(controller) if controller is not None else None
+        active = store.active() if store is not None else []
+        return max(active, key=lambda r: (r.acquired, r.id)) if active else None
+
+    def reference_peek_data(self):
+        """:class:`~modules.profile_peek.PeekData` of the newest active radiometric reference (the
+        Radiometric card's peek), or ``None`` without one."""
+        reference = self._newest_active_reference()
+        if reference is None:
+            return None
+        from modules.profile_peek import reference_peek
+        return reference_peek(reference)
+
     def view_reference(self):
         """Radiometric card clicked: plot the newest active radiometric reference (non-modal).
         Returns the dialog, or ``None`` without an active reference."""
-        controller = self.host.scan_controller
         try:
-            store = self.reference_store(controller) if controller is not None else None
-            active = store.active() if store is not None else []
-            if not active:
+            reference = self._newest_active_reference()
+            if reference is None:
                 self.host.show_status("No active radiometric reference to show")
                 return None
-            reference = max(active, key=lambda r: (r.acquired, r.id))
             from modules.radiometric.reference_view import ReferenceViewDialog
             dialog = ReferenceViewDialog(reference, parent=self.host.parent_widget)
         except Exception as exc:

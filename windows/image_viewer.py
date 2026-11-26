@@ -12,6 +12,9 @@ class ImageViewer(QWidget):
     start_scan_requested = pyqtSignal()
     stop_scan_requested = pyqtSignal()
     line_y_changed = pyqtSignal(int)
+    #: :meth:`set_scanning_ui` was called: True = scanning (Start off, Stop on). Lets a host
+    #: that shows its own Start / Stop buttons follow the same state.
+    scanning_ui_changed = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -36,9 +39,23 @@ class ImageViewer(QWidget):
         self.start_btn.clicked.connect(self.start_scan_requested.emit)
         self.stop_btn.clicked.connect(self.stop_scan_requested.emit)
 
+    def use_scan_buttons(self, start_btn, stop_btn):
+        """Let ``start_btn`` / ``stop_btn`` (a host's own, e.g. pinned under its settings) be the
+        Start / Stop buttons: they emit :attr:`start_scan_requested` / :attr:`stop_scan_requested`
+        and :meth:`set_scanning_ui` enables them. The buttons on the image are removed."""
+        start_enabled, stop_enabled = self.start_btn.isEnabled(), self.stop_btn.isEnabled()
+        for button in (self.start_btn, self.stop_btn):
+            self.image.remove_overlay_button(button)
+        self.start_btn, self.stop_btn = start_btn, stop_btn
+        start_btn.setEnabled(start_enabled)
+        stop_btn.setEnabled(stop_enabled)
+        start_btn.clicked.connect(self.start_scan_requested.emit)
+        stop_btn.clicked.connect(self.stop_scan_requested.emit)
+
     def set_scanning_ui(self, scanning: bool):
         self.start_btn.setEnabled(not scanning)
         self.stop_btn.setEnabled(scanning)
+        self.scanning_ui_changed.emit(bool(scanning))
 
     def set_image(self, frame: np.ndarray):
         self.image.set_array(frame)

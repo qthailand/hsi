@@ -19,10 +19,12 @@ Example:
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QPointF
-from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygonF
+from PyQt5.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget, QVBoxLayout
 
 from .saturation import saturated_mask
@@ -37,6 +39,61 @@ _GRID_ALPHA = 0.18
 _AXIS_LABEL_STYLE = {"color": "#bdbdbd", "font-size": "10px"}
 _TITLE_STYLE = {"color": "#e0e0e0", "font-size": "11px"}
 _TICK_FONT = QFont("sans-serif", 8)
+
+
+#: Colour of light at a wavelength, for the live spectrum's line and fill: ``(nm, '#RRGGBB')``
+#: anchors, linearly interpolated; below the first / above the last the end colour holds (the
+#: near infrared is a neutral grey: the eye sees none of it).
+SPECTRUM_COLOR_ANCHORS = ((380, "#6a3d9a"), (420, "#7b5cff"), (450, "#3f6fff"), (480, "#2fa9f5"),
+                          (510, "#3fd17a"), (560, "#e8e04a"), (590, "#ffb347"), (620, "#ff5a4e"),
+                          (680, "#c9463f"), (750, "#8a6f78"), (850, "#7d8794"))
+#: Line colour when the x axis is the band index (no wavelengths).
+_LINE_NO_WAVELENGTH = "#4fc3f7"
+
+
+_ANCHOR_NM = np.array([w for w, _ in SPECTRUM_COLOR_ANCHORS], dtype=np.float64)
+_ANCHOR_RGB = np.array([[int(c[i:i + 2], 16) for i in (1, 3, 5)] for _, c in SPECTRUM_COLOR_ANCHORS],
+                       dtype=np.float64)
+
+
+def wavelength_color(nm: float) -> QColor:
+    """The display colour of ``nm`` (see :data:`SPECTRUM_COLOR_ANCHORS`; NaN: the neutral grey)."""
+    nm = float(nm)
+    if not np.isfinite(nm):
+        nm = float(_ANCHOR_NM[-1])
+    return QColor(*(int(round(np.interp(nm, _ANCHOR_NM, _ANCHOR_RGB[:, k]))) for k in range(3)))
+
+
+@functools.lru_cache(maxsize=16)
+def _gradient_stops(nm0: float, nm1: float, alpha: int, samples: int) -> tuple:
+    """``((position, QColor), ...)`` of :func:`wavelength_gradient` (the same few per live view)."""
+    stops = []
+    for f in np.linspace(0.0, 1.0, int(samples)):
+        color = wavelength_color(nm0 + (nm1 - nm0) * f)
+        color.setAlpha(int(alpha))
+        stops.append((float(f), color))
+    return tuple(stops)
+
+
+def wavelength_gradient(x0: float, x1: float, nm0: float, nm1: float, alpha: int = 255,
+                        samples: int = 32) -> QLinearGradient:
+    """Horizontal gradient from pixel ``x0`` (``nm0``) to ``x1`` (``nm1``) in the colours of light."""
+    gradient = QLinearGradient(float(x0), 0.0, float(x1), 0.0)
+    for f, color in _gradient_stops(float(nm0), float(nm1), int(alpha), int(samples)):
+        gradient.setColorAt(f, QColor(color))
+    return gradient
+
+
+def nice_ticks(lo: float, hi: float, most: int = 7) -> list:
+    """Round tick values (1, 2, 2.5, 5 x 10^n apart) inside ``[lo, hi]``, at most ``most`` of them."""
+    span = float(hi) - float(lo)
+    if not np.isfinite(span) or span <= 0:
+        return [float(lo)]
+    for step in (m * 10.0 ** e for e in range(-2, 6) for m in (1, 2, 2.5, 5)):
+        if span / step <= most - 1:
+            first = np.ceil(float(lo) / step) * step
+            return [float(v) for v in np.arange(first, float(hi) + step * 1e-6, step)]
+    return [float(lo), float(hi)]
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -78,6 +135,10 @@ class LiveLineSpectrumWidget(QWidget):
     pixel can reach is drawn as a dashed red line, saturated points are drawn red and
     the number of saturated bands is shown, because after dark subtraction a clipped
     pixel sits at ``full scale - dark``, well below the top of the axis.
+
+    With wavelengths the line and a soft fill under it take the colour of light at each
+    wavelength (:func:`wavelength_color`), the peak's wavelength is shown at the top right
+    (:meth:`peak_text`), and the x axis has round nm ticks.
     """
 
     _BIT_CEILINGS = [
@@ -101,11 +162,11 @@ class LiveLineSpectrumWidget(QWidget):
         self._y_max: float = 65535.0
         self._manual_bit_depth: int | None = None
 
-        # layout
-        self._ml = 55
-        self._mr = 15
-        self._mt = 18
-        self._mb = 40
+        # layout: room for the y counts at the left, the peak above, the nm labels below
+        self._ml = 44
+        self._mr = 12
+        self._mt = 22
+        self._mb = 22
 
         self._major_x = 10
         self._major_y = 8
@@ -184,6 +245,8 @@ class LiveLineSpectrumWidget(QWidget):
         use_wl = (
             wavelengths is not None
             and np.asarray(wavelengths).shape[0] == spectrum.shape[0]
+            # a NaN end wavelength would make every paint fail: band numbers instead
+            and bool(np.isfinite(np.asarray(wavelengths, dtype=np.float64)[[0, -1]]).all())
         )
 
         if use_wl:
@@ -225,6 +288,16 @@ class LiveLineSpectrumWidget(QWidget):
         self._n_saturated = int(np.count_nonzero(mask))
         edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.view(np.int8), [0]))))
         self._sat_runs = list(zip(edges[0::2].tolist(), edges[1::2].tolist()))
+
+    def peak_text(self) -> str:
+        """Where the spectrum peaks: ``'612 nm'`` (``'band 37'`` without wavelengths), ``''`` with none."""
+        if self._data is None or self._n_points == 0 or not np.isfinite(self._data).any():
+            return ""
+        i = int(np.nanargmax(self._data))
+        if self._use_wavelengths and self._n_points > 1:
+            nm = self._wl_min + (self._wl_max - self._wl_min) * i / (self._n_points - 1)
+            return f"{nm:.0f} nm"
+        return f"band {i}"
 
     # ── auto-scale Y (UP only) ───────────────────────────────────
 
@@ -300,87 +373,77 @@ class LiveLineSpectrumWidget(QWidget):
     # ── paint ─────────────────────────────────────────────────────
 
     def paintEvent(self, event):
-        """Qt handler: draw grid, axes, tick labels and the spectrum polyline."""
+        """Qt handler: quiet grid, round ticks, the spectrum in the colours of light, the peak."""
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-
-        p.fillRect(self.rect(), QColor(15, 15, 15))
+        p.fillRect(self.rect(), QColor(17, 19, 23))
 
         plot_w = self.width() - self._ml - self._mr
         plot_h = self.height() - self._mt - self._mb
-
         if plot_w < 1 or plot_h < 1:
             p.end()
             return
+        left, top, bottom, right = self._ml, self._mt, self._mt + plot_h, self._ml + plot_w
 
-        dx_major = plot_w / self._major_x
-        dy_major = plot_h / self._major_y
-
-        # minor grid
-        p.setPen(QPen(QColor(35, 35, 35)))
-        for major in range(self._major_x):
-            x0 = self._ml + major * dx_major
-            for k in range(1, self._minor_x):
-                x = x0 + k * dx_major / self._minor_x
-                p.drawLine(int(x), self._mt, int(x), self._mt + plot_h)
-        for major in range(self._major_y):
-            y0 = self._mt + plot_h - major * dy_major
-            for k in range(1, self._minor_y):
-                y = y0 - k * dy_major / self._minor_y
-                p.drawLine(self._ml, int(y), self._ml + plot_w, int(y))
-
-        # major grid
-        p.setPen(QPen(QColor(60, 60, 60)))
-        for i in range(self._major_x + 1):
-            x = self._ml + i * dx_major
-            p.drawLine(int(x), self._mt, int(x), self._mt + plot_h)
-        for i in range(self._major_y + 1):
-            y = self._mt + plot_h - i * dy_major
-            p.drawLine(self._ml, int(y), self._ml + plot_w, int(y))
-
-        # axis
-        p.setPen(QPen(QColor(220, 220, 220)))
-        p.drawLine(self._ml, self._mt, self._ml, self._mt + plot_h)
-        p.drawLine(self._ml, self._mt + plot_h, self._ml + plot_w, self._mt + plot_h)
-
-        # X ticks
-        for i in range(self._major_x + 1):
-            x = self._ml + i * dx_major
-            wl = self._wl_min + (self._wl_max - self._wl_min) * i / self._major_x
-            p.drawText(int(x) - 15, self._mt + plot_h + 18, f"{wl:.0f}")
-
-        # Y ticks — right-aligned
-        vmax = self._y_max
+        small = QFont(p.font())
+        small.setPointSizeF(max(6.5, small.pointSizeF() * 0.85))
+        p.setFont(small)
         metrics = p.fontMetrics()
-        for i in range(self._major_y + 1):
-            y = self._mt + plot_h - i * dy_major
-            value = vmax * i / self._major_y
-            text = f"{value:.0f}"
+        muted = QColor(125, 135, 148)
+
+        # y: five levels of the full scale, a faint line each, the counts at the left
+        vmax = self._y_max
+        for i in range(5):
+            y = bottom - plot_h * i / 4
+            p.setPen(QPen(QColor(38, 42, 49) if i else QColor(62, 68, 77), 1))
+            p.drawLine(left, int(y), right, int(y))
+            text = f"{vmax * i / 4:.0f}"
+            p.setPen(QPen(muted))
+            p.drawText(left - metrics.horizontalAdvance(text) - 6, int(y) + metrics.ascent() // 2 - 1, text)
+
+        # x: round wavelengths (or band numbers), the unit on the last label
+        span = self._wl_max - self._wl_min
+        lo, hi = sorted((self._wl_min, self._wl_max))         # wavelengths may run downwards
+        ticks = nice_ticks(lo, hi) if span != 0 else [self._wl_min]
+        if span < 0:
+            ticks = ticks[::-1]
+        unit = " nm" if self._use_wavelengths else ""
+        p.setPen(QPen(muted))
+        for k, value in enumerate(ticks):
+            x = left + (plot_w * (value - self._wl_min) / span if span != 0 else 0)
+            text = f"{value:.0f}" + (unit if k == len(ticks) - 1 else "")
             tw = metrics.horizontalAdvance(text)
-            p.drawText(int(self._ml) - tw - 6, int(y) + 4, text)
+            p.drawText(int(min(max(x - tw / 2, left - 4), right - tw + 4)), bottom + metrics.ascent() + 5, text)
 
-        # X label
-        p.drawText(self._ml + plot_w // 2 - 50, self.height() - 8, self._xlabel)
-
-        # Y label
-        p.save()
-        p.translate(12, self._mt + plot_h // 2)
-        p.rotate(-90)
-        tw = metrics.horizontalAdvance("Intensity")
-        p.drawText(-tw // 2, 0, "Intensity")
-        p.restore()
-
-        # saturation ceiling (dashed) under the spectrum
+        # full scale (or the saturation ceiling, which sits lower after dark subtraction): dashed red
         if self._ceiling_polygon.size() > 1:
             p.setPen(QPen(QColor(239, 83, 80, 170), 1.0, Qt.DashLine))
             p.drawPolyline(self._ceiling_polygon)
+        else:
+            p.setPen(QPen(QColor(150, 60, 60, 160), 1.0, Qt.DashLine))
+            p.drawLine(left, top, right, top)
 
-        # spectrum line
-        if self._data is not None and self._n_points > 1:
-            p.setPen(QPen(QColor(79, 195, 247), 1.6))
+        if self._data is not None and self._n_points > 1 and self._polygon.size() == self._n_points:
+            x0, x1 = float(self._x_cache[0]), float(self._x_cache[-1])
+            if self._use_wavelengths:
+                line_brush = QBrush(wavelength_gradient(x0, x1, self._wl_min, self._wl_max))
+                fill_brush = QBrush(wavelength_gradient(x0, x1, self._wl_min, self._wl_max, alpha=46))
+            else:
+                line_brush = QBrush(QColor(_LINE_NO_WAVELENGTH))
+                fill_color = QColor(_LINE_NO_WAVELENGTH)
+                fill_color.setAlpha(40)
+                fill_brush = QBrush(fill_color)
+            area = QPolygonF(self._polygon)
+            area.append(QPointF(x1, float(bottom)))
+            area.append(QPointF(x0, float(bottom)))
+            p.setPen(Qt.NoPen)
+            p.setBrush(fill_brush)
+            p.drawPolygon(area)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(line_brush, 1.8))
             p.drawPolyline(self._polygon)
 
-        # saturated points: red over the spectrum, plus a count
+        # saturated points: red over the spectrum
         if self._sat_runs and self._polygon.size() == self._n_points:
             p.setPen(QPen(QColor(255, 82, 82), 2.6))
             for start, stop in self._sat_runs:
@@ -388,10 +451,20 @@ class LiveLineSpectrumWidget(QWidget):
                     p.drawPolyline(self._polygon.mid(start, stop - start))
                 else:
                     p.drawPoint(self._polygon[start])
+
+        # the peak at the top right, the saturated count at the top left
+        peak = self.peak_text()
+        if peak:
+            bold = QFont(small)
+            bold.setBold(True)
+            p.setFont(bold)
+            p.setPen(QPen(QColor(230, 233, 238)))
+            p.drawText(right - p.fontMetrics().horizontalAdvance(peak), top - 7, peak)
+            p.setFont(small)
+        if self._n_saturated:
             text = f"SATURATED {self._n_saturated} band" + ("s" if self._n_saturated != 1 else "")
             p.setPen(QPen(QColor(255, 82, 82)))
-            tw = metrics.horizontalAdvance(text)
-            p.drawText(self._ml + plot_w - tw - 6, self._mt + 14, text)
+            p.drawText(left, top - 7, text)
 
         p.end()
 

@@ -163,7 +163,7 @@ class ScanController:
                                                   profile=bool(getattr(config, "profile_timing", True)))
         self.preview_thread.saturation_ceiling_ready.connect(self._on_saturation_ceiling)
         self.preview_thread.frame_ready.connect(self.on_preview_frame)
-        self.preview_thread.processed_frame_ready.connect(self.win.save_processed_frame)
+        self.preview_thread.frame_stages_ready.connect(self.win.save_frame_stages)
         self.preview_thread.bin_applied.connect(self._on_bin_applied)
         self.preview_thread.bin_failed.connect(self._on_bin_failed)
         self.preview_thread.params_applied.connect(self._on_params_applied)
@@ -760,13 +760,7 @@ class ScanController:
             return None
         try:
             from modules.dark.view import DarkViewDialog
-            wavelength = None
-            try:
-                camera_bin = int(dark.get("bin") or self.win.selected_bin())
-                wavelength = (float(self.config.m) * camera_bin, float(self.config.c))
-            except Exception:
-                logger.debug("No wavelength calibration for the dark view", exc_info=True)
-            dialog = DarkViewDialog(dark, wavelength=wavelength, parent=self.win)
+            dialog = DarkViewDialog(dark, wavelength=self._dark_wavelength(dark), parent=self.win)
         except Exception as exc:
             logger.exception("Cannot show the dark reference")
             self.win.set_status(f"Cannot show the dark reference: {exc}")
@@ -794,6 +788,39 @@ class ScanController:
         self._smile_view = dialog                   # kept alive while shown
         dialog.show()
         return dialog
+
+    def _dark_wavelength(self, dark):
+        """``(m, c)`` (nm = c + m * column) at the dark's bin, or ``None`` without a calibration."""
+        try:
+            camera_bin = int(dark.get("bin") or self.win.selected_bin())
+            return float(self.config.m) * camera_bin, float(self.config.c)
+        except Exception:
+            logger.debug("No wavelength calibration for the dark view", exc_info=True)
+            return None
+
+    def dark_peek_data(self):
+        """:class:`~modules.profile_peek.PeekData` of the dark in use (the Dark card's peek), or
+        ``None`` without one."""
+        dark = getattr(self, "dark_reference", None)
+        if not dark or dark.get("mean") is None:
+            return None
+        from modules.profile_peek import dark_peek
+        leak = None
+        try:
+            leak = self._stored_dark_leak(dark)
+        except Exception:
+            logger.debug("Light-leak check skipped for the dark peek", exc_info=True)
+        return dark_peek(dark, wavelength=self._dark_wavelength(dark), leak=leak)
+
+    def smile_peek_data(self):
+        """:class:`~modules.profile_peek.PeekData` of the loaded Smile model (the Smile card's peek),
+        or ``None`` without one (the card then opens the Smile page directly)."""
+        runtime = getattr(getattr(self, "preview_thread", None), "_smile", None)
+        cal = getattr(runtime, "calibration", None)
+        if cal is None:
+            return None
+        from modules.profile_peek import smile_peek
+        return smile_peek(cal, str(getattr(runtime, "path", "") or ""))
 
     @staticmethod
     def _dark_capture_time(result: dict) -> str:
@@ -1596,16 +1623,34 @@ class ScanController:
 
     def _without_flatfield(self, frame):
         """Flat-field switched off with radiometric calibration on: the reference's factors with its
-        flat-field profile taken out (``factors x F``: the reference's scale per band only, the same
-        for every slit row). A reference made without a profile is returned as it is."""
+        flat-field profile taken out, the same for every slit row. A reference made without a
+        profile is returned as it is.
+
+        The factors are ``scale / F`` with ``scale = R / mean_ROI(c / F)``, and ``F`` has median 1
+        over the whole slit, not 1 at the reference target. ``factors x F`` alone (``scale``) would
+        give ``R x F_ROI`` on the target itself; dividing by ``F_ROI``, the mean of ``F`` over the
+        ROI pixels per band, keeps the target's rows at ``R`` (as a reference fitted without a
+        profile: right on the target, the falloff along the slit left in).
+
+        ``F`` is the copy kept with the reference (``flatfield.npy``); a reference stored before
+        that has only its id, and ``F`` is read from the flat-field store, checked against the
+        factors the same way."""
         flat_id = frame.reference.info.get("flatfield")
         if not flat_id:
             return frame, ""
         try:
-            store = self._flatfield_store()
-            flat = store.load(flat_id).profile()
-            factors = np.asarray(frame.factors, np.float32) * np.asarray(flat, np.float32)
-            if factors.shape != frame.factors.shape or not np.all(np.isfinite(factors)) or np.any(factors <= 0):
+            from modules.radiometric.reference import check_flatfield_fits
+            kept = getattr(frame.reference, "flatfield", None)
+            flat = kept() if kept is not None else None
+            if flat is None:                                  # an older reference: the store's copy
+                flat = check_flatfield_fits(frame.factors, self._flatfield_store().load(flat_id).profile())
+            flat = np.asarray(flat, np.float64)
+            per_row = frame.reference.roi_mask().sum(axis=1).astype(np.float64)   # ROI pixels per slit row
+            if per_row.shape != (flat.shape[0],) or per_row.sum() <= 0:
+                raise ValueError("the reference's ROI does not fit its factors")
+            flat_at_roi = per_row @ flat / per_row.sum()                          # (bands,)
+            factors = (np.asarray(frame.factors, np.float64) * flat / flat_at_roi[None, :]).astype(np.float32)
+            if not np.all(np.isfinite(factors)) or np.any(factors <= 0):
                 raise ValueError("the profile does not fit the reference")
         except Exception as exc:
             logger.warning("Flat-field %s cannot be taken out of %s: %s", flat_id, frame.reference.id, exc)

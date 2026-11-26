@@ -1,13 +1,17 @@
 # windows/scan_window.py
 from __future__ import annotations
 
+import json
 import math
 import time
 
+import qtawesome as qta
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
+    QProgressBar,
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
@@ -26,9 +30,11 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QFileDialog,
     QMessageBox,
+    QMenu,
 )
 
 from config import AppConfig
+from modules.ui_kit.theme import PLOT_FOREGROUND
 from modules.live_view.mapping import DisplayMapper
 from modules.live_view.image_canvas import (
     FOCUS_ROI_DEFAULT_HEIGHT,
@@ -37,21 +43,42 @@ from modules.live_view.image_canvas import (
 from modules.camera.widget import CameraControls
 from modules.live_view.spectrum import LiveLineSpectrumWidget
 from modules.cube_preview.widget import RealtimeCubePreviewWidget
-from modules.dark.widget import DarkFramePanel
+from modules.dark.state import DarkFrameState
 from modules.stage.config import FREE_SCAN_MAX_S, FREE_SCAN_MIN_S
 from modules.stage.speed import LINEAR_MAX_UM_S, ROTATION_MAX_DPS, ROTATION_SPEED_RESOLUTION_DPS
 from modules.acquisition.widget import CorrectionStatusDisplay
 from modules.status_card import StatusCard
 from modules.live_view.display_controls import DisplayControls
-from widgets.sharpness_panel import SharpnessPanel
-from modules.live_view.histogram import HistogramPlot
 from windows.image_viewer import ImageViewer
+from windows.scan_inspector import (ClippedTile, ReadyList, SharpnessTile, card_frame,
+                                    inspector_stylesheet, live_column_stylesheet, section_label)
 from modules.spectrogram_viewer.window import SpectrogramViewer
 
 #: Provisional limits of the wavelength range spin boxes until the camera reports its axis.
 WAVELENGTH_LIMITS_NM = (0.0, 9999.9)
 #: Title of the cube preview box; a scan appends its settings (see ScanWindow.set_scanning).
 CUBE_PREVIEW_TITLE = "Realtime Cube Preview"
+
+#: Save frame menu, in pipeline order: (stage of ``FrameStages``, label, tooltip). The two
+#: geometry labels are rewritten for the model in use (see ScanWindow._update_save_frame_menu).
+SAVE_FRAME_STAGES = (
+    ("raw", "Raw frame",
+     "Camera counts as read from the sensor; only the slit axis is flipped to the display orientation"),
+    ("dark", "Dark + hot-pixel corrected",
+     "After dark subtraction and hot-pixel repair, before the smile correction"),
+    ("geometry", "Smile corrected, full sensor",
+     "After the smile (and keystone) remap. The edges the remap fills with zeros are kept, "
+     "so every pixel lines up with the sensor and the other stages"),
+    ("valid", "Smile corrected, valid area",
+     "After the smile (and keystone) remap, cropped to the rows and spectral columns the cube "
+     "keeps (no zero-filled edges)"),
+    ("binned", "Binned bands (as recorded)",
+     "One line of the cube: binned to the wavelength bands of the scan, keystone rows cropped. "
+     "The band wavelengths are stored in the PNG"),
+)
+#: Font Awesome 5 (solid) icon of each Save frame menu entry; ``all`` = every stage at once.
+SAVE_FRAME_ICONS = {"raw": "fa5s.camera", "dark": "fa5s.adjust", "geometry": "fa5s.vector-square",
+                    "valid": "fa5s.crop-alt", "binned": "fa5s.layer-group", "all": "fa5s.copy"}
 #: A scan's measured line rate below this fraction of the camera's frame rate is warned about
 #: (ScanWindow.status_line_rate_warning), once the scan has at least this many lines (a short
 #: scan's rate is too coarse: one frame of jitter is 1 / lines of it).
@@ -107,8 +134,21 @@ class _NoWheelUnlessFocusedSpinBox(QDoubleSpinBox):
             event.ignore()
 
 
-#: Side (px) of the square status cards (Dark, Smile, Wavelength, Flat-field, Radiometric).
-STATUS_CARD_SIZE = 92     # the widest texts (RADIOMETRIC, Capturing) fit
+#: Smallest width (px) of the settings column (right): three status cards and the camera form fit.
+INSPECTOR_MIN_WIDTH = 360
+#: Height (px) of the Start / Stop scan buttons pinned under the settings.
+SCAN_BUTTON_HEIGHT = 44
+#: The Corrections rows of the settings column, in order: (status card key, name shown).
+CORRECTION_NAMES = (("wavelength", "Wavelength"), ("dark", "Dark + hot pixel"),
+                    ("smile", "Smile + keystone"), ("flatfield", "Flat-field"),
+                    ("radiometric", "Radiometric (reflectance)"))
+#: How often (ms) the settings column re-reads Ready to scan? and the scan progress.
+INSPECTOR_REFRESH_MS = 250
+#: Width (px) of the live column (left) and the height of its image.
+LIVE_COLUMN_WIDTH = 340
+LIVE_IMAGE_HEIGHT = 300
+#: A live frame with more saturated pixels than this (%) is listed in Ready to scan?.
+CLIPPED_WARN_PERCENT = 0.1
 
 
 class ScanWindow(QWidget):
@@ -143,29 +183,122 @@ class ScanWindow(QWidget):
         else:
             worker.request_snapshot(request_id)
 
-    def request_processed_frame(self):
-        """Ask the camera for the next preprocessed frame (before binning); it arrives in ``save_processed_frame``."""
+    def request_frame_stages(self, stages):
+        """Ask the camera for these processing stages of its next frame (``SAVE_FRAME_STAGES``
+        keys); they arrive together in :meth:`save_frame_stages`."""
         controller = getattr(self, 'controller', None)
         worker = getattr(controller, 'preview_thread', None)
         if worker is None or not worker.isRunning():
-            QMessageBox.warning(self, 'Save Frame', 'Camera acquisition is not running')
+            QMessageBox.warning(self, 'Save frame', 'Camera acquisition is not running')
         elif controller.dark_lib.is_collecting:
-            QMessageBox.warning(self, 'Save Frame', 'Finish dark capture before saving a frame')
+            QMessageBox.warning(self, 'Save frame', 'Finish dark capture before saving a frame')
         else:
-            worker.request_processed_frame()
+            worker.request_frame_stages(tuple(stages))
 
-    def save_processed_frame(self, packet):
-        """Ask for a file name and write ``packet.image`` as an 8/16-bit PNG (values unscaled)."""
+    def save_frame_stages(self, packet):
+        """Ask for a file name and write each image of a ``FrameStages`` as an 8/16-bit PNG.
+
+        Values are unscaled. One stage: the chosen file. Several (all stages of one frame): the
+        chosen name plus ``_<stage>`` per file. Each PNG carries a ``hsi`` text chunk (JSON) that
+        says which stage it is, which corrections were applied and what a crop left out.
+        """
         from modules.image import png_name, save_png
-        tags = (('dark',) if packet.dark_applied else ()) + (('smile',) if packet.stage == 'post_smile' else ())
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Save preprocessed frame', png_name('scan', packet.camera_bin, tags), 'PNG (*.png)')
-        if not path:
+        images = dict(packet.images)
+        if not images:
             return
+        tags = {key: self._frame_stage_tag(key, packet) for key in images}
+        if len(images) == 1:
+            (key,) = images
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Save frame', png_name('scan', packet.camera_bin, (tags[key],)), 'PNG (*.png)')
+            if not path:
+                return
+            targets = {key: path}
+        else:
+            path, _ = QFileDialog.getSaveFileName(
+                self, f'Save {len(images)} stages of one frame (one PNG each)',
+                png_name('scan', packet.camera_bin), 'PNG (*.png)')
+            if not path:
+                return
+            stem = path[:-4] if path.lower().endswith('.png') else path
+            targets = {key: f"{stem}_{tags[key]}.png" for key in images}
+        captured = time.strftime('%Y-%m-%dT%H:%M:%S')
         try:
-            save_png(path, packet.image)
+            for key, target in targets.items():
+                info = self._frame_stage_info(key, images[key], packet, captured)
+                save_png(target, images[key], text={'Software': 'HSI System', 'hsi': json.dumps(info)})
         except Exception as exc:
-            QMessageBox.warning(self, 'Save Frame', str(exc))
+            QMessageBox.warning(self, 'Save frame', str(exc))
+
+    @staticmethod
+    def _frame_stage_tag(key, packet) -> str:
+        """File-name word of a stage: what was applied, e.g. ``dark``, ``smile-keystone_valid``."""
+        geometry = ('smile-keystone' if packet.keystone_applied else 'smile') if packet.smile_applied else 'nosmile'
+        return {'raw': 'raw',
+                'dark': 'dark' if packet.dark_applied else 'nodark',
+                'geometry': geometry,
+                'valid': f'{geometry}_valid',
+                'binned': 'binned'}.get(key, key)
+
+    @staticmethod
+    def _frame_stage_info(key, image, packet, captured) -> dict:
+        """The ``hsi`` metadata of one saved stage (JSON-ready)."""
+        after_dark = key != 'raw'
+        after_geometry = key in ('geometry', 'valid', 'binned')
+        info = {
+            'stage': key, 'captured': captured, 'camera_bin': int(packet.camera_bin),
+            'shape': [int(n) for n in image.shape], 'dtype': str(image.dtype),
+            'slit_flipped': bool(packet.raw_inverted),
+            'dark_applied': bool(packet.dark_applied and after_dark),
+            'smile_applied': bool(packet.smile_applied and after_geometry),
+            'keystone_applied': bool(packet.keystone_applied and after_geometry),
+        }
+        if key in ('valid', 'binned'):
+            info['rows_left_out'] = [int(v) for v in packet.valid_rows]      # (top, bottom)
+        if key == 'valid':
+            info['columns_left_out'] = [int(v) for v in packet.valid_columns]   # (left, right)
+        lam = packet.wavelengths_nm
+        if key == 'binned' and lam is not None and len(lam) == image.shape[1]:
+            info['wavelengths_nm'] = [round(float(v), 3) for v in lam]
+        return info
+
+    def _build_save_frame_menu(self):
+        """The Save frame drop-down: one entry per processing stage, then all of them at once."""
+        menu = QMenu(self.save_frame_btn)
+        menu.setToolTipsVisible(True)
+        self._save_frame_actions = {}
+        for key, label, tip in SAVE_FRAME_STAGES:
+            action = menu.addAction(qta.icon(SAVE_FRAME_ICONS[key], color=PLOT_FOREGROUND), label)
+            action.setToolTip(tip)
+            action.triggered.connect(lambda _=False, key=key: self.request_frame_stages((key,)))
+            self._save_frame_actions[key] = action
+        menu.addSeparator()
+        every = menu.addAction(qta.icon(SAVE_FRAME_ICONS['all'], color=PLOT_FOREGROUND),
+                               "All stages of one frame\u2026")
+        every.setToolTip("Every stage above from the same frame, one PNG each, sharing one file name")
+        every.triggered.connect(lambda: self.request_frame_stages(self._save_frame_stage_keys()))
+        self._save_frame_actions['all'] = every
+        menu.aboutToShow.connect(self._update_save_frame_menu)
+        self.save_frame_btn.setMenu(menu)
+
+    def _geometry_in_use(self) -> tuple:
+        """``(smile, keystone)``: the geometric correction the next frame gets (status cards)."""
+        geo = getattr(self, '_geometry', {})
+        smile = bool(geo.get('model')) and bool(geo.get('smile', True))
+        return smile, smile and bool(geo.get('keystone_available')) and bool(geo.get('keystone', True))
+
+    def _save_frame_stage_keys(self) -> tuple:
+        """The stages worth saving now: the geometry ones only while a smile model is applied."""
+        smile, _ = self._geometry_in_use()
+        return tuple(key for key, _, _ in SAVE_FRAME_STAGES if smile or key not in ('geometry', 'valid'))
+
+    def _update_save_frame_menu(self):
+        smile, keystone = self._geometry_in_use()
+        name = 'Smile + keystone corrected' if keystone else 'Smile corrected'
+        for key, where in (('geometry', 'full sensor'), ('valid', 'valid area')):
+            action = self._save_frame_actions[key]
+            action.setText(f"{name}, {where}" if smile else f"Smile corrected, {where} (no model applied)")
+            action.setEnabled(smile)
 
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -179,7 +312,8 @@ class ScanWindow(QWidget):
         self.viewer = ImageViewer()
         
         # ── Dark frame ───────────────────────────────────────────
-        self.dark_panel = DarkFramePanel()
+        # the dark's state and requests (no box of its own: the Dark row, its peek and Ready to scan? show it)
+        self.dark_panel = DarkFrameState(self)
         self.correction_status = CorrectionStatusDisplay(self)
         # flat-field profile and radiometric reference of this camera (set by the radiometric
         # integration). Five cards: small squares in a grid, the detail in each tooltip
@@ -199,8 +333,6 @@ class ScanWindow(QWidget):
         self.flatfield_card.value_clicked.connect(self._on_flatfield_card_switch)
         self.correction_status.dark.set_togglable(True, "Click to switch dark + hot-pixel correction on / off")
         self.radiometric_card.set_togglable(True, "Click to switch automatic radiometric calibration on / off")
-        for card in self.status_cards:
-            card.set_compact(STATUS_CARD_SIZE)
         # a click on a card opens that module's profile; Smile and Wavelength always have a
         # window to open, Flat-field and Radiometric only while there is a profile to show
         self._card_keys = {"smile": self.correction_status.smile, "wavelength": self.correction_status.wavelength,
@@ -210,6 +342,10 @@ class ScanWindow(QWidget):
             card.clicked.connect(lambda key=key: self.status_card_clicked.emit(key))
         self.correction_status.smile.set_clickable(True, "View ▸")   # the loaded model, else the Smile page
         self.correction_status.wavelength.set_clickable(True, "Open ▸")
+        # the Dark row always opens its peek: the dark's details, Capture and Reload (no dark: just those)
+        self._dark_viewable = False
+        self._dark_warning = ""
+        self.correction_status.dark.set_clickable(True, "")
 
         # ── Stage — rotation ─────────────────────────────────────
         # The rotation stage runs multiples of 0.01 deg/s (half steps of 0.02 deg), so the
@@ -335,18 +471,17 @@ class ScanWindow(QWidget):
 
         self.focus_roi_full_btn = QPushButton("Full Height")
 
-        self.save_frame_btn = QPushButton("Save Frame PNG…")
+        self.save_frame_btn = QPushButton(qta.icon("fa5s.save", color=PLOT_FOREGROUND),
+                                          "Save frame (PNG)")      # opens the stage menu
         self.save_frame_btn.setToolTip(
-            "Save the next frame after the active preprocessing (dark/hot-pixel, orientation, "
-            "Smile) and before wavelength binning, as an 8/16-bit PNG")
+            "Save the next camera frame as an 8/16-bit PNG (counts, unscaled) at the processing "
+            "stage you choose, or all stages of that one frame")
+        self._build_save_frame_menu()
 
         focus_roi_layout = QHBoxLayout()
         focus_roi_layout.addWidget(QLabel("Focus ROI Height"))
         focus_roi_layout.addWidget(self.focus_roi_height_spin)
         focus_roi_layout.addWidget(self.focus_roi_full_btn)
-
-        # ── Sharpness sidebar ────────────────────────────────────
-        self.sharpness_panel = SharpnessPanel()
 
         # ── Live spectrum ────────────────────────────────────────
         self.live_line_spectrum = LiveLineSpectrumWidget()
@@ -365,79 +500,179 @@ class ScanWindow(QWidget):
             "calibration_warning": "",   # set for a scan started with calibration warnings
         }
 
-        # ── LEFT PANEL ───────────────────────────────────────────
+        # ── LEFT COLUMN: what the camera sees, to focus and expose ──
         left_panel = QWidget()
+        left_panel.setObjectName("liveColumn")
+        left_panel.setAttribute(Qt.WA_StyledBackground, True)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
-        left_panel.setFixedWidth(350)
+        left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
+        left_panel.setFixedWidth(LIVE_COLUMN_WIDTH)
 
-        self.viewer.setFixedWidth(300)
-        self.viewer.setFixedHeight(240)
-        self.sharpness_panel.setFixedHeight(240)
-        image_row = QHBoxLayout()
-        image_row.setSpacing(0)
-        image_row.setContentsMargins(0, 0, 0, 0)
-        image_row.addWidget(self.viewer, stretch=1)
-        image_row.addWidget(self.sharpness_panel)
-        left_layout.addLayout(image_row)
+        # Live card: title, frame rate and display mode above the image; focus ROI and Save below
+        live_card = card_frame()
+        live_layout = QVBoxLayout(live_card)
+        live_layout.setContentsMargins(0, 0, 0, 0)
+        live_layout.setSpacing(0)
+        head = QHBoxLayout()
+        head.setContentsMargins(12, 8, 8, 8)
+        head.setSpacing(8)
+        live_title = QLabel("Live")
+        live_title.setStyleSheet("color: #e6e9ee; font-weight: 600; font-size: 13px;")
+        self.live_fps_label = QLabel("")
+        self.live_fps_label.setStyleSheet("color: #7d8794; font-size: 11px; font-family: Consolas, monospace;")
+        head.addWidget(live_title)
+        head.addWidget(self.live_fps_label)
+        head.addStretch(1)
+        for label in self.display_controls.findChildren(QLabel):
+            if label.text() == "Display:":
+                label.hide()                  # the combo says it (RAW / Enhance)
+        head.addWidget(self.display_controls)
+        live_layout.addLayout(head)
+        self.viewer.setFixedHeight(LIVE_IMAGE_HEIGHT)        # the spectrum below takes the rest
+        live_layout.addWidget(self.viewer)
+        foot = QHBoxLayout()
+        foot.setContentsMargins(8, 6, 8, 6)
+        foot.setSpacing(6)
+        roi_icon = QLabel()
+        roi_icon.setPixmap(qta.icon("mdi.select", color="#E3B341").pixmap(16, 16))
+        roi_icon.setToolTip("Focus ROI height (rows around the selector used for the sharpness)")
+        self.focus_roi_height_spin.setToolTip(roi_icon.toolTip())
+        self.focus_roi_height_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.focus_roi_height_spin.setFixedWidth(84)
+        self.focus_roi_full_btn.setText("")
+        self.focus_roi_full_btn.setIcon(qta.icon("fa5s.arrows-alt-v", color="#aeb7c4"))
+        self.focus_roi_full_btn.setToolTip("Full height: the focus ROI over every row")
+        self.save_frame_btn.setText("")
+        self.save_frame_btn.setIcon(qta.icon("fa5s.save", color="#aeb7c4"))
+        self.save_frame_btn.setToolTip("Save frame (PNG) ▾\n" + self.save_frame_btn.toolTip())
+        foot.addWidget(roi_icon)
+        foot.addWidget(self.focus_roi_height_spin)
+        foot.addWidget(self.focus_roi_full_btn)
+        foot.addStretch(1)
+        foot.addWidget(self.save_frame_btn)
+        live_layout.addLayout(foot)
+        left_layout.addWidget(live_card)
 
-        left_layout.addWidget(self.display_controls)
-        left_layout.addLayout(focus_roi_layout)
-        left_layout.addWidget(self.save_frame_btn)
+        # Sharpness and Clipped tiles
+        self.sharpness_tile = SharpnessTile()
+        self.sharpness_tile.reset_requested.connect(self.reset_sharpness_scale)
+        self.clipped_tile = ClippedTile(CLIPPED_WARN_PERCENT)
+        self.histogram = self.clipped_tile       # the exposure histogram the controller feeds
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
+        tiles.addWidget(self.sharpness_tile, 1)
+        tiles.addWidget(self.clipped_tile, 1)
+        left_layout.addLayout(tiles)
 
-        spectrum_label = QLabel("Live Spectrum (horizontal selector)")
-        spectrum_label.setStyleSheet("font-size: 11px; color: gray;")
-        left_layout.addWidget(spectrum_label)
-        left_layout.addWidget(self.live_line_spectrum)
+        spectrum_card = card_frame()
+        spectrum_layout = QVBoxLayout(spectrum_card)
+        spectrum_layout.setContentsMargins(10, 8, 10, 8)
+        spectrum_layout.setSpacing(4)
+        spectrum_label = QLabel("Spectrum · selected row")
+        spectrum_label.setToolTip("Live spectrum along the horizontal selector of the image")
+        spectrum_label.setStyleSheet("color: #9aa4b2; font-size: 11px;")
+        spectrum_layout.addWidget(spectrum_label)
+        spectrum_layout.addWidget(self.live_line_spectrum, 1)
+        left_layout.addWidget(spectrum_card, 1)
 
-        self.histogram = HistogramPlot(bit_depth=16)
-        left_layout.addWidget(self.histogram)
-        left_layout.addStretch()
+        left_panel.setStyleSheet(live_column_stylesheet())
 
-        # ── RIGHT PANEL ──────────────────────────────────────────
+        # ── RIGHT COLUMN: the scan settings in the order they are set, Start / Stop pinned below ──
         controls_widget = QWidget()
+        controls_widget.setObjectName("inspectorBody")
         controls_layout = QVBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(4, 4, 4, 4)
-        controls_layout.setSpacing(6)
+        controls_layout.setContentsMargins(12, 10, 12, 10)
+        controls_layout.setSpacing(4)
 
-        controls_body = QHBoxLayout()
-        controls_body.setSpacing(10)
-        settings_column = QVBoxLayout()
-        settings_column.setSpacing(6)
+        # Ready to scan?: only what needs attention (refreshed by _refresh_inspector)
+        self.ready_list = ReadyList()
+        self._ready_extra = {}              # host items, e.g. the camera's pixel pitch (set_ready_issue)
+        controls_layout.addWidget(self.ready_list)
 
-        top_row = QHBoxLayout()
-        top_row.addLayout(self.camera_layout)
-        top_row.addWidget(self.dark_panel, stretch=1)
-        settings_column.addLayout(top_row)
+        controls_layout.addLayout(self.camera_layout)
+        for group in (self.rotation_group, self.linear_group, self.free_group):   # one shows (stage.json)
+            controls_layout.addWidget(group)
+        self.wavelength_range_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        controls_layout.addWidget(self.wavelength_range_group)
 
-        stage_row = QHBoxLayout()
-        stage_row.addWidget(self.rotation_group)
-        stage_row.addWidget(self.linear_group)
-        stage_row.addWidget(self.free_group)
-        stage_row.addWidget(self.wavelength_range_group)
-        settings_column.addLayout(stage_row)
-
-        # a grid, two cards a row: five full cards in one column would not fit the pane's height
-        status_column = QGridLayout()
-        status_column.setSpacing(6)
-        for i, card in enumerate(self.status_cards):
-            status_column.addWidget(card, i // 2, i % 2)
-        status_column.setRowStretch(len(self.status_cards) // 2 + 1, 1)
-        controls_body.addLayout(settings_column, stretch=1)
-        controls_body.addLayout(status_column)
-        controls_layout.addLayout(controls_body)
-
+        # the corrections of the next scan: each status card drawn as a row (row = open its view,
+        # switch = on / off)
+        self.corrections_label = section_label("Corrections")
+        self.corrections_label.setContentsMargins(0, 14, 0, 4)
+        controls_layout.addWidget(self.corrections_label)
+        self.correction_rows = {}
+        for key, name in CORRECTION_NAMES:
+            card = self._card_keys[key]
+            card.set_row(name)
+            self.correction_rows[key] = card
+            controls_layout.addWidget(card)
         controls_layout.addStretch()
 
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setWidget(controls_widget)
-        scroll_area.setMinimumWidth(420)
-        # Fixed like the left panel's width, so the splitter handle snaps it shut (dragged past
-        # half its height) and open again instead of shrinking it step by step.
-        scroll_area.setFixedHeight(300)
-        scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        self.settings_scroll = scroll_area
+
+        # Start / Stop: always on screen at the bottom of the column, one of them at a time. They are
+        # the live view's Start / Stop (its signals, F5 / Esc, set_scanning_ui); the image has none.
+        self.start_scan_btn = QPushButton(qta.icon("fa5s.play", color="white"), "  Start scan")
+        self.start_scan_btn.setToolTip("Start Scan (F5)")
+        self.stop_scan_btn = QPushButton(qta.icon("fa5s.stop", color="white"), "  Stop scan")
+        self.stop_scan_btn.setToolTip("Stop Scan (Esc)")
+        for button, colour, hover in ((self.start_scan_btn, "#1a9a55", "#22c06b"),
+                                      (self.stop_scan_btn, "#c62828", "#e53935")):
+            button.setMinimumHeight(SCAN_BUTTON_HEIGHT)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(
+                f"QPushButton {{ background-color: {colour}; color: white; border: none; border-radius: 8px;"
+                f" font-size: 15px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background-color: {hover}; }}"
+                "QPushButton:disabled { background-color: #2b2e33; color: #6b7280; }")
+        self.viewer.use_scan_buttons(self.start_scan_btn, self.stop_scan_btn)
+        self.scan_action_hint = QLabel("")
+        self.scan_action_hint.setAlignment(Qt.AlignCenter)
+        self.scan_action_hint.setStyleSheet("font-size: 11px; color: #9e9e9e;")
+        # how far the running scan is (stage move or free-scan time), above Stop
+        self.scan_progress = QProgressBar()
+        self.scan_progress.setRange(0, 1000)
+        self.scan_progress.setTextVisible(False)
+        self.scan_progress.setFixedHeight(4)
+        self.scan_progress.hide()
+        action_bar = QWidget()
+        action_bar.setObjectName("scanActionBar")
+        action_bar.setAttribute(Qt.WA_StyledBackground, True)
+        action_layout = QVBoxLayout(action_bar)
+        action_layout.setContentsMargins(12, 10, 12, 8)
+        action_layout.setSpacing(6)
+        action_layout.addWidget(self.scan_progress)
+        action_layout.addWidget(self.start_scan_btn)
+        action_layout.addWidget(self.stop_scan_btn)
+        action_layout.addWidget(self.scan_action_hint)
+        self.viewer.scanning_ui_changed.connect(self._show_scan_action)
+
+        inspector = QWidget()
+        inspector.setObjectName("inspector")
+        inspector.setAttribute(Qt.WA_StyledBackground, True)
+        inspector_layout = QVBoxLayout(inspector)
+        inspector_layout.setContentsMargins(0, 0, 0, 0)
+        inspector_layout.setSpacing(0)
+        inspector_layout.addWidget(scroll_area, 1)
+        inspector_layout.addWidget(action_bar)
+        inspector.setMinimumWidth(INSPECTOR_MIN_WIDTH)
+        inspector.setStyleSheet(inspector_stylesheet())
+        for spin in controls_widget.findChildren(QAbstractSpinBox):
+            spin.setButtonSymbols(QAbstractSpinBox.NoButtons)     # the unit sits in the field; no arrows
+        # the wavelength range shows its Start / End only while it is on
+        self.wavelength_range_group.toggled.connect(self._show_wavelength_fields)
+        self._show_wavelength_fields(self.wavelength_range_group.isChecked())
+        self.inspector = inspector
+        self._inspector_timer = QTimer(self)
+        self._inspector_timer.setInterval(INSPECTOR_REFRESH_MS)
+        self._inspector_timer.timeout.connect(self._refresh_inspector)
+        self._inspector_timer.start()
 
         self._pending_cube = None
         self._pending_wavelengths = None
@@ -570,29 +805,23 @@ class ScanWindow(QWidget):
 
         cube_preview_group.setLayout(cpg_layout)
 
-        # Settings above, cube preview below: the handle moves, and a scan folds the
-        # settings away (see set_scanning).
-        right_panel = QSplitter(Qt.Vertical)
-        right_panel.addWidget(scroll_area)
-        right_panel.addWidget(cube_preview_group)
-        right_panel.setCollapsible(0, True)
-        right_panel.setCollapsible(1, False)
-        right_panel.setStretchFactor(0, 0)
-        right_panel.setStretchFactor(1, 1)
-        self.settings_splitter = right_panel
-        self._settings_sizes_before_scan = None
         self._scan_clock = None             # (monotonic start, expected s) while the stage moves
         self._scanning = False
         self.dark_panel.dark_toggled.connect(lambda _on: self._update_card_switches())
         self._update_card_switches()             # the switch faces start in step with the settings
         self._stage_speed = None            # speed the stage reported it runs, this scan
 
-        # ── SPLITTER ─────────────────────────────────────────────
+        # ── THREE COLUMNS: live view | realtime cube preview (the main view) | settings ──
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        splitter.addWidget(cube_preview_group)
+        splitter.addWidget(inspector)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        self.columns_splitter = splitter
+        self._show_scan_action(False)
 
         main_layout = QVBoxLayout()
         main_layout.setContentsMargins(4, 4, 4, 4)
@@ -618,7 +847,6 @@ class ScanWindow(QWidget):
         self.save_reference_btn.clicked.connect(self._on_save_reference)
         self.save_flatfield_btn.clicked.connect(self._on_save_flatfield)
         self.open_spectrogram_btn.clicked.connect(self._on_open_spectrogram)
-        self.save_frame_btn.clicked.connect(self.request_processed_frame)
         self.controller = None
 
     # ── status bar interface ─────────────────────────────────────
@@ -1046,14 +1274,48 @@ class ScanWindow(QWidget):
         self._update_card_switches()
 
     def set_dark_viewable(self, on: bool, warning: str = ""):
-        """The Dark card opens the dark viewer (``View ▸``) while a dark is loaded; ``warning`` (e.g. a
-        light leak found in it) is added to the card's tooltip."""
+        """A dark is loaded (``on``): its peek gets ``View ▸`` (the dark viewer). ``warning`` (e.g. a
+        light leak found in it) goes into the card's tooltip and *Ready to scan?*. The Dark card is
+        clickable either way: its peek holds Capture and Reload."""
+        self._dark_viewable = bool(on)
+        self._dark_warning = str(warning or "") if on else ""
         card = self.correction_status.dark
-        card.set_clickable(bool(on), "View ▸")
-        tip = "Click to view the dark reference" if on else ""
+        card.set_clickable(True, "View ▸" if on else "")
+        tip = "Click for the dark reference: view, capture, reload" if on else "Click to capture or reload a dark"
         if warning:
             tip = f"⚠ {warning}\n\n{tip}"
         card.setToolTip(tip)
+
+    def dark_viewable(self) -> bool:
+        """Whether a dark is loaded that the dark viewer can show (:meth:`set_dark_viewable`)."""
+        return self._dark_viewable
+
+    def peek_actions(self, key: str) -> tuple:
+        """Buttons of status card ``key``'s peek, ``((action, label), ...)``: for the Dark, Capture
+        and Reload (Cancel while capturing; none during a scan or while the panel is locked)."""
+        if key != "dark" or self._scanning:
+            return ()
+        panel = self.dark_panel
+        if panel.is_capturing():
+            return (("cancel", "Cancel capture"),)
+        if not panel.is_interactive():
+            return ()
+        return (("capture", "Capture"), ("reload", "Reload"))
+
+    def run_peek_action(self, key: str, action: str) -> None:
+        """Do what a peek button asked (:meth:`peek_actions`): the dark panel's own requests."""
+        if key != "dark":
+            return
+        panel = self.dark_panel
+        request = {"capture": panel.request_capture, "reload": panel.request_reload,
+                   "cancel": panel.request_cancel}.get(action)
+        if request is not None:
+            request()
+
+    def dark_setting_text(self) -> str:
+        """The camera setting a dark is stored for, e.g. ``6 ms · gain 1 · bin 2``."""
+        controls = self.camera_controls
+        return f"{controls.exposure_ms():g} ms · gain {controls.gain():g} · bin {self.selected_bin()}"
 
     def _on_dark_card_switch(self):
         if self._scanning:
@@ -1133,18 +1395,128 @@ class ScanWindow(QWidget):
     def selected_bin(self):
         return self.camera_controls.selected_bin()
 
+    def status_card(self, key: str):
+        """The status card for ``key`` (``'wavelength'``, ``'dark'``, ``'smile'``, ``'flatfield'``,
+        ``'radiometric'``), e.g. to place its profile peek; ``None`` for an unknown key."""
+        return self._card_keys.get(key)
+
     def set_bin_enabled(self, enabled):
         self.camera_controls.set_bin_enabled(enabled)
 
     # ── scanning ─────────────────────────────────────────────────
 
-    def set_scanning(self, active: bool):
-        """Lock the camera and stage settings during a scan and fold them away.
+    def _show_wavelength_fields(self, on: bool):
+        """Show the Start / End rows of the wavelength range only while the range is on."""
+        form = self.wavelength_range_group.layout()
+        for spin in (self.wavelength_start_spin, self.wavelength_end_spin):
+            spin.setVisible(bool(on))
+            label = form.labelForField(spin) if form is not None else None
+            if label is not None:
+                label.setVisible(bool(on))
 
-        Starting folds the settings pane so the cube preview gets its height; it can still
-        be dragged open to read the (locked) values, and the preview title shows them in one
-        line (:meth:`scan_settings_summary`). Ending restores the pane height from before the
-        scan and the plain title. The bin, wavelength range and dark panel are locked separately.
+    def _show_scan_action(self, scanning: bool):
+        """Show Start (idle) or Stop (scanning) under the settings, enabled like the live view's
+        own buttons (:meth:`ImageViewer.set_scanning_ui`)."""
+        self.start_scan_btn.setVisible(not scanning)
+        self.stop_scan_btn.setVisible(scanning)
+        self.scan_progress.setVisible(scanning)
+        self.scan_action_hint.setText("Esc stops the scan" if scanning else "F5 starts the scan")
+        self._refresh_scan_progress()
+
+    # ── settings column: Ready to scan? and the scan progress ─────
+
+    def set_ready_issue(self, key: str, text: str = "", action: str = "", callback=None,
+                        severity: str = "warning"):
+        """Add (or with an empty ``text`` remove) an item of *Ready to scan?* that the host
+        knows about, e.g. a camera without a pixel pitch.
+
+        Args:
+            key: Identifies the item (a second call replaces it).
+            text: What needs attention; ``""`` removes the item.
+            action: Caption of its fix button (``""``: none).
+            callback: Called by that button.
+            severity: ``"error"``, ``"warning"`` or ``"info"``.
+        """
+        if text:
+            self._ready_extra[key] = (severity, str(text), str(action), callback)
+        else:
+            self._ready_extra.pop(key, None)
+        self._refresh_inspector()
+
+    def ready_items(self):
+        """``(items, passed)`` of *Ready to scan?*: what needs attention as ``(severity, text,
+        action, callback)``, and the names of the checks that passed. Only states the window
+        already shows elsewhere (dark panel, histogram, status cards, status line)."""
+        items, passed = [], []
+        panel = self.dark_panel
+        state = panel.state()
+        if state == panel.CAPTURING:              # the frame count is on the Dark row
+            items.append(("info", "Capturing the dark frame…", "Cancel", panel.request_cancel))
+        elif state != panel.LOADED:
+            items.append(("error", "No dark frame", "Capture",
+                          None if self._scanning else panel.request_capture))
+        elif not panel.is_dark_enabled():
+            items.append(("warning", "Dark subtraction is off", "Turn on",
+                          None if self._scanning else self._turn_dark_on))
+        elif self._dark_warning:
+            items.append(("warning", "Light leak in the dark", "View",
+                          lambda: self.status_card_clicked.emit("dark")))
+        else:
+            passed.append("Dark frame")
+        percent = self.histogram.saturated_percent()
+        if percent is not None and percent > CLIPPED_WARN_PERCENT:
+            items.append(("warning", f"{percent:.2f} % clipped", "", None))
+        elif percent is not None:
+            passed.append("No clipped pixels")
+        if self._geometry.get("model"):
+            passed.append("Smile model")
+        else:
+            items.append(("info", "No smile model", "Open",
+                          lambda: self.status_card_clicked.emit("smile")))
+        if self.correction_status.wavelength.color_name() == "green":
+            passed.append("Wavelength calibration")
+        warning = str(self._status.get("calibration_warning") or "").strip()
+        if warning:
+            items.append(("warning", warning.splitlines()[0], "", None))
+        line_rate = self.status_line_rate_warning()
+        if line_rate:
+            items.append(("info", line_rate, "", None))
+        items.extend(self._ready_extra.values())
+        return items, passed
+
+    def _turn_dark_on(self):
+        """*Turn on* of the Ready list: dark subtraction on, never in the middle of a cube."""
+        if not self._scanning:
+            self.dark_panel.set_dark_enabled(True)
+
+    def _refresh_inspector(self):
+        items, passed = self.ready_items()
+        self.ready_list.set_items(items, passed)
+        self._refresh_scan_progress()
+        # a dark capture in progress: the Dark row counts its frames (one indicator, in one place)
+        done, total = self.dark_panel.capture_progress()
+        self.correction_status.dark.set_row_note(
+            f"{done} / {total}" if self.dark_panel.is_capturing() and total else None)
+
+    def _refresh_scan_progress(self):
+        """Progress bar and time left on Stop while the stage moves (or a free scan records)."""
+        clock = self._scan_clock if self._scanning else None
+        if clock is None or clock[1] <= 0:
+            self.scan_progress.setValue(0)
+            self.stop_scan_btn.setText("  Stop scan")
+            return
+        started, total = clock
+        elapsed = max(0.0, time.monotonic() - started)
+        self.scan_progress.setValue(int(1000 * min(1.0, elapsed / total)))
+        self.stop_scan_btn.setText(f"  Stop scan   {_format_countdown(total - elapsed)} left")
+
+    def set_scanning(self, active: bool):
+        """Lock the camera and stage settings during a scan.
+
+        The settings stay in their column, locked, so their values can be read while the cube
+        preview fills; the preview title also shows them in one line
+        (:meth:`scan_settings_summary`). The bin, wavelength range and dark panel are locked
+        separately.
 
         Args:
             active: True when a scan starts, False when it ends (or fails).
@@ -1155,17 +1527,10 @@ class ScanWindow(QWidget):
         self.free_duration_spin.setEnabled(not active)   # the box stays lit for its countdown
         # chosen at Start for the whole scan (frames are calibrated while recorded)
         self.auto_radiometric_box.setEnabled(not active)
+        if active and not self._scanning:
+            self.clipped_tile.reset_peak()      # the max then says whether this scan clipped on the way
         self._scanning = bool(active)
         self._update_card_switches()
-        splitter = self.settings_splitter
-        if active and self._settings_sizes_before_scan is None:
-            sizes = splitter.sizes()
-            self._settings_sizes_before_scan = sizes
-            splitter.setSizes([0, sum(sizes)])
-        elif not active and self._settings_sizes_before_scan is not None:
-            splitter.setSizes(self._settings_sizes_before_scan)
-            self._settings_sizes_before_scan = None
-        self._scanning = bool(active)
         if not active:
             self._scan_clock = None
             self._stage_speed = None
@@ -1297,6 +1662,7 @@ class ScanWindow(QWidget):
         finally:
             for widget in widgets:
                 widget.blockSignals(False)
+        self._show_wavelength_fields(wavelength_range is not None)
 
     def set_wavelength_range_axis(self, info: dict):
         """Limits and tooltip from the engine's ``wavelength_range_applied`` info.
@@ -1356,7 +1722,7 @@ class ScanWindow(QWidget):
 
     def set_status(self, text: str):
         self._status["state"] = text
-        self.sharpness_panel.set_scanning(text == "SCANNING")
+        self.sharpness_tile.set_scanning(text == "SCANNING")
 
     def set_calibration_warning(self, text: str):
         """Calibration warnings of the running scan, shown after the state ("" for none)."""
@@ -1364,6 +1730,7 @@ class ScanWindow(QWidget):
 
     def set_fps(self, fps: float):
         self._status["fps"] = fps
+        self.live_fps_label.setText(f"{fps:.1f} fps" if fps else "")
 
     def set_camera_frame_rate(self, hz: float):
         """Camera AcquisitionFrameRate (Hz) shown next to the measured FPS."""
@@ -1386,11 +1753,11 @@ class ScanWindow(QWidget):
 
     def set_sharpness_score(self, score: float):
         self._status["sharpness"] = score
-        self.sharpness_panel.set_value(score)
+        self.sharpness_tile.set_value(score)
 
     def reset_sharpness_scale(self):
         """Forget the sharpness peak (the scores of a new gain/exposure/bin are not comparable)."""
-        self.sharpness_panel.reset()
+        self.sharpness_tile.reset()
 
     def set_temperature(self, temp_c: float):
         self._status["temp"] = temp_c

@@ -121,6 +121,14 @@ class LiveImageCanvas(QLabel):
         self._position_overlay_buttons()
         return btn
 
+    def remove_overlay_button(self, btn: QPushButton) -> None:
+        """Take a button made by :meth:`add_overlay_button` off the image and delete it."""
+        if btn in self._overlay_buttons:
+            self._overlay_buttons.remove(btn)
+            btn.hide()
+            btn.deleteLater()
+            self._position_overlay_buttons()
+
     def _position_overlay_buttons(self):
         """Stack overlay buttons vertically at the top-left of the draw rect."""
         if not self._overlay_buttons:

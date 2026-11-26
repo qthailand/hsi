@@ -54,8 +54,8 @@ class _SignalSink(AcquisitionSink):
     def snapshot(self, packet):
         self._t.snapshot_ready.emit(packet)
 
-    def processed_frame(self, packet):
-        self._t.processed_frame_ready.emit(packet)
+    def frame_stages(self, packet):
+        self._t.frame_stages_ready.emit(packet)
 
     def error(self, message):
         self._t.error.emit(message)
@@ -107,8 +107,8 @@ class CameraPreviewThread(AcquisitionEngine, QThread):
         correction_status(dict): ``{'dark': (state, detail), 'smile': (...)}`` on change.
         sharpness_ready(float): Focus score (about 5 Hz).
         snapshot_ready(FrameSnapshot): Answer to :meth:`request_snapshot`.
-        processed_frame_ready(FrameSnapshot): Answer to :meth:`request_processed_frame`
-            (preprocessed frame before spectral binning).
+        frame_stages_ready(FrameStages): Answer to :meth:`request_frame_stages` (the
+            requested processing stages of one frame).
         error(str): A failure; fatal ones end the thread.
         bin_applied(int) / bin_failed(int, str): Outcome of :meth:`request_bin`.
         params_applied(): Gain/exposure were applied (queued before any score of the new frames).
@@ -134,7 +134,7 @@ class CameraPreviewThread(AcquisitionEngine, QThread):
     wavelength_range_applied = pyqtSignal(object)
     wavelength_range_failed = pyqtSignal(object, str)
     snapshot_ready = pyqtSignal(object)
-    processed_frame_ready = pyqtSignal(object)
+    frame_stages_ready = pyqtSignal(object)
     frame_ready = pyqtSignal(object, float, float)
     saturation_ceiling_ready = pyqtSignal(object)
     saturation_ready = pyqtSignal(object)

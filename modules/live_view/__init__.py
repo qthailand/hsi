@@ -47,12 +47,13 @@ from __future__ import annotations
 import importlib
 
 from .mapping import DisplayMapper, DisplayMode
-from .saturation import saturated_mask
+from .saturation import exposure_histogram, saturated_mask
 
 __all__ = (
     "DisplayMapper",
     "DisplayMode",
     "saturated_mask",
+    "exposure_histogram",
     "DisplayControls",
     "LiveImageCanvas",
     "LiveLineSpectrumWidget",

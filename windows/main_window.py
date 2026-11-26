@@ -268,6 +268,15 @@ class MainWindow(QMainWindow):
         if temp is not None:
             self.temp_status_text.setText(f"{temp:.1f}°C")
         self.temp_status.setVisible(temp is not None)
+        scan = getattr(self, "scan_window", None)
+        if scan is not None and hasattr(scan, "set_ready_issue"):
+            # the camera's missing pixel pitch is a Ready to scan? item too (fix: enter it)
+            missing = not self.pixel_pitch_status.isHidden()
+            # remembered on the window itself: a reopened window (maybe at the same address) asks anew
+            if getattr(scan, "_pitch_issue_shown", None) != missing:
+                scan._pitch_issue_shown = missing
+                scan.set_ready_issue("pixel_pitch", "Pixel pitch not set" if missing else "", "Set",
+                                     self.edit_pixel_pitch)
         line_rate = (widget.status_line_rate_warning()
                      if hasattr(widget, "status_line_rate_warning") else "")
         self.line_rate_status.setText(line_rate)
@@ -413,7 +422,79 @@ class MainWindow(QMainWindow):
         return {**(camera_bits or {}), **self.scan_controller.last_scan_header}
 
     def _on_status_card_clicked(self, key: str):
-        """A status card of the scan window was clicked: open that module's profile view."""
+        """A status card of the scan window was clicked: peek at that module's profile next to the
+        card; the peek's *Open ▸* opens the full view. Without anything to peek at (no Smile model:
+        the card opens the Smile page) the full view opens directly."""
+        controller = self.scan_controller
+        window = getattr(controller, "win", None)
+        card = window.status_card(key) if window is not None and hasattr(window, "status_card") else None
+        try:
+            data = self._profile_peek_data(key) if card is not None else None
+        except Exception:
+            logger.exception("Cannot build the %s peek", key)
+            data = None
+        if data is None:
+            self._open_profile(key)
+            return
+        from modules.profile_peek import ProfilePeek
+        peek = getattr(self, "_profile_peek", None)
+        if peek is None:
+            peek = self._profile_peek = ProfilePeek(self)
+            peek.openRequested.connect(lambda: self._open_profile(peek.property("profile_key")))
+            peek.actionRequested.connect(lambda action: self._run_peek_action(peek.property("profile_key"), action))
+        peek.setProperty("profile_key", key)
+        peek.set_data(data)
+        peek.popup(card)
+
+    def _profile_peek_data(self, key: str):
+        """:class:`~modules.profile_peek.PeekData` for status card ``key``, or ``None`` (open directly)."""
+        from windows.integrations import RadiometricIntegration
+        controller = self.scan_controller
+        if controller is None:
+            return None
+        if key == "dark":
+            return self._dark_peek_data(controller)
+        if key == "smile":
+            return controller.smile_peek_data()
+        if key == "wavelength":
+            from modules.profile_peek import text_peek
+            card = controller.win.status_card("wavelength")
+            details = [line for line in (card.toolTip() or card.detail.text()).splitlines()]
+            return text_peek("Wavelength", card.value.text(), details, color=card.color_name())
+        method = {"flatfield": "flatfield_peek_data", "radiometric": "reference_peek_data"}.get(key)
+        for integration in self.integrations:
+            if method and isinstance(integration, RadiometricIntegration):
+                return getattr(integration, method)()
+        return None
+
+    @staticmethod
+    def _dark_peek_data(controller):
+        """The Dark peek: the loaded dark's profile, or *No dark frame* for the current setting, with
+        the scan window's Capture / Reload (Cancel while capturing) and *View ▸* only with a dark."""
+        import dataclasses
+        from modules.profile_peek import text_peek
+        window = controller.win
+        actions = window.peek_actions("dark") if hasattr(window, "peek_actions") else ()
+        data = controller.dark_peek_data()
+        if data is None:
+            panel = window.dark_panel
+            capturing = panel.is_capturing() if hasattr(panel, "is_capturing") else False
+            setting = window.dark_setting_text() if hasattr(window, "dark_setting_text") else ""
+            data = text_peek("Dark", "Capturing…" if capturing else "No dark frame",
+                             [f"for {setting}" if setting else "",
+                              "" if capturing else "Cap the lens (room lights off), then Capture."],
+                             color="orange" if capturing else "red", open_label="", actions=actions)
+            return data
+        return dataclasses.replace(data, actions=tuple(actions))
+
+    def _run_peek_action(self, key: str, action: str):
+        """A peek button other than *Open ▸* was pressed: the scan window does it."""
+        window = getattr(self.scan_controller, "win", None)
+        if window is not None and hasattr(window, "run_peek_action"):
+            window.run_peek_action(key, action)
+
+    def _open_profile(self, key: str):
+        """Open the full profile view of status card ``key`` (what a card click did before peeks)."""
         from windows.integrations import RadiometricIntegration, SmileIntegration, WavelengthIntegration
         if key == "dark":
             if self.scan_controller is not None:
@@ -421,7 +502,7 @@ class MainWindow(QMainWindow):
             return
         if key == "smile" and self.scan_controller is not None:
             # the loaded model's viewer, whose button opens the Smile page; no model: the page itself
-            if self.scan_controller.view_smile(open_page=lambda: self._on_status_card_clicked("smile_page")):
+            if self.scan_controller.view_smile(open_page=lambda: self._open_profile("smile_page")):
                 return
         target, method = {"smile": (SmileIntegration, "open"), "smile_page": (SmileIntegration, "open"), "wavelength": (WavelengthIntegration, "open"),
                           "flatfield": (RadiometricIntegration, "view_flatfield"),

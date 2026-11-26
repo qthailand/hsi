@@ -50,3 +50,43 @@ class FrameSnapshot:
     stage: str = 'post_dark_hot_pixel_orientation'
     clipped: object = None
     saturation_level: object = None
+
+
+#: Processing stages a :class:`FrameStages` packet can hold, in pipeline order:
+#: ``raw`` (camera counts, slit axis in display orientation), ``dark`` (after dark subtraction
+#: and hot-pixel repair), ``geometry`` (after the smile / keystone remap, full sensor),
+#: ``valid`` (``geometry`` cropped to the rows and columns the cube keeps) and ``binned``
+#: (the line the cube records: wavelength bands, keystone rows cropped).
+FRAME_STAGES = ('raw', 'dark', 'geometry', 'valid', 'binned')
+
+
+@dataclass(frozen=True)
+class FrameStages:
+    """Several processing stages of ONE camera frame, for saving or comparing them.
+
+    Attributes:
+        images: ``{stage: 2-D array}`` for the requested stages (keys from
+            :data:`FRAME_STAGES`, in pipeline order); each array is a read-only copy.
+            Every stage except ``binned`` has ``(slit, spectral pixel)`` axes in the same
+            orientation, so pixel ``(y, x)`` of ``raw``, ``dark`` and ``geometry`` is the same
+            position (``valid`` is offset by ``(valid_rows[0], valid_columns[0])``).
+        timestamp: Capture time in seconds (the producer's monotonic clock).
+        camera_bin: Hardware bin factor.
+        raw_inverted: The slit axis of the sensor frame was flipped (also in ``raw``).
+        dark_applied: Dark subtraction / hot-pixel repair was applied (``dark`` differs from ``raw``).
+        smile_applied: A smile model was applied (``geometry`` differs from ``dark``).
+        keystone_applied: That model also corrected the keystone.
+        valid_rows: ``(top, bottom)`` rows left out of ``valid`` and ``binned``.
+        valid_columns: ``(left, right)`` spectral columns left out of ``valid``.
+        wavelengths_nm: Centre wavelength of each ``binned`` column, or ``None``.
+    """
+    images: dict
+    timestamp: float
+    camera_bin: int
+    raw_inverted: bool
+    dark_applied: bool
+    smile_applied: bool
+    keystone_applied: bool
+    valid_rows: tuple = (0, 0)
+    valid_columns: tuple = (0, 0)
+    wavelengths_nm: object = None

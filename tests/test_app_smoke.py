@@ -132,24 +132,24 @@ def test_scan_produces_a_cube_with_every_frame(main_window):
     assert pump(app, lambda: scan.cube_preview._current_shape[1] == scans, timeout=10)
 
 
-def test_a_scan_locks_and_folds_the_settings_then_restores_them(main_window):
+def test_a_scan_locks_the_settings_in_view_then_restores_them(main_window):
     app, window = main_window
     window.show()
     scan = window.scan_window
-    controller, controls, splitter = scan.controller, scan.camera_controls, scan.settings_splitter
+    controller, controls = scan.controller, scan.camera_controls
     assert pump(app, lambda: controller.preview_frame_index > 3)
-    locked = (controls.gain_spin, controls.exp_spin, controls.bin_combo, controls.keep_spectrogram_check,
+    locked = (controls.gain_spin, controls.exp_spin, controls.bin_segments, controls.keep_spectrogram_check,
               scan.rotation_group, scan.linear_group)
-    before = splitter.sizes()
-    assert before[0] > 0 and all(w.isEnabled() for w in locked)
+    assert all(w.isEnabled() for w in locked) and scan.start_scan_btn.isVisible()
     controller.start_scan()
     assert controller.state == controller.SCANNING
-    assert splitter.sizes()[0] == 0 and not any(w.isEnabled() for w in locked)
+    assert not any(w.isEnabled() for w in locked) and scan.settings_scroll.isVisible()   # locked, still in view
+    assert scan.stop_scan_btn.isVisible() and not scan.start_scan_btn.isVisible()
     assert controls.temp_spin.isEnabled()                      # the fan-cooled sensor readout stays readable
     assert pump(app, lambda: '/ ~' in scan.status_info())      # Scan elapsed / ~expected, once the stage moves
     assert pump(app, lambda: scan._pending_cube is not None)
     assert controller.state == controller.PREVIEW
-    assert splitter.sizes() == before and all(w.isEnabled() for w in locked)
+    assert all(w.isEnabled() for w in locked) and scan.start_scan_btn.isVisible()
     assert '/ ~' not in scan.status_info()
 
 

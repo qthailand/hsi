@@ -19,7 +19,9 @@ Example:
 from __future__ import annotations
 
 import logging
+import struct
 import time
+import zlib
 
 import cv2
 import numpy as np
@@ -182,12 +184,15 @@ def correct_hot_pixels(
 
     return np.ascontiguousarray(corrected)
 
-def save_png(path, frame) -> None:
+def save_png(path, frame, text=None) -> None:
     """Write a 2-D uint8/uint16 frame as an 8/16-bit grayscale PNG, values unscaled.
 
     Args:
         path: Destination file (any characters; written through Python, not ``cv2.imwrite``).
         frame: 2-D ``(slit, wavelength)`` array of dtype uint8 or uint16.
+        text: Optional ``{keyword: value}`` stored as PNG ``tEXt`` chunks (keyword 1-79
+            Latin-1 characters; the value is written as ``str(value)``, non-Latin-1 characters
+            replaced). Read back with :func:`png_text`.
 
     Raises:
         ValueError: ``frame`` is not 2-D or not uint8/uint16 (a PNG cannot hold other types).
@@ -201,8 +206,39 @@ def save_png(path, frame) -> None:
     ok, data = cv2.imencode(".png", np.ascontiguousarray(a))
     if not ok:
         raise OSError("PNG encoding failed")
+    data = data.tobytes()
+    if text:
+        data = data[:_PNG_AFTER_IHDR] + b"".join(
+            _png_chunk(b"tEXt", str(k).encode("latin-1") + b"\0" + str(v).encode("latin-1", "replace"))
+            for k, v in text.items()) + data[_PNG_AFTER_IHDR:]
     with open(path, "wb") as f:
-        f.write(data.tobytes())
+        f.write(data)
+
+
+#: Byte offset just after the IHDR chunk (8-byte signature + 25-byte IHDR), where ``tEXt`` goes.
+_PNG_AFTER_IHDR = 33
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    return (struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF))
+
+
+def png_text(path) -> dict:
+    """The ``tEXt`` chunks of a PNG file as ``{keyword: value}`` (see :func:`save_png`)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    out, pos = {}, 8
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        payload = data[pos + 8:pos + 8 + length]
+        if kind == b"tEXt" and b"\0" in payload:
+            key, value = payload.split(b"\0", 1)
+            out[key.decode("latin-1")] = value.decode("latin-1")
+        if kind == b"IEND":
+            break
+        pos += 12 + length
+    return out
 
 
 def png_name(prefix: str, camera_bin=None, tags=()) -> str:

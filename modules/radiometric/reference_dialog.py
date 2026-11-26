@@ -1037,6 +1037,7 @@ class RadiometricReferenceDialog(QDialog):
             reference = self.store.save(result["factors"], self.key, reflectance_profile=table,
                                         avg_window_size=self.avg_window_spin.value(), mask=mask,
                                         roi_mean_spectrum=result["roi_mean_spectrum"],
+                                        flatfield=self._flatfield_array if self.uses_flatfield() else None,
                                         sensor_temperature_c=scan_temperature_c(self.metadata), info=info,
                                         acquired_at=started, activate=False)
         except Exception as exc:

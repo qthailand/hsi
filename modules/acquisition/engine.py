@@ -45,7 +45,7 @@ from pathlib import Path
 import numpy as np
 
 from modules.dark import DarkProcessor
-from modules.frame_exchange.snapshot import FrameSnapshot
+from modules.frame_exchange.snapshot import FRAME_STAGES, FrameSnapshot, FrameStages
 from modules.preprocessing import PreprocessingRuntime
 from modules.sharpness import ImageSharpness
 from modules.smile.runtime import SmileRuntime
@@ -59,16 +59,26 @@ def crop_keystone_rows(image, calibration):
     same way); returned unchanged without a keystone model, without a margin, or when the margin
     would leave no rows.
     """
-    if image is None or calibration is None or not getattr(calibration, "has_keystone", False):
+    if image is None:
         return image
+    top, bottom = keystone_row_margin(calibration, image.shape[0])
+    if top + bottom <= 0:
+        return image
+    return image[top:image.shape[0] - bottom]
+
+
+def keystone_row_margin(calibration, height: int) -> tuple:
+    """``(top, bottom)`` rows :func:`crop_keystone_rows` leaves out of a frame ``height`` rows high;
+    ``(0, 0)`` without a keystone model, without a margin, or when the margin would leave no rows."""
+    if calibration is None or not getattr(calibration, "has_keystone", False):
+        return (0, 0)
     try:
         top, bottom = (max(0, int(v)) for v in getattr(calibration, "row_margin", (0, 0)))
     except (TypeError, ValueError):
-        return image
-    h = image.shape[0]
-    if top + bottom <= 0 or top + bottom >= h:
-        return image
-    return image[top:h - bottom]
+        return (0, 0)
+    if top + bottom <= 0 or top + bottom >= int(height):
+        return (0, 0)
+    return (top, bottom)
 from modules.spectral_processing import LambdaBinner
 
 from .profiler import StageProfiler
@@ -115,12 +125,9 @@ class AcquisitionSink:
     def snapshot(self, packet) -> None:
         """A :class:`~modules.frame_exchange.FrameSnapshot` answering ``request_snapshot``."""
 
-    def processed_frame(self, packet) -> None:
-        """A :class:`~modules.frame_exchange.FrameSnapshot` answering ``request_processed_frame``.
-
-        ``image`` is the preprocessed frame before spectral binning; ``stage`` is ``'post_smile'``
-        when a Smile calibration was applied, else ``'post_dark_hot_pixel_orientation'``.
-        """
+    def frame_stages(self, packet) -> None:
+        """A :class:`~modules.frame_exchange.FrameStages` answering ``request_frame_stages``:
+        the requested processing stages of one frame."""
 
     def error(self, message: str) -> None:
         """A failure; fatal ones end the loop."""
@@ -213,7 +220,7 @@ class AcquisitionEngine:
         self._pending_bin: int | None = None
         self._pending_wavelength = None
         self._pending_snapshot = None
-        self._pending_processed = False
+        self._pending_stages = frozenset()   # FRAME_STAGES asked for by request_frame_stages
         self._pending_smile_model = None
         self._last_correction_status = None
         # geometry switches (Smile card): smile remap on/off, keystone on/off within it
@@ -709,10 +716,22 @@ class AcquisitionEngine:
         with self._lock:
             self._pending_snapshot = int(request_id)
 
-    def request_processed_frame(self):
-        """Ask for one copy of the next preprocessed frame before binning (delivered via ``sink.processed_frame``)."""
+    def request_frame_stages(self, stages):
+        """Ask for copies of processing stages of the next frame (delivered via ``sink.frame_stages``).
+
+        Args:
+            stages: Names from :data:`~modules.frame_exchange.FRAME_STAGES`. Requests made before
+                that frame arrives are merged into one packet.
+
+        Raises:
+            ValueError: an unknown stage name, or none at all.
+        """
+        wanted = frozenset(stages)
+        unknown = wanted.difference(FRAME_STAGES)
+        if unknown or not wanted:
+            raise ValueError(f"Unknown frame stages {sorted(unknown)}; choose from {FRAME_STAGES}")
         with self._lock:
-            self._pending_processed = True
+            self._pending_stages = self._pending_stages | wanted
 
     def request_smile_model(self, path):
         """Queue loading a Smile model file for the current bin."""
@@ -926,24 +945,47 @@ class AcquisitionEngine:
         except Exception:                     # a mask is a convenience; the snapshot goes out without
             return None, None
 
-    def _processed_requested(self) -> bool:
+    def _take_stage_request(self) -> frozenset:
+        """The stages asked for since the last frame (cleared: one packet per request)."""
         with self._lock:
-            return self._pending_processed
+            wanted = self._pending_stages
+            self._pending_stages = frozenset()
+        return wanted
 
-    def _publish_processed_if_requested(self, frame, smile_applied):
-        with self._lock:
-            requested = self._pending_processed
-            self._pending_processed = False
-        if not requested:
-            return
-        image = frame.copy()
-        image.setflags(write=False)
+    def _publish_frame_stages(self, wanted, raw, grabbed, corrected, binned, calibration, binner):
+        """Send the ``wanted`` stages of one frame as a :class:`FrameStages` (copies, read-only).
+
+        ``raw`` is the sensor frame, ``grabbed`` the oriented pre-smile image, ``corrected`` the
+        remapped full frame, ``binned`` the recorded line (keystone rows already cropped) and
+        ``calibration`` the model applied to it (``None``: no remap).
+        """
         dark = getattr(self.backend, '_dark_mean', None)
         enabled = bool(getattr(self.backend, '_dark_enabled', False))
-        self.sink.processed_frame(FrameSnapshot(0, image, time.monotonic(),
-            int(self.backend.current_bin), self._raw_inverted, enabled,
-            enabled and dark is not None and dark.shape == frame.shape,
-            'post_smile' if smile_applied else 'post_dark_hot_pixel_orientation'))
+        height, width = raw.shape
+        rows = keystone_row_margin(calibration, height)
+        left, right = self._smile_border(width) if calibration is not None else (0, 0)
+        if left + right >= width:
+            left, right = 0, 0
+        sources = {
+            'raw': raw[::-1] if self._raw_inverted else raw,
+            'dark': grabbed,
+            'geometry': corrected,
+            'valid': None if corrected is None else corrected[rows[0]:height - rows[1], left:width - right],
+            'binned': binned,
+        }
+        images = {}
+        for name in FRAME_STAGES:
+            if name in wanted and sources[name] is not None:
+                image = np.ascontiguousarray(sources[name]).copy()
+                image.setflags(write=False)
+                images[name] = image
+        lam = getattr(binner, 'lambda_out', None)
+        self.sink.frame_stages(FrameStages(
+            images, time.monotonic(), int(self.backend.current_bin), bool(self._raw_inverted),
+            bool(enabled and dark is not None and dark.shape == raw.shape),
+            calibration is not None, bool(getattr(calibration, 'has_keystone', False)),
+            rows, (int(left), int(right)),
+            None if lam is None else np.asarray(lam, dtype=float).copy()))
 
     def _read_camera_frame(self, profiler, dark_capture):
         """Raw dark capture bypasses correction; normal frames keep backend policy."""
@@ -1516,6 +1558,7 @@ class AcquisitionEngine:
                     emit_frame = frame
                 else:
                     binner = self._ensure_binner(frame.shape[1])
+                    wanted = self._take_stage_request()
                     try:
                         correction = self.backend if self._shared_preprocessing else self._passthrough_dark
                         calibration = self._active_calibration()
@@ -1523,12 +1566,11 @@ class AcquisitionEngine:
                         # unbinned image is downloaded only for a processed-frame request.
                         emit_frame, corrected, grabbed = self._preprocessor.process_binned(
                             frame, correction, binner, calibration=calibration,
-                            inverted=self._raw_inverted, snapshot=self._snapshot_requested(),
-                            full=self._processed_requested(), profiler=prof)
+                            inverted=self._raw_inverted,
+                            snapshot=self._snapshot_requested() or 'dark' in wanted,
+                            full=bool(wanted & {'geometry', 'valid'}), profiler=prof)
                         if grabbed is not None:
                             self._publish_snapshot_if_requested(grabbed, raw=frame)
-                        if corrected is not None:
-                            self._publish_processed_if_requested(corrected, calibration is not None)
                     except Exception as exc:
                         self._report_corrections(frame, smile_error=True)
                         self.sink.error(str(exc))
@@ -1537,6 +1579,12 @@ class AcquisitionEngine:
                     # rows the keystone filled from outside the sensor are left out, as the smile
                     # border bands are (the snapshot for calibration keeps the full sensor frame)
                     emit_frame = crop_keystone_rows(emit_frame, calibration)
+                    if wanted:
+                        try:
+                            self._publish_frame_stages(wanted, frame, grabbed, corrected, emit_frame,
+                                                       calibration, binner)
+                        except Exception:              # a saved frame is a convenience: keep running
+                            logger.exception("Could not copy the frame stages %s", sorted(wanted))
                     self._update_saturation_ceiling(frame, correction, dark_capture=False)
                     # transform() allocates a new array per call, so it is safe to keep
                     self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp)

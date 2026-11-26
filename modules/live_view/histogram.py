@@ -22,7 +22,7 @@ from PyQt5.QtCore import Qt, QRectF
 from PyQt5.QtGui import QColor, QPainter, QPen, QBrush, QFont, QFontMetrics
 from PyQt5.QtWidgets import QWidget
 
-from .saturation import saturated_mask
+from .saturation import exposure_histogram
 
 
 class HistogramPlot(QWidget):
@@ -84,6 +84,10 @@ class HistogramPlot(QWidget):
         self._raw_max = float((1 << self._bit_depth) - 1)
         self._scale = self._8BIT_MAX / self._raw_max
 
+    def saturated_percent(self):
+        """Share of saturated pixels in the last frame (%), or ``None`` before the first frame."""
+        return float(getattr(self, "_sat_pct", 0.0)) if getattr(self, "_has_data", False) else None
+
     def update_histogram(self, frame: np.ndarray, ceiling: np.ndarray | None = None):
         """Recompute and repaint the histogram from a raw frame.
 
@@ -95,36 +99,10 @@ class HistogramPlot(QWidget):
                 :func:`~modules.live_view.saturation.saturated_mask`); another shape
                 or ``None`` falls back to 99 % of full scale.
         """
-        flat = frame.ravel()
-        flat_ceiling = None
-        if ceiling is not None and np.shape(ceiling) == frame.shape:
-            flat_ceiling = np.asarray(ceiling).ravel()
-
-        # downsample for speed
-        if flat.size > 500_000:
-            flat = flat[::4]
-            if flat_ceiling is not None:
-                flat_ceiling = flat_ceiling[::4]
-
-        # normalize to 0-255
-        flat_8bit = (flat.astype(np.float32) * self._scale)
-        flat_8bit = np.clip(flat_8bit, 0, 255).astype(np.uint8)
-
-        # histogram
-        counts = np.bincount(flat_8bit, minlength=self._N_BINS).astype(np.float64)
+        counts, self._sat_counts, self._sat_pct = exposure_histogram(frame, self._bit_depth, ceiling)
         self._counts = counts
         self._max_count = float(counts.max()) if counts.max() > 0 else 1.0
         self._has_data = True
-
-        # saturation %
-        if flat_ceiling is not None:
-            sat = saturated_mask(flat, flat_ceiling)
-            n_sat = int(np.count_nonzero(sat))
-            self._sat_counts = np.bincount(flat_8bit[sat], minlength=self._N_BINS).astype(np.float64)
-        else:
-            n_sat = int(np.count_nonzero(flat >= self._raw_max * 0.99))
-            self._sat_counts = None
-        self._sat_pct = (n_sat / flat.size) * 100.0 if flat.size > 0 else 0.0
 
         self.update()
 

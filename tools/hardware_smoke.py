@@ -140,10 +140,8 @@ def main(argv=None) -> int:
                   f"preview columns {scan.cube_preview._current_shape[1]}")
         # hardware bin changes while previewing: camera, frame size and the matching dark follow
         for target in (1, 4, 2):
-            index = scan.camera_controls.bin_combo.findData(target)
-            if index < 0:
+            if not scan.camera_controls.choose_bin(target):    # as a click on its button (emits bin_changed)
                 continue
-            scan.camera_controls.bin_combo.setCurrentIndex(index)
             switched = pump(lambda: controller.camera_bin == target, 20)
             before = controller.preview_frame_index
             flowing = pump(lambda: controller.preview_frame_index > before + 15, 20)

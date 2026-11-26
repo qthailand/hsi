@@ -8,6 +8,8 @@ set_clickable(True) makes the card a button: it emits ``clicked`` on a left clic
 Enter / Space, shows a pointing hand and a small hint ("View") in its corner.
 set_togglable(True) shows an ON / OFF switch button in the bottom-left corner (a click on it, or
 on the value, emits ``value_clicked``, not ``clicked``); set_switch_state(on, label) sets what it shows.
+set_row(name) draws the card as one row instead (dot in the status colour, name, state, ``›``
+while clickable, a toggle switch while togglable), for a list of corrections; the API is the same.
 
 Data conventions:
     ``value`` and ``detail`` are converted with ``str()``. ``color`` is a key of
@@ -27,12 +29,32 @@ Example:
     >>> card.value.text()
     '42 GB'
 """
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
-from PyQt5.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import QEvent, QPointF, QRectF, QSize, Qt, pyqtSignal
+from PyQt5.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
 
 #: Card colour name -> ``'#RRGGBB'`` gradient start colour.
 PALETTE = {'green': '#00C98D', 'red': '#FF637C', 'orange': '#FF9868', 'cyan': '#00BFC7'}
+#: Row presentation: switch track colour when on / off, and the size of the switch (px).
+ROW_SWITCH_ON, ROW_SWITCH_OFF, ROW_SWITCH_SIZE = '#22c06b', '#343a42', (30, 17)
+
+
+def switch_icon(on: bool) -> QIcon:
+    """A toggle switch drawn as an icon (track + knob); Qt greys it out when disabled."""
+    w, h = ROW_SWITCH_SIZE
+    pixmap = QPixmap(w * 2, h * 2)                  # drawn at 2x, sharp on high-DPI screens
+    pixmap.setDevicePixelRatio(2.0)
+    pixmap.fill(Qt.transparent)
+    p = QPainter(pixmap)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(ROW_SWITCH_ON if on else ROW_SWITCH_OFF))
+    p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), (h - 1) / 2, (h - 1) / 2)
+    p.setBrush(QColor('#ffffff' if on else '#aeb7c4'))
+    r = h / 2 - 2.3
+    p.drawEllipse(QPointF(w - h / 2 if on else h / 2, h / 2), r, r)
+    p.end()
+    return QIcon(pixmap)
 
 class StatusCard(QFrame):
     """Compact card with selectable palette and a full-detail tooltip.
@@ -53,6 +75,9 @@ class StatusCard(QFrame):
 
     clicked = pyqtSignal()
     value_clicked = pyqtSignal()
+    #: The value, colour, tooltip, clickable / togglable state or switch face changed, so a
+    #: mirror of the card (e.g. a compact row) can redraw. Not emitted by a no-op update.
+    changed = pyqtSignal()
 
     def __init__(self, title, parent=None):
         """Create the card showing ``'—'`` / ``'Waiting'`` in cyan.
@@ -97,8 +122,84 @@ class StatusCard(QFrame):
         self.switch_mark = self.switch_btn        # kept name for callers / tests
         self.set_switch_state(True)
         self.value.installEventFilter(self)
+        self._row = False               # set_row: drawn as one row
+        self._row_note = None           # set_row_note: shown instead of the value in the row
         self._last = None
         self.set_content('—', 'Waiting', color='cyan')
+
+    # ── row presentation ──────────────────────────────────────────
+
+    def set_row(self, name):
+        """Draw the card as one row: dot (status colour), ``name``, state, ``›``, switch.
+
+        For a list of corrections. Clicks, signals and setters stay the same: a click on the row
+        emits ``clicked`` (while clickable), a click on the switch ``value_clicked``. The title,
+        the big value and the detail are kept (read by hosts) but not shown.
+
+        Args:
+            name: Name shown in the row (the title is upper case).
+        """
+        from PyQt5 import sip
+        old = self.layout()
+        while old.count():                         # the card's widgets stay, its layout goes
+            old.takeAt(0)
+        sip.delete(old)
+        for widget in (self.title, self.value, self._line, self.detail, self.hint):
+            widget.hide()
+        self._row = True
+        self._compact = None
+        self.setMinimumSize(0, 30)
+        self.setMaximumSize(16777215, 16777215)
+        self.row_dot = QLabel()
+        self.row_dot.setFixedSize(8, 8)
+        self.row_name = QLabel(str(name))
+        self.row_name.setStyleSheet('color: #e6e9ee; font-size: 12px; background: transparent;')
+        self.row_state = QLabel()
+        self.row_state.setStyleSheet('color: #7d8794; font-size: 11px; background: transparent;')
+        self.row_chevron = QLabel('\u203a')
+        self.row_chevron.setStyleSheet('color: #8ab8ff; font-size: 16px; font-weight: 600; background: transparent;')
+        self.switch_btn.setText('')
+        self.switch_btn.setFlat(True)
+        self.switch_btn.setIconSize(QSize(*ROW_SWITCH_SIZE))
+        self.switch_btn.setFixedSize(QSize(ROW_SWITCH_SIZE[0] + 4, ROW_SWITCH_SIZE[1] + 4))
+        self.switch_btn.setStyleSheet('QPushButton {background: transparent; border: none; padding: 0;}')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 3, 4, 3)
+        row.setSpacing(8)
+        row.addWidget(self.row_dot)
+        row.addWidget(self.row_name, 1)
+        row.addWidget(self.row_state)
+        row.addWidget(self.row_chevron)
+        row.addWidget(self.switch_btn)
+        self.setStyleSheet('QFrame#statusCard {background: transparent; border: none; border-radius: 6px;}'
+                           'QFrame#statusCard:hover {background: #20242a;}')
+        self._refresh_row()
+
+    def is_row(self):
+        """Whether :meth:`set_row` made the card a row."""
+        return self._row
+
+    def set_row_note(self, text):
+        """Show ``text`` instead of the value in the row (e.g. ``12 / 50`` while a dark is captured);
+        ``None`` shows the value again. No effect before :meth:`set_row`."""
+        text = None if text is None else str(text)
+        if text != self._row_note:
+            self._row_note = text
+            if self._row:
+                self._refresh_row()
+
+    def row_state_text(self):
+        """What the row shows as the state: the note, else the value."""
+        return self._row_note if self._row_note is not None else self.value.text()
+
+    def _refresh_row(self):
+        if not getattr(self, '_row', False):
+            return
+        self.row_dot.setStyleSheet(f'background: {PALETTE.get(self.color_name(), "#5b626c")}; border-radius: 4px;')
+        self.row_state.setText(self.row_state_text())
+        self.row_chevron.setVisible(self._clickable)
+        self.switch_btn.setVisible(self._togglable)
+        self.switch_btn.setIcon(switch_icon(self._switch_on))
 
     def set_compact(self, size=92):
         """Make the card a ``size`` x ``size`` px square showing the title and the value only.
@@ -144,8 +245,10 @@ class StatusCard(QFrame):
         self.setCursor(Qt.PointingHandCursor if on else Qt.ArrowCursor)
         self.setFocusPolicy(Qt.TabFocus if on else Qt.NoFocus)
         self.hint.setText(str(hint))
-        self.hint.setVisible(bool(on and hint))
+        self.hint.setVisible(bool(on and hint) and not getattr(self, '_row', False))
         self._place_hint()
+        self._refresh_row()
+        self.changed.emit()
 
     def is_clickable(self):
         """Whether the card emits ``clicked`` now."""
@@ -164,10 +267,17 @@ class StatusCard(QFrame):
         self.switch_btn.setToolTip(str(tip) if tip else '')
         self.switch_btn.setVisible(self._togglable)
         self._place_hint()
+        self._refresh_row()
+        self.changed.emit()
 
     def set_switch_state(self, on, label=None):
         """Show the switch as on (filled) or off (outlined), with ``label`` (default ``ON`` / ``OFF``)."""
         self._switch_on = bool(on)
+        if getattr(self, '_row', False):           # the row's switch is an icon
+            self.switch_btn.setToolTip(str(label) if label else self.switch_btn.toolTip())
+            self._refresh_row()
+            self.changed.emit()
+            return
         text = str(label) if label else ('ON' if on else 'OFF')
         self.switch_btn.setText(f'⏻ {text}')
         if on:
@@ -180,6 +290,7 @@ class StatusCard(QFrame):
                      'QPushButton:hover {background: rgba(0,0,0,110);}')
         self.switch_btn.setStyleSheet(style)
         self._place_hint()
+        self.changed.emit()
 
     def switch_state(self):
         """Whether the switch shows on."""
@@ -200,6 +311,8 @@ class StatusCard(QFrame):
         return super().eventFilter(obj, event)
 
     def _place_hint(self):
+        if getattr(self, '_row', False):           # a row lays itself out
+            return
         self.hint.adjustSize()
         btn = getattr(self, 'switch_btn', None)
         bottom = self.height() - self.hint.height() - 5
@@ -209,6 +322,15 @@ class StatusCard(QFrame):
             if btn.isVisibleTo(self):            # the switch takes the bottom row: the hint goes above it
                 bottom = btn.y() - self.hint.height() - 1
         self.hint.move(self.width() - self.hint.width() - 7, bottom)
+
+    def setToolTip(self, text):
+        """Set the tooltip (the card's full detail) and emit :attr:`changed`."""
+        super().setToolTip(text)
+        self.changed.emit()
+
+    def color_name(self):
+        """The palette key of the last :meth:`set_content` (``'cyan'`` before the first)."""
+        return self._last[2] if getattr(self, '_last', None) else 'cyan'
 
     def resizeEvent(self, event):
         """Keep the corner hint and the switch button in their corners."""
@@ -248,11 +370,13 @@ class StatusCard(QFrame):
         if key == self._last:
             return
         self._last = key
-        self.setStyleSheet(f'QFrame#statusCard {{background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {PALETTE[color]}, stop:1 {QColor(PALETTE[color]).lighter(118).name()}); border: none; border-radius: 6px;}}')
+        if not self._row:
+            self.setStyleSheet(f'QFrame#statusCard {{background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {PALETTE[color]}, stop:1 {QColor(PALETTE[color]).lighter(118).name()}); border: none; border-radius: 6px;}}')
         self.value.setText(value)
         if self._compact:
             self._fit_value()
         self.detail.setText(detail if len(detail) <= 38 else detail[:35] + '…')
         self.setToolTip(f'{self.title.text()}: {value}\n{detail}')
         self.setAccessibleName(f'{self.title.text()} {value}')
+        self._refresh_row()
 

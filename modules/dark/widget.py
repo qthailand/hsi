@@ -4,7 +4,9 @@
 Reload buttons plus an "Apply Dark Subtraction" toggle. It performs no capture itself:
 the host (see :class:`modules.dark.DarkFrameLibrary` and
 :func:`modules.dark.select_dark`) reacts to the signals and pushes state back with the
-``set_*`` methods.
+``set_*`` methods. It is a view of a :class:`~modules.dark.state.DarkFrameState`
+(:attr:`DarkFramePanel.model`), which holds the state; a host that shows the dark elsewhere
+(a status row, a peek) can use that object alone.
 
 Data conventions:
     Exposure is in milliseconds, gain in vendor units, bin is the hardware bin factor.
@@ -25,6 +27,8 @@ from __future__ import annotations
 
 import qtawesome as qta
 from PyQt5.QtCore import Qt, pyqtSignal, QSize
+
+from .state import DarkFrameState
 from PyQt5.QtWidgets import (
     QGroupBox,
     QVBoxLayout,
@@ -58,6 +62,9 @@ class DarkFramePanel(QGroupBox):
             the new state. The box starts checked and no signal is emitted at start-up.
 
     Class attributes ``IDLE``, ``LOADED``, ``CAPTURING`` and ``ERROR`` are the state names.
+
+    Attributes:
+        model (DarkFrameState): The state it shows; its ``set_*`` methods are the panel's.
     """
 
     capture_requested = pyqtSignal()
@@ -77,12 +84,7 @@ class DarkFramePanel(QGroupBox):
             parent: Optional parent widget.
         """
         super().__init__("Dark Frame", parent)
-
-        self._state = self.IDLE
-        self._interactive = True
-        self._loaded_info = {}
-        self._dark_temperature = None      # °C of the loaded dark, None if unknown
-        self._current_temperature = None   # °C reported by the camera, None/-999 if unknown
+        self.model = DarkFrameState(self)
 
         # --- status dot ---
         self._dot_label = QLabel()
@@ -117,7 +119,7 @@ class DarkFramePanel(QGroupBox):
         self._dark_toggle.setStyleSheet(
             "font-size: 11px; color: #e0e0e0;"
         )
-        self._dark_toggle.toggled.connect(self.dark_toggled.emit)
+        self._dark_toggle.toggled.connect(self.model.set_dark_enabled)
 
         # --- progress ---
         self._progress_bar = QProgressBar()
@@ -188,249 +190,103 @@ class DarkFramePanel(QGroupBox):
         self.setLayout(layout)
 
         # --- connections ---
-        self._capture_btn.clicked.connect(self.capture_requested.emit)
-        self._cancel_btn.clicked.connect(self.cancel_requested.emit)
-        self._reload_btn.clicked.connect(self.reload_requested.emit)
+        self._capture_btn.clicked.connect(self.model.capture_requested.emit)
+        self._cancel_btn.clicked.connect(self.model.cancel_requested.emit)
+        self._reload_btn.clicked.connect(self.model.reload_requested.emit)
+        self.model.capture_requested.connect(self.capture_requested.emit)
+        self.model.cancel_requested.connect(self.cancel_requested.emit)
+        self.model.reload_requested.connect(self.reload_requested.emit)
+        self.model.dark_toggled.connect(self.dark_toggled.emit)
+        self.model.changed.connect(self._render)
 
         # --- initial ---
-        self._apply_state(self.IDLE)
+        self._render()
 
-    # ── public API ──────────────────────────────────────────────────
+    # ── public API (the model's) ────────────────────────────────────
 
     def is_dark_enabled(self) -> bool:
-        """★ Return current toggle state.
-
-        Returns:
-            bool: True if the "Apply Dark Subtraction" check box is checked.
-        """
-        return self._dark_toggle.isChecked()
+        """Whether *Apply Dark Subtraction* is on."""
+        return self.model.is_dark_enabled()
 
     def set_dark_enabled(self, enabled: bool) -> None:
         """Tick or untick *Apply Dark Subtraction* (emits ``dark_toggled`` when it changes)."""
-        self._dark_toggle.setChecked(bool(enabled))
+        self.model.set_dark_enabled(enabled)
 
     def set_idle(self):
         """Show "No dark frame" (grey): nothing loaded and nothing capturing."""
-        self._apply_state(self.IDLE)
+        self.model.set_idle()
 
-    def set_loaded(
-        self,
-        bin_value: int,
-        exposure_ms: float,
-        gain: float,
-        n_frames: int,
-        n_hot: int,
-        temperature_c: float | None = None,
-        current_temperature_c: float | None = None,
-    ):
-        """Show that a dark reference is active (green).
-
-        Args:
-            bin_value: Hardware bin of the dark.
-            exposure_ms: Exposure of the dark in milliseconds.
-            gain: Gain of the dark (vendor units).
-            n_frames: Number of frames averaged into the dark.
-            n_hot: Number of hot pixels in its hot-pixel map.
-            temperature_c: Sensor temperature (°C) the dark was captured at, ``None`` if unknown.
-            current_temperature_c: Current sensor temperature (°C) for the ΔT shown next to
-                it; ``None``/``-999`` hides ΔT. Update it later with :meth:`set_current_temperature`.
-        """
-        self._dark_temperature = temperature_c
-        if current_temperature_c is not None:
-            self._current_temperature = current_temperature_c
-        self._apply_state(
-            self.LOADED,
-            bin_value=bin_value,
-            exposure_ms=exposure_ms,
-            gain=gain,
-            n_frames=n_frames,
-            n_hot=n_hot,
-        )
+    def set_loaded(self, bin_value: int, exposure_ms: float, gain: float, n_frames: int, n_hot: int,
+                   temperature_c: float | None = None, current_temperature_c: float | None = None):
+        """Show that a dark reference is active (green); see :meth:`DarkFrameState.set_loaded`."""
+        self.model.set_loaded(bin_value, exposure_ms, gain, n_frames, n_hot, temperature_c,
+                              current_temperature_c)
 
     def set_current_temperature(self, temperature_c: float):
-        """Update the current sensor temperature (°C) used for the ΔT of the loaded dark.
+        """Update the current sensor temperature (°C) used for the ΔT of the loaded dark."""
+        self.model.set_current_temperature(temperature_c)
 
-        Args:
-            temperature_c: Current temperature; below ``-900`` (``-999``) means unknown.
-        """
-        self._current_temperature = temperature_c
-        if self._state == self.LOADED:
-            self._extra_label.setText(self._loaded_extra_text())
-
-    def set_capturing(
-        self,
-        collected: int,
-        total: int,
-        bin_value: int | None = None,
-        exposure_ms: float | None = None,
-        gain: float | None = None,
-    ):
-        """Show capture progress (amber) with a progress bar; the Cancel button appears.
-
-        Args:
-            collected: Frames collected so far.
-            total: Frames to collect.
-            bin_value: Bin being captured (the settings line is blank if None).
-            exposure_ms: Exposure in milliseconds, shown with ``bin_value``.
-            gain: Gain in vendor units, shown with ``bin_value``.
-        """
-        self._apply_state(
-            self.CAPTURING,
-            collected=collected,
-            total=total,
-            bin_value=bin_value,
-            exposure_ms=exposure_ms,
-            gain=gain,
-        )
+    def set_capturing(self, collected: int, total: int, bin_value: int | None = None,
+                      exposure_ms: float | None = None, gain: float | None = None):
+        """Show capture progress (amber) with a progress bar; the Cancel button appears."""
+        self.model.set_capturing(collected, total, bin_value, exposure_ms, gain)
 
     def update_progress(self, collected: int, total: int):
-        """Fast progress update – no layout rebuild.
-
-        Ignored unless the panel is in the capturing state (call :meth:`set_capturing` first).
-
-        Args:
-            collected: Frames collected so far.
-            total: Frames to collect.
-        """
-        if self._state != self.CAPTURING:
-            return
-        self._progress_bar.setRange(0, max(1, total))
-        self._progress_bar.setValue(collected)
-        self._progress_label.setText(f"{collected} / {total}")
+        """Frames collected so far (ignored unless capturing)."""
+        self.model.update_progress(collected, total)
 
     def set_error(self, message: str = "Load failed"):
-        """Show an error title (red), e.g. when the stored dark does not fit the camera.
-
-        Args:
-            message: Text for the title line.
-        """
-        self._apply_state(self.ERROR, error_message=message)
+        """Show an error title (red), e.g. when the stored dark does not fit the camera."""
+        self.model.set_error(message)
 
     def is_capturing(self) -> bool:
         """True while the panel is in the capturing state."""
-        return self._state == self.CAPTURING
+        return self.model.is_capturing()
+
+    def state(self) -> str:
+        """The state: :attr:`IDLE`, :attr:`LOADED`, :attr:`CAPTURING` or :attr:`ERROR`."""
+        return self.model.state()
+
+    def is_interactive(self) -> bool:
+        """Whether Capture and Reload may be used now (:meth:`set_interactive`)."""
+        return self.model.is_interactive()
+
+    def capture_progress(self) -> tuple:
+        """``(collected, total)`` frames of the capture in progress, ``(0, 0)`` when none runs."""
+        return self.model.capture_progress()
 
     def set_interactive(self, enabled: bool):
-        """Enable/disable user actions (e.g. during scan).
+        """Enable/disable Capture and Reload (e.g. during a scan); Cancel stays enabled."""
+        self.model.set_interactive(enabled)
 
-        Args:
-            enabled: False disables Capture and Reload. Cancel stays enabled while
-                capturing.
-        """
-        self._interactive = enabled
-        self._refresh_buttons()
-
-    # ── internal ────────────────────────────────────────────────────
-
-    def _dot_icon(self, color: str):
-        return qta.icon("fa5s.circle", color=color)
+    # ── drawing ─────────────────────────────────────────────────────
 
     def _set_dot(self, color: str):
-        self._dot_label.setPixmap(
-            self._dot_icon(color).pixmap(_DOT_SIZE, _DOT_SIZE)
-        )
+        self._dot_label.setPixmap(qta.icon("fa5s.circle", color=color).pixmap(_DOT_SIZE, _DOT_SIZE))
 
-    def _refresh_buttons(self):
-        """Re-apply enable/visibility based on current state + interactive flag."""
-        enabled = self._interactive
-
-        if self._state == self.CAPTURING:
-            self._capture_btn.hide()
-            self._cancel_btn.show()
-            self._cancel_btn.setEnabled(True)
-            self._reload_btn.show()
-            self._reload_btn.setEnabled(False)
-        else:
-            self._capture_btn.show()
-            self._capture_btn.setEnabled(enabled)
-            self._cancel_btn.hide()
-            self._reload_btn.show()
-            self._reload_btn.setEnabled(enabled)
-
-    def _loaded_extra_text(self) -> str:
-        """``"50 frames · 3 hot pixels · 25.3°C (ΔT +1.2)"`` for the loaded dark."""
-        kw = self._loaded_info
-        text = f"{kw.get('n_frames', 0)} frames · {kw.get('n_hot', 0)} hot pixels"
-        dark_t = self._dark_temperature
-        if dark_t is None:
-            return text + " · temp unknown"
-        text += f" · {dark_t:.1f}°C"
-        current = self._current_temperature
-        if current is not None and current > -900:
-            text += f" (ΔT {current - dark_t:+.1f})"
-        return text
-
-    def _apply_state(self, state: str, **kw):
-        self._state = state
-
-        # ---- idle ----
-        if state == self.IDLE:
-            self._set_dot(_DOT_GRAY)
-            self._title_label.setText("No dark frame")
-            self._title_label.setStyleSheet(
-                "font-weight: 600; color: #9e9e9e;"
-            )
-            self._detail_label.setText(
-                "Capture or reload to enable correction"
-            )
-            self._extra_label.hide()
-            self._progress_bar.hide()
-            self._progress_label.hide()
-
-        # ---- loaded ----
-        elif state == self.LOADED:
-            self._set_dot(_DOT_GREEN)
-            self._title_label.setText("Dark frame active")
-            self._title_label.setStyleSheet(
-                f"font-weight: 600; color: {_DOT_GREEN};"
-            )
-            self._detail_label.setText(
-                f"bin={kw.get('bin_value', '?')} · "
-                f"exp={kw.get('exposure_ms', 0):.1f}ms · "
-                f"gain={kw.get('gain', 0):.0f}"
-            )
-            self._loaded_info = kw
-            self._extra_label.setText(self._loaded_extra_text())
-            self._extra_label.show()
-            self._progress_bar.hide()
-            self._progress_label.hide()
-
-        # ---- capturing ----
-        elif state == self.CAPTURING:
-            self._set_dot(_DOT_AMBER)
-            self._title_label.setText("Capturing dark frames\u2026")
-            self._title_label.setStyleSheet(
-                f"font-weight: 600; color: {_DOT_AMBER};"
-            )
-            bv = kw.get("bin_value")
-            if bv is not None:
-                self._detail_label.setText(
-                    f"bin={bv} · "
-                    f"exp={kw.get('exposure_ms', 0):.1f}ms · "
-                    f"gain={kw.get('gain', 0):.0f}"
-                )
-            else:
-                self._detail_label.setText("")
-
-            collected = kw.get("collected", 0)
-            total = kw.get("total", 1)
-            self._extra_label.hide()
-            self._progress_bar.show()
-            self._progress_bar.setRange(0, max(1, total))
-            self._progress_bar.setValue(collected)
-            self._progress_label.setText(f"{collected} / {total}")
-            self._progress_label.show()
-
-        # ---- error / stale ----
-        elif state == self.ERROR:
-            self._set_dot(_DOT_RED)
-            self._title_label.setText(kw.get("error_message", "Error"))
-            self._title_label.setStyleSheet(
-                f"font-weight: 600; color: {_DOT_RED};"
-            )
-            self._detail_label.setText("Capture or reload to restore")
-            self._extra_label.hide()
-            self._progress_bar.hide()
-            self._progress_label.hide()
-
-        self._refresh_buttons()
+    def _render(self):
+        """Show the model: dot, texts, progress, the toggle and the buttons."""
+        model = self.model
+        state = model.state()
+        color = {"grey": _DOT_GRAY, "green": _DOT_GREEN, "amber": _DOT_AMBER, "red": _DOT_RED}[model.color_name()]
+        self._set_dot(color)
+        self._title_label.setText(model.title())
+        self._title_label.setStyleSheet(f"font-weight: 600; color: {'#9e9e9e' if state == model.IDLE else color};")
+        self._detail_label.setText(model.detail())
+        capturing = state == model.CAPTURING
+        self._extra_label.setText(model.extra() if state == model.LOADED else "")
+        self._extra_label.setVisible(state == model.LOADED)
+        done, total = model.capture_progress()
+        self._progress_bar.setRange(0, max(1, total))
+        self._progress_bar.setValue(done)
+        self._progress_label.setText(f"{done} / {total}")
+        self._progress_bar.setVisible(capturing)
+        self._progress_label.setVisible(capturing)
+        self._dark_toggle.blockSignals(True)
+        self._dark_toggle.setChecked(model.is_dark_enabled())
+        self._dark_toggle.blockSignals(False)
+        self._capture_btn.setVisible(not capturing)
+        self._capture_btn.setEnabled(model.is_interactive())
+        self._cancel_btn.setVisible(capturing)
+        self._cancel_btn.setEnabled(True)
+        self._reload_btn.setEnabled(model.is_interactive() and not capturing)

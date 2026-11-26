@@ -28,16 +28,18 @@ from __future__ import annotations
 
 from PyQt5.QtWidgets import (
     QAbstractSpinBox,
+    QButtonGroup,
     QGroupBox,
-    QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSpinBox,
     QDoubleSpinBox,
-    QComboBox,
     QCheckBox,
+    QWidget,
 )
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 
 _TEMPERATURE_RANGE_C = (-80.0, 100.0)    # widest range shown when the camera reports none
 #: Colour of the cooling-state label per state (others grey).
@@ -48,16 +50,18 @@ _STATE_COLORS = {"stable": "#66bb6a", "low": "#ffa726", "high": "#ffa726", "aler
 class CameraControls(QGroupBox):
     """Gain / exposure / binning / keep_spectrogram controls with signals.
 
-    A ``QGroupBox`` titled "Camera" (or the model, see :meth:`set_camera_name`) holding a gain spin box, an exposure spin box
-    (ms, 3 decimals), a bin combo box and a "Keep Spectrogram" check box. It is
-    constructible with no arguments; call :meth:`set_limits` and
-    :meth:`set_bin_options` after the camera is open so the ranges match the sensor.
+    A ``QGroupBox`` titled "Camera" (or the model, see :meth:`set_camera_name`) holding, for a
+    narrow settings column: Exposure (ms, 3 decimals) and Gain side by side, the bin as a bar of
+    buttons (``1 × 1``, ``2 × 2``, ...; :attr:`bin_segments`), the temperature on one row and a
+    "Keep Spectrogram" check box. It is constructible with no arguments; call
+    :meth:`set_limits` and :meth:`set_bin_options` after the camera is open so the ranges match
+    the sensor.
 
     Signals:
         params_changed: Emitted (no arguments) when gain or exposure changes through
             the user or a call that does not block signals. Not emitted by
             :meth:`set_values`.
-        bin_changed: Emitted (no arguments) when the bin combo selection changes. Not
+        bin_changed: Emitted (no arguments) when the user picks another bin button. Not
             emitted by :meth:`set_bin_options` or :meth:`set_selected_bin`.
             Toggling "Keep Spectrogram" emits nothing; poll :meth:`keep_spectrogram`.
         target_temperature_changed(float): The user finished editing the target temperature
@@ -94,8 +98,17 @@ class CameraControls(QGroupBox):
         self.exp_spin.setRange(1, 1000)
         self.exp_spin.setSuffix(" ms")
 
-        # ── binning factor ──────────────────────────────────────
-        self.bin_combo = QComboBox()
+        # ── binning factor: a bar of buttons, one per supported N x N (it holds the value) ──
+        self.bin_segments = QWidget()
+        self.bin_segments.setObjectName("binSegments")
+        segments = QHBoxLayout(self.bin_segments)
+        segments.setContentsMargins(0, 0, 0, 0)
+        segments.setSpacing(0)
+        self._bin_group = QButtonGroup(self)
+        self._bin_group.setExclusive(True)
+        self._bin_group.idClicked.connect(self._on_bin_segment)
+        self._bins: tuple = ()
+        self._bin_index = -1
 
         # ── temperature: target (TEC cooling) or read-only sensor value ──
         self.temp_label = QLabel()
@@ -107,10 +120,6 @@ class CameraControls(QGroupBox):
         self.cooling_state_label = QLabel()
         self.cooling_state_label.setToolTip("Cooler regulation state reported by the camera")
         self.cooling_state_label.hide()
-        temp_row = QHBoxLayout()
-        temp_row.setContentsMargins(0, 0, 0, 0)
-        temp_row.addWidget(self.temp_spin, stretch=1)
-        temp_row.addWidget(self.cooling_state_label)
         self._cooling_supported = False
         self._last_target = None
 
@@ -122,21 +131,81 @@ class CameraControls(QGroupBox):
             "จำนวนและลำดับเฟรมตรงกับ cube 1:1"
         )
 
-        # ── layout ──────────────────────────────────────────────
-        layout = QFormLayout()
-        layout.addRow("Gain", self.gain_spin)
-        layout.addRow("Exposure", self.exp_spin)
-        layout.addRow("Bin", self.bin_combo)
-        layout.addRow(self.temp_label, temp_row)
-        layout.addRow("", self.keep_spectrogram_check)
-        self.setLayout(layout)
+        # ── layout: Exposure | Gain, the bin bar, the temperature row, Keep Spectrogram ──
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(QLabel("Exposure"), 0, 0)
+        grid.addWidget(QLabel("Gain"), 0, 1)
+        grid.addWidget(self.exp_spin, 1, 0)
+        grid.addWidget(self.gain_spin, 1, 1)
+        grid.addWidget(QLabel("Bin"), 2, 0, 1, 2)
+        grid.addWidget(self.bin_segments, 3, 0, 1, 2)
+        temp_row = QHBoxLayout()
+        temp_row.setContentsMargins(0, 0, 0, 0)
+        temp_row.addWidget(self.temp_label)
+        temp_row.addWidget(self.temp_spin, stretch=1)
+        temp_row.addWidget(self.cooling_state_label)
+        grid.addLayout(temp_row, 4, 0, 1, 2)
+        grid.addWidget(self.keep_spectrogram_check, 5, 0, 1, 2)
+        self.setLayout(grid)
         self.set_cooling_supported(False)
 
         # ── forward changes as signals ──────────────────────────
         self.gain_spin.valueChanged.connect(self.params_changed.emit)
         self.exp_spin.valueChanged.connect(self.params_changed.emit)
-        self.bin_combo.currentIndexChanged.connect(self.bin_changed.emit)
         self.temp_spin.editingFinished.connect(self._on_target_edited)
+
+    # ── the bin bar ─────────────────────────────────────────────
+
+    def bin_options(self) -> tuple:
+        """The binning factors offered, in order (``()`` before :meth:`set_bin_options`)."""
+        return self._bins
+
+    def _build_bin_buttons(self) -> None:
+        layout = self.bin_segments.layout()
+        for button in self._bin_group.buttons():
+            self._bin_group.removeButton(button)
+            layout.removeWidget(button)
+            button.deleteLater()
+        n = len(self._bins)
+        for i, b in enumerate(self._bins):
+            button = QPushButton(f"{b} \u00d7 {b}")
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(f"Bin {b} \u00d7 {b} on the sensor")
+            button.setProperty("segment", "only" if n == 1 else "first" if i == 0
+                               else "last" if i == n - 1 else "middle")
+            self._bin_group.addButton(button, i)
+            layout.addWidget(button, 1)
+
+    def _show_bin_index(self, index: int) -> None:
+        """Check button ``index`` without emitting :attr:`bin_changed`."""
+        self._bin_index = int(index)
+        button = self._bin_group.button(self._bin_index)
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
+
+    def choose_bin(self, bin_value: int) -> bool:
+        """Pick ``bin_value`` as the user would (press its button): emits :attr:`bin_changed` when
+        it differs from the current bin. For scripts and tests; :meth:`set_selected_bin` only shows.
+
+        Returns:
+            bool: False when ``bin_value`` is not offered (nothing happens).
+        """
+        if int(bin_value) not in self._bins:
+            return False
+        index = self._bins.index(int(bin_value))
+        button = self._bin_group.button(index)
+        if button is not None:
+            button.setChecked(True)
+        self._on_bin_segment(index)
+        return True
+
+    def _on_bin_segment(self, index: int) -> None:
+        if index != self._bin_index:
+            self._bin_index = int(index)
+            self.bin_changed.emit()
 
     # ── value getters ───────────────────────────────────────────
 
@@ -149,9 +218,10 @@ class CameraControls(QGroupBox):
         return self.exp_spin.value()
 
     def selected_bin(self) -> int:
-        """Current binning factor from the combo (1 if unset)."""
-        value = self.bin_combo.currentData()
-        return int(value) if value is not None else 1
+        """Current binning factor (1 before :meth:`set_bin_options`)."""
+        if 0 <= self._bin_index < len(self._bins):
+            return int(self._bins[self._bin_index])
+        return 1
 
     def keep_spectrogram(self) -> bool:
         """True if full-resolution frames should be stored during scan."""
@@ -284,46 +354,37 @@ class CameraControls(QGroupBox):
     def set_bin_options(
         self, bins: tuple[int, ...], default_bin: int
     ) -> None:
-        """Populate the bin combo with supported binning factors.
+        """Offer the supported binning factors (one button each).
 
-        Signals are blocked during population to avoid triggering
-        ``bin_changed`` before the caller is ready.
+        Emits nothing (``bin_changed`` is for the user's picks).
 
         Args:
             bins: Supported binning factors (N for N x N); an empty value gives ``(1,)``.
             default_bin: Factor to select; the first entry is used if it is not in ``bins``.
         """
         bins = tuple(int(b) for b in bins) if bins else (1,)
-        self.bin_combo.blockSignals(True)
-        self.bin_combo.clear()
-        for b in bins:
-            self.bin_combo.addItem(str(b), b)
-        idx = list(bins).index(default_bin) if default_bin in bins else 0
-        self.bin_combo.setCurrentIndex(idx)
-        self.bin_combo.blockSignals(False)
+        self._bins = bins
+        self._build_bin_buttons()
+        self._show_bin_index(list(bins).index(default_bin) if default_bin in bins else 0)
 
     # ── state ──────────────────────────────────────────────────
 
     def set_selected_bin(self, bin_value: int) -> None:
-        """Show ``bin_value`` in the combo without emitting ``bin_changed``.
+        """Show ``bin_value`` as the selected bin without emitting ``bin_changed``.
 
         Args:
             bin_value: Binning factor; ignored if it is not one of the listed options.
         """
-        index = self.bin_combo.findData(int(bin_value))
-        if index < 0 or index == self.bin_combo.currentIndex():
-            return
-        self.bin_combo.blockSignals(True)
-        self.bin_combo.setCurrentIndex(index)
-        self.bin_combo.blockSignals(False)
+        if int(bin_value) in self._bins:
+            self._show_bin_index(self._bins.index(int(bin_value)))
 
     def set_bin_enabled(self, enabled: bool) -> None:
-        """Enable / disable bin combo (disabled during scan).
+        """Enable / disable the bin buttons (disabled during scan).
 
         Args:
             enabled: True to let the user change the bin.
         """
-        self.bin_combo.setEnabled(enabled)
+        self.bin_segments.setEnabled(bool(enabled))
 
     def set_settings_enabled(self, enabled: bool) -> None:
         """Enable / disable gain, exposure, cooling target and Keep Spectrogram (disabled during scan).

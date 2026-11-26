@@ -403,25 +403,22 @@ def test_controller_points_the_preview_at_the_recording_then_the_cube():
 
 # ── settings pane during a scan ─────────────────────────────────────────
 
-def test_a_scan_folds_and_locks_the_settings_and_the_end_restores_them():
+def test_a_scan_locks_the_settings_in_view_and_the_end_unlocks_them():
     import config as app_config
     from windows.scan_window import ScanWindow
     app = QApplication.instance() or QApplication([])
     win = ScanWindow(app_config.AppConfig())
-    win.resize(1200, 800); win.show(); app.processEvents()
-    splitter, controls = win.settings_splitter, win.camera_controls
+    win.resize(1500, 800); win.show(); app.processEvents()
+    controls = win.camera_controls
     controls.set_cooling_supported(True, (-20.0, 20.0))         # a TEC target is a setting
-    before = splitter.sizes()
-    assert before[0] > 0
-    win.set_scanning(True); win.set_scanning(True)              # twice: still the pre-scan height kept
-    assert splitter.sizes()[0] == 0
+    win.set_scanning(True); win.set_scanning(True)              # twice: no harm
+    assert win.settings_scroll.isVisible() and controls.isVisible()   # still readable in their column
     assert not any(w.isEnabled() for w in (controls.gain_spin, controls.exp_spin, controls.temp_spin,
                                            controls.keep_spectrogram_check, win.rotation_group, win.linear_group))
-    splitter.moveSplitter(sum(before), 1)                       # dragged open to read the values
     win.set_scanning(False)
-    assert splitter.sizes() == before and controls.temp_spin.isEnabled() and win.rotation_group.isEnabled()
+    assert controls.temp_spin.isEnabled() and win.rotation_group.isEnabled()
     win.set_scanning(False)                                     # no scan to end: unchanged
-    assert splitter.sizes() == before
+    assert controls.gain_spin.isEnabled()
     controls.set_cooling_supported(False)
     win.set_scanning(True)
     assert controls.temp_spin.isEnabled() and not controls.gain_spin.isEnabled()   # a sensor readout stays readable
@@ -429,21 +426,46 @@ def test_a_scan_folds_and_locks_the_settings_and_the_end_restores_them():
     win.close()
 
 
-def test_the_settings_handle_snaps_shut_and_open_like_the_left_panel():
+def test_three_columns_live_view_cube_preview_settings():
+    """Live view | cube preview (the one that grows) | settings with Start / Stop pinned below."""
     import config as app_config
+    from windows.scan_window import INSPECTOR_MIN_WIDTH, ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.resize(1500, 800); win.show(); app.processEvents()
+    columns = win.columns_splitter
+    assert [columns.widget(i) for i in range(3)][1:] == [win.cube_preview_group, win.inspector]
+    left, centre, right = columns.sizes()
+    assert centre > left and centre > right and right >= INSPECTOR_MIN_WIDTH
+    win.resize(1900, 800); app.processEvents()
+    assert columns.sizes()[1] > centre and columns.sizes()[2] == right           # only the preview grows
+    start, stop = win.start_scan_btn, win.stop_scan_btn
+    bottom = win.inspector.mapTo(win, win.inspector.rect().bottomLeft()).y()
+    assert start.isVisible() and not stop.isVisible() and start.mapTo(win, start.rect().bottomLeft()).y() <= bottom
+    assert win.viewer.start_btn is start and win.viewer.stop_btn is stop   # the image has no buttons of its own
+    win.close()
+
+
+def test_the_pinned_start_and_stop_drive_the_scan_and_follow_its_state():
+    import config as app_config
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
     from windows.scan_window import ScanWindow
     app = QApplication.instance() or QApplication([])
     win = ScanWindow(app_config.AppConfig())
-    win.resize(1200, 800); win.show(); app.processEvents()
-    splitter, pane = win.settings_splitter, win.settings_splitter.widget(0)
-    full = pane.height()
-    def drag_to(y):
-        splitter.moveSplitter(y, 1); app.processEvents()
-        return splitter.sizes()[0]
-    assert drag_to(full - full // 3) > 0 and pane.height() == full     # a short drag: no shrinking
-    assert drag_to(full // 3) == 0                                      # past half its height: shut
-    assert drag_to(full // 3) == 0 and drag_to(full * 2 // 3) > 0       # past half again: open
-    assert pane.height() == full
+    win.show(); app.processEvents()
+    asked = []
+    win.viewer.start_scan_requested.connect(lambda: asked.append("start"))
+    win.viewer.stop_scan_requested.connect(lambda: asked.append("stop"))
+    win.start_scan_btn.click()
+    win.viewer.set_scanning_ui(True)                           # the controller: the scan runs
+    assert win.stop_scan_btn.isVisible() and win.stop_scan_btn.isEnabled() and not win.start_scan_btn.isVisible()
+    win.stop_scan_btn.click()
+    win.viewer.set_scanning_ui(False)
+    assert win.start_scan_btn.isVisible() and win.start_scan_btn.isEnabled()
+    win.activateWindow(); win.setFocus(); app.processEvents()
+    QTest.keyClick(win, Qt.Key_F5)                              # F5 still starts it
+    assert asked[:2] == ["start", "stop"] and asked[2:] in ([], ["start"])
     win.close()
 
 
@@ -551,3 +573,279 @@ def test_the_status_bar_shows_the_temperature_with_a_thermometer_icon():
     host._update_status_bar()
     assert host.temp_status.isHidden()
     host.close()
+
+
+# ── the settings column (inspector) ─────────────────────────────────────
+
+def test_status_cards_are_the_correction_rows():
+    import config as app_config
+    from PyQt5.QtCore import QPoint, Qt
+    from PyQt5.QtTest import QTest
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.resize(1500, 1100); win.show(); app.processEvents()
+    opened, switched = [], []
+    win.status_card_clicked.connect(opened.append)
+    card = win.correction_status.dark
+    assert win.correction_rows["dark"] is card and card.is_row() and card.isVisible()
+    card.value_clicked.connect(lambda: switched.append(True))
+    card.set_content("Ready", "dark_b1.npz", color="green")
+    assert card.row_state.text() == "Ready" and "dark_b1.npz" in card.toolTip()
+    assert card.row_chevron.isVisible()                         # no dark yet: its peek captures one
+    QTest.mouseClick(card, Qt.LeftButton, pos=QPoint(20, card.height() // 2))
+    assert opened == ["dark"]                                   # the row opens its view (peek)
+    assert card.switch_btn.isVisible() and not card.value.isVisible()
+    card.switch_btn.click()
+    assert switched == [True]                                   # the owner switches, the card shows it
+    win.close()
+
+
+def test_ready_to_scan_lists_only_what_needs_attention():
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    captured = []
+    win.dark_panel.capture_requested.connect(lambda: captured.append(True))
+    win._refresh_inspector()
+    items, passed = win.ready_items()
+    assert [text for _s, text, _a, _c in items][:2] == ["No dark frame", "No smile model"]
+    items[0][3]()                                               # its Capture fix
+    assert captured == [True]
+    import numpy as np
+    clipped = np.zeros((10, 100), np.uint16); clipped[0, :21] = 65535      # 2.1 % at full scale
+    win.histogram.update_histogram(clipped)
+    win.set_ready_issue("pixel_pitch", "Pixel pitch not set", "Set", lambda: None)
+    assert "2.10 % clipped" in win.ready_list.texts() and "Pixel pitch not set" in win.ready_list.texts()
+    win.set_ready_issue("pixel_pitch", "")
+    win.histogram.update_histogram(np.zeros((10, 100), np.uint16))
+    win._refresh_inspector()
+    assert "Pixel pitch not set" not in win.ready_list.texts() and "No clipped pixels" in win.ready_items()[1]
+    win.close()
+
+
+def test_bin_buttons_drive_the_bin_and_lock_with_it():
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    controls = win.camera_controls
+    assert not hasattr(controls, "bin_combo")                 # the bar holds the bin
+    win.set_bin_options((1, 2, 4), 2)
+    picked = []
+    controls.bin_changed.connect(lambda: picked.append(win.selected_bin()))
+    buttons = controls._bin_group.buttons()
+    assert [b.isChecked() for b in buttons] == [False, True, False]
+    buttons[2].click()
+    assert picked == [4] and win.selected_bin() == 4
+    win.set_bin_enabled(False)
+    assert not controls.bin_segments.isEnabled()
+    win.close()
+
+
+def test_stop_shows_the_scan_progress_and_time_left(monkeypatch):
+    import config as app_config
+    import windows.scan_window as scan_window_module
+    app = QApplication.instance() or QApplication([])
+    win = scan_window_module.ScanWindow(app_config.AppConfig())
+    now = [100.0]
+    monkeypatch.setattr(scan_window_module, 'time', SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(win, 'stage_type', lambda: 'rotation')
+    win.degree_spin.setValue(10.0); win.degree_per_second_spin.setValue(2.0)   # 5 s
+    win.viewer.set_scanning_ui(True); win.set_scanning(True); win.start_scan_clock()
+    now[0] = 102.0
+    win._refresh_inspector()
+    assert win.scan_progress.value() == 400 and win.stop_scan_btn.text().endswith("3.0 s left")
+    win.set_scanning(False); win.viewer.set_scanning_ui(False)
+    assert win.stop_scan_btn.text().strip() == "Stop scan" and win.scan_progress.isHidden()
+    win.close()
+
+
+def test_the_dark_lives_in_its_row_its_peek_and_ready_to_scan():
+    """No Dark Frame box: the row switch subtracts, the peek captures / reloads / cancels."""
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.resize(1500, 1000); win.show(); app.processEvents()
+    panel = win.dark_panel
+    from modules.dark.state import DarkFrameState
+    assert isinstance(panel, DarkFrameState) and win.correction_rows["dark"].isVisible()   # no box: a state
+    asked = []
+    for name in ("capture_requested", "reload_requested", "cancel_requested"):
+        getattr(panel, name).connect(lambda name=name: asked.append(name))
+    assert win.peek_actions("dark") == (("capture", "Capture"), ("reload", "Reload"))
+    win.run_peek_action("dark", "capture"); win.run_peek_action("dark", "reload")
+    panel.set_capturing(12, 50, 2, 6.0, 1)
+    assert win.peek_actions("dark") == (("cancel", "Cancel capture"),)
+    items, _ = win.ready_items()
+    assert items[0][1] == "Capturing the dark frame…" and items[0][2] == "Cancel"
+    win._refresh_inspector()
+    assert win.correction_rows["dark"].row_state.text() == "12 / 50"      # the count: on the row only
+    panel.update_progress(30, 50); win._refresh_inspector()
+    assert win.correction_rows["dark"].row_state.text() == "30 / 50"
+    items[0][3]()
+    assert asked == ["capture_requested", "reload_requested", "cancel_requested"]
+    panel.set_loaded(2, 6.0, 1.0, 50, 3)                         # the capture finished
+    win._refresh_inspector()
+    assert win.correction_rows["dark"].row_state.text() == win.correction_status.dark.value.text()
+    assert win.peek_actions("dark") == (("capture", "Capture"), ("reload", "Reload"))
+    win.set_scanning(True)
+    assert win.peek_actions("dark") == ()                       # locked during a scan
+    win.set_scanning(False)
+    win.set_dark_viewable(True, "lines at 912 nm")
+    texts = [text for _s, text, _a, _c in win.ready_items()[0]]
+    assert "Light leak in the dark" in texts and "⚠ lines at 912 nm" in win.correction_status.dark.toolTip()
+    assert win.dark_setting_text().endswith("bin 1")
+    win.close()
+
+
+def test_the_main_window_dark_peek_without_a_dark():
+    from types import SimpleNamespace as NS
+    from windows.main_window import MainWindow
+    panel = NS(is_capturing=lambda: False)
+    win = NS(peek_actions=lambda key: (("capture", "Capture"), ("reload", "Reload")), dark_panel=panel,
+             dark_setting_text=lambda: "6 ms · gain 1 · bin 2")
+    data = MainWindow._dark_peek_data(NS(win=win, dark_peek_data=lambda: None))
+    assert data.title == "Dark" and data.open_label == "" and data.color == "red"
+    assert data.lines[:2] == ("No dark frame", "for 6 ms · gain 1 · bin 2")
+    assert data.actions == (("capture", "Capture"), ("reload", "Reload"))
+    import numpy as np
+    from modules.profile_peek import dark_peek
+    loaded = MainWindow._dark_peek_data(NS(win=win, dark_peek_data=lambda: dark_peek({"mean": np.zeros((2, 3))})))
+    assert loaded.open_label == "View ▸" and loaded.actions == data.actions
+
+
+def test_live_column_cards_follow_sharpness_and_clipping():
+    import config as app_config
+    import numpy as np
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.resize(1500, 1000); win.show(); app.processEvents()
+    assert not hasattr(win, "sharpness_panel")                 # the tile is the sharpness display
+    assert win.sharpness_tile.isVisible() and win.clipped_tile.isVisible() and win.histogram is win.clipped_tile
+    for score in (40.0, 72.4, 71.8):
+        win.set_sharpness_score(score)
+    assert win.sharpness_tile.value_label.text() == "71.8" and win.sharpness_tile.best() == 72.4
+    win.sharpness_tile.reset_btn.click()                       # resets every sharpness display
+    assert win.sharpness_tile.value_label.text() == "\u2014" and win.sharpness_tile.best() is None
+    frame = np.full((40, 60), 100, np.uint16)
+    frame[:, :3] = 65535
+    win.histogram.update_histogram(frame)
+    win._refresh_inspector()
+    assert win.clipped_tile.value_label.text() == "5.00 %"
+    assert win.clipped_tile.bars.saturated[-1] > 0                # the clipped bar is red
+    win.set_fps(37.8)
+    assert win.live_fps_label.text() == "37.8 fps"
+    assert win.save_frame_btn.menu() is not None and win.save_frame_btn.text() == ""
+    win.close()
+
+
+def test_clipped_keeps_the_max_since_reset_and_a_scan_resets_it():
+    """Now (this frame) and on the way (max since reset): Start scan resets the max."""
+    import config as app_config
+    import numpy as np
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    tile = win.clipped_tile
+    assert tile.max_label.text() == "\u2014"
+    frame = np.zeros((10, 100), np.uint16)
+    frame[0, :30] = 65535
+    tile.update_histogram(frame)                               # 3 % clipped
+    tile.update_histogram(np.zeros((10, 100), np.uint16))      # then none
+    assert tile.value_label.text() == "0.00 %" and tile.max_label.text() == "3.00 %"
+    assert "#F85149" in tile.max_label.styleSheet()             # it clipped on the way: red
+    assert tile.max_saturated_percent() == 3.0
+    tile.reset_btn.click()
+    assert tile.max_label.text() == "\u2014" and "#F85149" not in tile.max_label.styleSheet()   # grey
+    tile.update_histogram(frame)
+    win.set_scanning(True)                                     # Start scan: the max starts again
+    assert tile.max_saturated_percent() is None
+    tile.update_histogram(np.zeros((10, 100), np.uint16))
+    win.set_scanning(True)                                     # already scanning: no reset
+    assert tile.max_saturated_percent() == 0.0
+    win.set_scanning(False)
+    assert tile.max_saturated_percent() == 0.0                 # the scan's max stays readable after it
+    win.close()
+
+
+def test_choose_bin_acts_like_a_click_on_its_button():
+    """Scripts (tools/hardware_smoke.py) switch the bin with choose_bin: it emits bin_changed."""
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    controls = win.camera_controls
+    win.set_bin_options((1, 2, 4), 2)
+    picked = []
+    controls.bin_changed.connect(lambda: picked.append(win.selected_bin()))
+    assert controls.choose_bin(4) and picked == [4] and controls._bin_group.checkedId() == 2
+    assert controls.choose_bin(4) and picked == [4]            # already the bin: no change
+    assert not controls.choose_bin(3) and win.selected_bin() == 4
+    controls.set_selected_bin(1)                               # shows only: no bin_changed
+    assert picked == [4] and win.selected_bin() == 1
+    win.close()
+
+
+def test_a_single_bin_button_is_rounded_on_both_sides():
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    controls = win.camera_controls
+    win.set_bin_options((1,), 1)
+    assert [b.property("segment") for b in controls._bin_group.buttons()] == ["only"]
+    win.set_bin_options((1, 2, 4), 1)
+    assert [b.property("segment") for b in controls._bin_group.buttons()] == ["first", "middle", "last"]
+    assert '[segment="only"]' in win.inspector.styleSheet()
+    win.close()
+
+
+def test_the_wavelength_peek_has_the_cards_colour():
+    """A missing or mismatched calibration (red / orange card) must not peek green."""
+    from types import SimpleNamespace as NS
+    import config as app_config
+    from windows.main_window import MainWindow
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    card = win.status_card("wavelength")
+    host = NS(scan_controller=NS(win=win), integrations=[])
+    for value, color in (("Missing", "red"), ("Bin 2?", "orange"), ("Stored", "green")):
+        card.set_content(value, "detail", color=color)
+        data = MainWindow._profile_peek_data(host, "wavelength")
+        assert data.color == color and data.lines[0] == value
+    win.close()
+
+
+def test_ready_list_locks_its_buttons_and_updates_text_in_place():
+    from PyQt5.QtCore import QEvent
+    from PyQt5.QtWidgets import QPushButton
+    from windows.scan_inspector import ReadyList
+    app = QApplication.instance() or QApplication([])
+    ready = ReadyList()
+    calls = []
+    ready.set_items([("warning", "Dark subtraction is off", "Turn on", lambda: calls.append("on"))])
+    buttons = ready.findChildren(QPushButton)
+    assert [b.text() for b in buttons] == ["Turn on"]
+    # the scan starts: same text, no callback -> the button goes (a kept one would act mid-cube)
+    ready.set_items([("warning", "Dark subtraction is off", "Turn on", None)])
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert [b.text() for b in ready.findChildren(QPushButton) if not b.isHidden()] == []
+    # and comes back after the scan
+    ready.set_items([("warning", "Dark subtraction is off", "Turn on", lambda: calls.append("on"))])
+    app.sendPostedEvents(None, QEvent.DeferredDelete)
+    # a new clipped % every tick: the rows (and the button under the cursor) stay, the text changes
+    for percent in ("0.51", "0.52", "0.53"):
+        ready.set_items([("warning", "Dark subtraction is off", "Turn on", lambda: calls.append("on")),
+                         ("warning", f"{percent} % clipped", "", None)])
+    rows = list(ready.rows)
+    ready.set_items([("warning", "Dark subtraction is off", "Turn on", lambda: calls.append("on2")),
+                     ("warning", "0.60 % clipped", "", None)])
+    assert ready.rows == rows and ready.texts()[1] == "0.60 % clipped"
+    ready.findChildren(QPushButton)[-1].click()
+    assert calls == ["on2"]                                  # the latest callback runs
+    ready.deleteLater()

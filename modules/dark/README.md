@@ -110,6 +110,12 @@ Capture / Cancel / Reload buttons and an "Apply Dark Subtraction" check box. It 
 nothing itself: the host reacts to its signals and reports back with `set_*` methods.
 There is no GUI launcher (`python -m modules.dark` is the CLI above).
 
+The state itself is `DarkFrameState` (`modules.dark.state`, a `QObject`: same `set_*` methods,
+signals and getters, plus `changed`, texts such as `title()` / `summary()` and the requests
+`request_capture()` / `request_reload()` / `request_cancel()`). `DarkFramePanel` is a view of one
+(`panel.model`); a host that shows the dark its own way (the HSI scan window: a status row, a
+peek and *Ready to scan?*) uses `DarkFrameState` alone.
+
 ```python
 from modules.dark import DarkFrameLibrary, DarkFramePanel, select_dark
 

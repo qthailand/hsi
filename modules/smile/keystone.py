@@ -149,6 +149,7 @@ class GeometrySurface:
         return out
 
     def design(self, X, Y):
+        """Least-squares design matrix ``(points, coefficients)`` of ``X`` / ``Y`` (px), no box rule."""
         bx, by = self._bx(X), self._by(Y)
         return (by[:, :, None] * bx[:, None, :]).reshape(len(bx), -1)
 
@@ -158,6 +159,13 @@ class GeometrySurface:
         return np.sum((self._by(Y) @ self.C) * self._bx(X), axis=1).reshape(X.shape)
 
     def fit(self, X, Y, values, weights=None):
+        """Fit the coefficients to ``values`` at ``(X, Y)`` by (weighted) least squares; returns ``self``.
+
+        Args:
+            X, Y: Point columns / rows (px), any shape (flattened).
+            values: Value at each point (px of shift).
+            weights: Optional weight per point (``None``: all equal).
+        """
         A = self.design(X, Y)
         v = np.asarray(values, float).ravel()
         if weights is not None:
@@ -195,11 +203,13 @@ class GeometrySurface:
         return by @ self.C @ bx.T
 
     def to_json(self) -> dict:
+        """JSON-serialisable dict of the surface (read back by :meth:`from_json`)."""
         return dict(xpows=self.xpows, ypows=self.ypows, x0=self.x0, sx=self.sx, y0=self.y0, sy=self.sy,
                     coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
 
     @classmethod
     def from_json(cls, d: dict) -> "GeometrySurface":
+        """The surface stored by :meth:`to_json`."""
         return cls(d["xpows"], d["ypows"], d["x0"], d["sx"], d["y0"], d["sy"], d["coef"], d.get("box"),
                    d.get("y_rule", "linear"))
 
@@ -276,6 +286,7 @@ class SplineSurface:
         return (_bspline_basis(Y + 0.5, self.ty) - _bspline_basis(Y - 0.5, self.ty)).toarray()
 
     def design(self, X, Y) -> sparse.csr_matrix:
+        """Sparse least-squares design matrix ``(points, coefficients)`` of ``X`` / ``Y`` (px), no box rule."""
         X = np.asarray(X, float).ravel(); Y = np.asarray(Y, float).ravel()
         n = X.size
         bx = self._bx(X)
@@ -304,6 +315,13 @@ class SplineSurface:
         return (self.design(X, Y) @ self.C.ravel()).reshape(X.shape)
 
     def fit(self, X, Y, values, weights=None):
+        """Fit the coefficients to ``values`` at ``(X, Y)`` by weighted least squares with the second-difference penalty; returns ``self``.
+
+        Args:
+            X, Y: Point columns / rows (px), any shape (flattened).
+            values: Value at each point (px of shift).
+            weights: Optional weight per point (``None``: all equal).
+        """
         A = self.design(X, Y)
         v = np.asarray(values, float).ravel()
         wt = np.ones(v.size) if weights is None else np.asarray(weights, float).ravel()
@@ -336,11 +354,13 @@ class SplineSurface:
         return by @ self.C @ self._bx(Xc).T
 
     def to_json(self) -> dict:
+        """JSON-serialisable dict of the surface (read back by :meth:`from_json`)."""
         return dict(kind=self.kind, x_ref=self.x_ref, tx=self.tx.tolist(), ty=self.ty.tolist(), reg=self.reg,
                     coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
 
     @classmethod
     def from_json(cls, d: dict) -> "SplineSurface":
+        """The surface stored by :meth:`to_json`."""
         return cls(d["x_ref"], d["tx"], d["ty"], d.get("reg", SPLINE_REG), d["coef"], d.get("box"),
                    d.get("y_rule", "linear"))
 
@@ -400,14 +420,23 @@ class TensorSurface:
         return np.column_stack([v ** i for i in range(self.y_degree + 1)])
 
     def design(self, X, Y):
+        """Least-squares design matrix ``(points, coefficients)`` of ``X`` / ``Y`` (px), no box rule."""
         bx, by = self._bx(X), self._by(Y)
         return (by[:, :, None] * bx[:, None, :]).reshape(len(bx), -1)
 
     def raw(self, X, Y):
+        """Value at points, no box rule."""
         X, Y = np.broadcast_arrays(np.asarray(X, float), np.asarray(Y, float))
         return np.sum((self._by(Y) @ self.C) * self._bx(X), axis=1).reshape(X.shape)
 
     def fit(self, X, Y, values, weights=None):
+        """Fit the coefficients to ``values`` at ``(X, Y)`` by weighted least squares with the coefficient ridge; returns ``self``.
+
+        Args:
+            X, Y: Point columns / rows (px), any shape (flattened).
+            values: Value at each point (px of shift).
+            weights: Optional weight per point (``None``: all equal).
+        """
         A = self.design(X, Y)
         v = np.asarray(values, float).ravel()
         wt = np.ones(v.size) if weights is None else np.asarray(weights, float).ravel()
@@ -424,12 +453,14 @@ class TensorSurface:
     grid = SplineSurface.grid
 
     def to_json(self) -> dict:
+        """JSON-serialisable dict of the surface (read back by :meth:`from_json`)."""
         return dict(kind=self.kind, family=self.family, x_degree=self.x_degree, y_degree=self.y_degree,
                     x_ref=self.x_ref, shape=list(self.shape), knots=self.knots, reg=self.reg,
                     coef=self.C.tolist(), box=self.box, y_rule=self.y_rule)
 
     @classmethod
     def from_json(cls, d: dict) -> "TensorSurface":
+        """The surface stored by :meth:`to_json`."""
         return cls(d["family"], d["x_degree"], d["y_degree"], d["x_ref"], d["shape"], d.get("knots", ()),
                    d.get("reg", 0.0), d["coef"], d.get("box"), d.get("y_rule", "linear"))
 
@@ -498,6 +529,7 @@ class GeometryModel:
         return X, Y
 
     def to_json(self) -> dict:
+        """JSON-serialisable dict of the model, tagged with ``KEYSTONE_SCHEMA``."""
         return dict(schema=KEYSTONE_SCHEMA, shape=[int(v) for v in self.shape], y_ref=float(self.y_ref),
                     x_ref=float(self.x_ref), dx=self.dx.to_json(), dy=self.dy.to_json(),
                     lamp_X=[float(v) for v in self.lamp_X], target_Y=[float(v) for v in self.target_Y],
@@ -505,6 +537,11 @@ class GeometryModel:
 
     @classmethod
     def from_json(cls, d: dict) -> "GeometryModel":
+        """The model stored by :meth:`to_json`.
+
+        Raises:
+            ValueError: ``d`` is not tagged with ``KEYSTONE_SCHEMA``.
+        """
         if d.get("schema") != KEYSTONE_SCHEMA:
             raise ValueError(f"Not a smile + keystone geometry model ({d.get('schema')!r}).")
         return cls(shape=tuple(int(v) for v in d["shape"]), y_ref=float(d["y_ref"]), x_ref=float(d["x_ref"]),
@@ -541,6 +578,7 @@ class TargetLine:
     recovered: Optional[np.ndarray] = None
 
     def y_at(self, x, w: int) -> np.ndarray:
+        """Row of the bar (px) at columns ``x`` of a frame ``w`` px wide, from the fitted cubic ``coef``."""
         xc, sx = (w - 1) / 2.0, max(1.0, (w - 1) / 2.0)
         return np.polynomial.polynomial.polyval((np.asarray(x, float) - xc) / sx, self.coef)
 

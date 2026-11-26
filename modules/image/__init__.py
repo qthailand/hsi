@@ -18,7 +18,7 @@ Example:
     >>> apply_raw_orientation(np.arange(8).reshape(2, 4)).tolist()
     [[4, 5, 6, 7], [0, 1, 2, 3]]
 """
-from .core import raw_2d_frame, apply_raw_orientation, subtract_dark_frame, correct_hot_pixels, save_png, png_name
+from .core import raw_2d_frame, apply_raw_orientation, subtract_dark_frame, correct_hot_pixels, save_png, png_name, png_text
 
-__all__ = ("raw_2d_frame", "apply_raw_orientation", "subtract_dark_frame", "correct_hot_pixels", "save_png", "png_name")
+__all__ = ("raw_2d_frame", "apply_raw_orientation", "subtract_dark_frame", "correct_hot_pixels", "save_png", "png_name", "png_text")
 __requires__ = ()

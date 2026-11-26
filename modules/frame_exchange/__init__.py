@@ -10,9 +10,9 @@ Example:
     >>> FrameSnapshot(1, np.zeros((2, 2)), 0.0, 1, False, False, False).camera_bin
     1
 """
-from .snapshot import FrameSnapshot
+from .snapshot import FRAME_STAGES, FrameSnapshot, FrameStages
 
-__all__ = ['FrameExchange', 'FrameSnapshot']
+__all__ = ['FRAME_STAGES', 'FrameExchange', 'FrameSnapshot', 'FrameStages']
 __requires__ = ()
 
 

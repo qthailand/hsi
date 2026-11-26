@@ -153,5 +153,5 @@ from .config import SmileConfig
 __all__ += ["SmileConfig", "SpectralReference", "QualityReport", "analyze_quality",
             "estimate_shift_uncertainty", "correlation_shift"]
 
-__requires__ = ("contracts", "image")
+__requires__ = ("contracts", "image", "ui_kit")      # ui_kit: dashboard colours (ui_theme.py, optional at run time)
 __widgets__ = ("SmileCorrectionWidget",)
