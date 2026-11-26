@@ -1,7 +1,8 @@
 """Flat-field correction along the slit of a pushbroom scan (Qt-free).
 
 ``compute_flatfield`` fits the relative response of every slit row and band on a scan of a
-target that is uniform along the slit and spans it; ``apply_flatfield`` divides a cube by it;
+target that is uniform along the slit and spans it; ``combine_flatfields`` makes one profile of
+several such scans whose target joints lie elsewhere; ``apply_flatfield`` divides a cube by it;
 ``FlatFieldStore`` keeps profiles per camera and finds the one that fits a scan's setting.
 The reflectance scale is not part of this module: pass the profile to
 ``modules.radiometric.compute_flatfield_factors_array`` with a scan of a reflectance target.
@@ -18,13 +19,13 @@ Example:
     >>> flat = compute_flatfield(strip_cube, strip_mask)          # doctest: +SKIP
     >>> evened = apply_flatfield(scan_cube, flat['profile'])      # doctest: +SKIP
 """
-from .core import (DEFAULT_MAX_SATURATED, DEFAULT_MIN_COVERAGE, DEFAULT_STEP_THRESHOLD, apply_flatfield, evening_factors,
-                   check_profile, compute_flatfield)
+from .core import (DEFAULT_LAMP_RESIDUAL, DEFAULT_MAX_SATURATED, DEFAULT_MIN_COVERAGE, DEFAULT_STEP_THRESHOLD,
+                   apply_flatfield, check_profile, combine_flatfields, compute_flatfield, evening_factors)
 from .store import (FLATFIELD_FORMAT_VERSION, FlatFieldMatch, FlatFieldProfile, FlatFieldStore,
                     flatfield_mismatch)
 
-__all__ = ["compute_flatfield", "apply_flatfield", "evening_factors", "check_profile", "DEFAULT_MIN_COVERAGE", "DEFAULT_MAX_SATURATED",
-           "DEFAULT_STEP_THRESHOLD",
+__all__ = ["compute_flatfield", "combine_flatfields", "apply_flatfield", "evening_factors", "check_profile",
+           "DEFAULT_MIN_COVERAGE", "DEFAULT_MAX_SATURATED", "DEFAULT_STEP_THRESHOLD", "DEFAULT_LAMP_RESIDUAL",
            "FlatFieldStore", "FlatFieldProfile", "FlatFieldMatch", "flatfield_mismatch",
            "FLATFIELD_FORMAT_VERSION"]
 __requires__ = ("radiometric",)

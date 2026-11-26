@@ -32,8 +32,9 @@ import warnings
 
 import numpy as np
 
-__all__ = ["compute_flatfield", "apply_flatfield", "evening_factors", "check_profile", "DEFAULT_MIN_COVERAGE",
-           "DEFAULT_MAX_SATURATED", "DEFAULT_STEP_THRESHOLD"]
+__all__ = ["compute_flatfield", "combine_flatfields", "plan_next_scan", "apply_flatfield", "evening_factors", "check_profile",
+           "DEFAULT_MIN_COVERAGE", "DEFAULT_MAX_SATURATED", "DEFAULT_STEP_THRESHOLD", "DEFAULT_COMBINE_PAD",
+           "DEFAULT_STRAY_SIGMA", "DEFAULT_LAMP_RESIDUAL"]
 
 #: Smallest share of the slit rows the target must cover (the rest is interpolated or held).
 DEFAULT_MIN_COVERAGE = 0.5
@@ -42,6 +43,15 @@ DEFAULT_MAX_SATURATED = 0.01
 #: Smallest lasting jump of the response along the slit that is reported (two pieces of the
 #: target that do not lie alike).
 DEFAULT_STEP_THRESHOLD = 0.01
+#: Rows beside a joint that :func:`combine_flatfields` also leaves out of that scan.
+DEFAULT_COMBINE_PAD = 3
+#: Robust sigmas a scan's row may stray from the others before :func:`combine_flatfields` drops it.
+DEFAULT_STRAY_SIGMA = 4.0
+#: A scan whose residual after combining is larger than this (fraction) saw other light.
+DEFAULT_LAMP_RESIDUAL = 0.01
+#: Smallest robust sigma of the stray test (fraction): noiseless scans would make every tiny
+#: difference a stray.
+_STRAY_FLOOR = 0.0025
 
 
 def _neighbour_prediction(positions, values, half):
@@ -163,7 +173,9 @@ def compute_flatfield(cube, mask, *, seam_threshold=None, seam_window=31, min_co
             pieces (another height or tilt) is not a narrow outlier and is not found.
         seam_window: Rows around a row used for that prediction (``seam_window // 2`` on each
             side); joints up to about a quarter of it are found. Keep it short where the
-            response curves strongly along the slit.
+            response curves strongly along the slit. It is capped at a quarter of the measured
+            rows (at least 3): on a short ROI a window reaching across the slit would read the
+            falloff towards its ends as joints. The window used is returned as ``seam_window``.
         min_coverage: Smallest share of the slit rows that must be measured.
         saturation: Counts at or above this are saturated; their share of the ROI is reported.
         max_saturated: Largest share of saturated ROI pixels accepted (with ``saturation``).
@@ -174,14 +186,17 @@ def compute_flatfield(cube, mask, *, seam_threshold=None, seam_window=31, min_co
         progress_callback: Called with ``0`` and then the number of bands done.
 
     Returns:
-        dict: ``profile`` float32 ``(lines, bands)``; ``measured_rows`` bool ``(lines,)``; ``span``
+        dict: ``profile`` float32 ``(lines, bands)``; ``measured`` float32 ``(lines, bands)``: the
+        same before the gaps are filled (NaN on joint rows and rows the ROI leaves out; what
+        :func:`combine_flatfields` works on); ``measured_rows`` bool ``(lines,)``; ``span``
         (first, last measured row); ``coverage`` (share of rows measured); ``seam_rows`` (list of
         rows dropped by ``seam_threshold``); ``steps`` (list of ``(row, step)``: the response
         jumps by the fraction ``step`` at slit row ``row`` and stays, see ``step_threshold``);
         ``extrapolated_rows`` (rows outside ``span``);
         ``invalid_bands`` (bands without any positive response: profile 1 there);
         ``row_profile`` float64 ``(lines,)`` (broadband response, median 1, for a plot);
-        ``saturated_fraction`` (``None`` without ``saturation``).
+        ``saturated_fraction`` (``None`` without ``saturation``); ``seam_window`` (the window used,
+        after the cap).
 
     Raises:
         ValueError: Wrong shapes, an empty ROI, a saturated target, so many rows looking like
@@ -225,11 +240,12 @@ def compute_flatfield(cube, mask, *, seam_threshold=None, seam_window=31, min_co
             warnings.simplefilter("ignore", RuntimeWarning)       # all-NaN rows / bands
             return np.nanmedian(values / np.nanmedian(values, axis=0), axis=1)
 
+    window = effective_seam_window(seam_window, int(np.isfinite(broadband(means)).sum()))
+    half = max(1, window // 2)
     seam_rows = []
     if seam_threshold is not None:
         relative = broadband(means)
         measured = np.where(np.isfinite(relative))[0]
-        half = max(1, int(seam_window) // 2)
         # drop the worst row, judge again from the rows left: a joint's neighbours are then
         # compared with clean rows, not with the joint
         limit = max(1, measured.size // 4)
@@ -252,7 +268,7 @@ def compute_flatfield(cube, mask, *, seam_threshold=None, seam_window=31, min_co
     if step_threshold is not None:
         relative = broadband(means)
         measured = np.where(np.isfinite(relative))[0]
-        steps = _lasting_steps(measured, relative[measured], max(1, int(seam_window) // 2), float(step_threshold))
+        steps = _lasting_steps(measured, relative[measured], half, float(step_threshold))
 
     measured_rows = np.isfinite(means).any(axis=1)
     measured = np.where(measured_rows)[0]
@@ -262,22 +278,369 @@ def compute_flatfield(cube, mask, *, seam_threshold=None, seam_window=31, min_co
                          f"target must span the slit (at least {float(min_coverage):.0%}).")
 
     profile = np.ones((lines, bands), dtype=np.float64)
+    known = np.where(measured_rows[:, None], 1.0, np.nan) * np.ones((1, bands))
     all_rows = np.arange(lines)
     invalid_bands = 0
     for b in range(bands):
         good = np.where(np.isfinite(means[:, b]))[0]
         if good.size == 0:
-            invalid_bands += 1
+            invalid_bands += 1                      # profile 1; measured 1 on the measured rows
             continue
         filled = np.interp(all_rows, good, means[good, b])
-        profile[:, b] = filled / np.median(filled[good])
+        scale = np.median(filled[good])
+        profile[:, b] = filled / scale
+        # NaN only on the rows not measured: a measured row where one dark band read <= 0 is not
+        # a joint (combine would take it for one), it is that band's noise, filled like the profile
+        known[:, b] = np.where(measured_rows, filled / scale, np.nan)
 
     row_profile = np.median(profile, axis=1)
     first, last = int(measured[0]), int(measured[-1])
-    return {"profile": profile.astype(np.float32), "measured_rows": measured_rows, "span": (first, last),
+    return {"profile": profile.astype(np.float32), "measured": known.astype(np.float32),
+            "measured_rows": measured_rows, "span": (first, last),
             "coverage": coverage, "seam_rows": seam_rows, "steps": steps, "extrapolated_rows": int(first + lines - 1 - last),
             "invalid_bands": invalid_bands, "row_profile": row_profile,
-            "saturated_fraction": saturated_fraction}
+            "saturated_fraction": saturated_fraction, "seam_window": window}
+
+
+def _gaps(known):
+    """Runs of unknown rows between the first and the last known row: ``[(first, last), ...]``.
+    These are the joints of a scan; unknown rows at the ends are not joints."""
+    rows = np.where(known)[0]
+    if rows.size == 0:
+        return []
+    missing = np.where(~known[rows[0]:rows[-1] + 1])[0] + rows[0]
+    gaps = []
+    for r in missing:
+        if gaps and r == gaps[-1][1] + 1:
+            gaps[-1][1] = int(r)
+        else:
+            gaps.append([int(r), int(r)])
+    return [tuple(g) for g in gaps]
+
+
+def _solve_levels(logf, valid, pieces, anchor):
+    """Least-squares levels of every piece of every scan, with the response eliminated row by row.
+
+    ``logf`` ``(scans, lines, bands)`` log response (NaN where unknown); ``valid`` ``(scans, lines)``
+    rows to use; ``pieces`` per scan, the piece index of every row; ``anchor`` ``(scan, piece)``
+    held at level 0. Returns ``(t, offsets)``: ``t`` ``(lines, bands)`` the median of the levelled
+    scans (NaN where no scan is valid), ``offsets`` per scan ``(pieces, bands)``.
+    """
+    scans, lines, bands = logf.shape
+    base = np.cumsum([0] + [int(p.max()) + 1 for p in pieces])
+    unknowns = int(base[-1])
+    normal = np.zeros((unknowns, unknowns))
+    right = np.zeros((unknowns, bands))
+    for r in range(lines):
+        s = np.where(valid[:, r])[0]
+        n = s.size
+        if n < 2:
+            continue
+        columns = base[s] + np.array([pieces[i][r] for i in s])
+        centred = np.eye(n) - 1.0 / n                     # the row's own response drops out
+        normal[np.ix_(columns, columns)] += centred
+        right[columns] += centred @ logf[s, r]
+    fixed = int(base[anchor[0]] + anchor[1])
+    free = np.array([k for k in range(unknowns) if k != fixed and normal[k, k] > 0], dtype=int)
+    levels = np.zeros((unknowns, bands))
+    if free.size:
+        levels[free] = np.linalg.lstsq(normal[np.ix_(free, free)], right[free], rcond=None)[0]
+    offsets = [levels[base[i]:base[i + 1]] for i in range(scans)]
+    levelled = np.stack([logf[i] - offsets[i][pieces[i]] for i in range(scans)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)          # rows no scan measured
+        t = np.nanmedian(np.where(valid[:, :, None], levelled, np.nan), axis=0)
+    return t, offsets
+
+
+def _fill_rows(values, rows_known):
+    """Each band of ``values`` ``(lines, bands)`` with the unknown rows interpolated (held at the ends)."""
+    out = np.array(values, dtype=np.float64)
+    good = np.where(rows_known)[0]
+    every = np.arange(out.shape[0])
+    for b in range(out.shape[1]):
+        out[:, b] = np.interp(every, good, out[good, b])
+    return out
+
+
+def _fill_bands(logf, known):
+    """``logf`` ``(scans, lines, bands)`` with each band's NaN on ``known`` rows interpolated along
+    the rows from that band's finite rows (a band with none: 0, the median level); unknown rows stay NaN."""
+    out = np.array(logf, dtype=np.float64)
+    rows = np.arange(out.shape[1])
+    for i in range(out.shape[0]):
+        for b in range(out.shape[2]):
+            good = np.isfinite(out[i, :, b])
+            hole = known[i] & ~good
+            if hole.any():
+                out[i, hole, b] = np.interp(rows[hole], rows[good], out[i, good, b]) if good.any() else 0.0
+    return out
+
+
+def _broadband(values):
+    """Per row, the median over bands of ``values`` ``(..., lines, bands)`` (NaN-aware): one weak
+    band cannot pull a row's residual the way a mean over bands lets it."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)          # rows with no finite band
+        return np.nanmedian(values, axis=-1)
+
+
+def combine_flatfields(measured, *, pad=DEFAULT_COMBINE_PAD, stray_sigma=DEFAULT_STRAY_SIGMA,
+                       stray_window=61, stray_grow=3, rounds=3, leave_one_out=True,
+                       step_threshold=DEFAULT_STEP_THRESHOLD):
+    """One flat-field profile from several scans of a target whose joints lie at other slit rows.
+
+    Every scan is the camera's response times the target's: the target's pieces each have their own
+    level (another height, tilt or material) and carry their own blemishes, and they move from scan
+    to scan, while the response stays on the slit. So, in log and per band::
+
+        log scan_i(row) = t(row) + level_i(piece of row in scan i) + noise
+
+    The joints (unknown rows inside a scan) split each scan into pieces. The levels are solved by
+    least squares with ``t`` eliminated row by row, ``t`` is then the median of the levelled scans.
+    With three scans or more, rows where one scan strays from the others (a blemish, the curled
+    edge of a piece) are left out of that scan and the levels solved again. No shape is imposed on
+    ``t``: the camera's own row-to-row pattern stays.
+
+    Args:
+        measured: Two or more ``(lines, bands)`` arrays (``compute_flatfield(...)["measured"]``,
+            :meth:`FlatFieldProfile.measured`): the response, NaN on rows not measured.
+        pad: Rows beside each joint also left out of that scan.
+        stray_sigma: A row whose broadband residual (after a ``stray_window`` running mean is
+            taken off) is this many robust sigmas off is a stray.
+        stray_window: Rows of the running mean, odd.
+        stray_grow: Rows added on each side of a stray.
+        rounds: Times the strays are looked for and the levels solved again.
+        leave_one_out: With three scans or more, also combine without each scan in turn and report
+            the largest change (``leave_one_out``): how much one scan decides the result.
+        step_threshold: Brightness steps over this (fraction) left in the combined response, on the
+            rows two scans or more measure, are reported in ``steps``; ``None``: not looked for.
+
+    Returns:
+        dict: ``profile`` float32 ``(lines, bands)`` (median 1 per band, gaps filled);
+        ``measured`` float32 the same with NaN where no scan is valid; ``scans_per_row`` int
+        ``(lines,)``; ``joints`` per scan ``[(first, last), ...]``; ``strays`` per scan, the rows
+        left out beyond its joints; ``levels`` per scan ``[(first row, last row, level), ...]``
+        (broadband, relative); ``residual_rms`` per scan (fraction: what is left of it after its
+        levels; large when the light was not the same); ``leave_one_out`` (fraction, the 95th
+        percentile of the broadband change, or ``None``); ``single_rows`` / ``uncovered_rows``
+        (rows with one / no valid scan); ``steps`` ``[(row, step), ...]`` as
+        :func:`compute_flatfield` reports them.
+
+    Raises:
+        ValueError: Fewer than two scans, shapes that differ, or values that are not positive.
+    """
+    arrays = [np.asarray(m, dtype=np.float64) for m in measured]
+    if len(arrays) < 2:
+        raise ValueError("Combining needs two flat-field scans or more")
+    shape = arrays[0].shape
+    if len(shape) != 2 or any(a.shape != shape for a in arrays):
+        raise ValueError(f"Flat-field scans must all be (lines, bands), got {[a.shape for a in arrays]}")
+    stack = np.stack(arrays)
+    if np.any(stack[np.isfinite(stack)] <= 0):
+        raise ValueError("A flat-field scan has a response that is not positive")
+    scans, lines, bands = stack.shape
+    with np.errstate(invalid="ignore", divide="ignore"):
+        logf = np.log(stack)
+    # a row is measured when any band is: a band missing on a measured row (a profile saved
+    # before the NaN was kept to unmeasured rows) is that band's noise, not a joint; it is
+    # filled from the band's neighbouring rows
+    known = np.isfinite(logf).any(axis=2)
+    logf = _fill_bands(logf, known)
+    joints = [_gaps(k) for k in known]
+    pieces = [np.searchsorted([b for _, b in j], np.arange(lines), side="left") for j in joints]
+    base_valid = known.copy()
+    for i, j in enumerate(joints):
+        for a, b in j:
+            base_valid[i, max(0, a - pad):b + pad + 1] = False
+    counts = np.bincount(pieces[0][base_valid[0]], minlength=int(pieces[0].max()) + 1)
+    anchor = (0, int(np.argmax(counts)))
+
+    def solve(valid, use=None):
+        use = list(range(scans)) if use is None else use
+        sub_anchor = (use.index(anchor[0]), anchor[1]) if anchor[0] in use else (0, int(np.argmax(
+            np.bincount(pieces[use[0]][valid[use[0]]], minlength=int(pieces[use[0]].max()) + 1))))
+        return _solve_levels(logf[use], valid[use], [pieces[i] for i in use], sub_anchor)
+
+    valid = base_valid.copy()
+    t, offsets = solve(valid)
+    if scans >= 3:
+        half = max(1, int(stray_window) // 2)
+        kernel = np.ones(2 * half + 1) / (2 * half + 1)
+        for _ in range(max(0, int(rounds))):
+            resid = np.stack([_broadband(logf[i] - offsets[i][pieces[i]] - t) for i in range(scans)])
+            stray = np.zeros_like(valid)
+            for i in range(scans):
+                r = np.where(valid[i], resid[i], np.nan)
+                filled = np.where(np.isfinite(r), r, np.nanmedian(r))
+                high = filled - np.convolve(np.pad(filled, half, mode="edge"), kernel, mode="valid")
+                spread = max(1.4826 * np.nanmedian(np.abs(high[valid[i]])), _STRAY_FLOOR)
+                stray[i] = valid[i] & (np.abs(high) > float(stray_sigma) * spread)
+            # a row is judged by the others only where at least two others are there to judge it
+            others = base_valid.sum(axis=0)[None, :] - base_valid
+            stray &= others >= 2
+            grown = stray.copy()
+            for s in range(1, int(stray_grow) + 1):
+                grown[:, s:] |= stray[:, :-s]
+                grown[:, :-s] |= stray[:, s:]
+            # cumulative: strays are judged on the rows still valid, so the ones left out in an
+            # earlier round stay out (rebuilding from base_valid would put them back every other round)
+            new_valid = valid & ~grown
+            if np.array_equal(new_valid, valid):
+                break
+            valid = new_valid
+            t, offsets = solve(valid)
+
+    per_row = valid.sum(axis=0)
+    covered = per_row > 0
+    if not covered.any():
+        raise ValueError("No slit row is measured by any of the flat-field scans")
+    response = np.exp(_fill_rows(t, covered))
+    scale = np.median(response[covered], axis=0)
+    profile = response / scale
+    combined = np.where(covered[:, None], profile, np.nan)
+
+    residual_rms = []
+    for i in range(scans):
+        r = _broadband(logf[i] - offsets[i][pieces[i]] - t)[valid[i]]       # broadband, like the strays
+        r = r[np.isfinite(r)]
+        residual_rms.append(float(np.sqrt(np.mean(r ** 2))) if r.size else float("nan"))
+    levels = []
+    for i in range(scans):
+        starts = [0] + [b + 1 for _, b in joints[i]]
+        ends = [a - 1 for a, _ in joints[i]] + [lines - 1]
+        broadband = np.expm1(np.median(offsets[i], axis=1))
+        levels.append([(int(s), int(e), round(float(v), 5)) for s, e, v in zip(starts, ends, broadband)])
+    loo = None
+    if leave_one_out and scans >= 3:
+        worst = 0.0
+        for drop in range(scans):
+            part = combine_flatfields([a for i, a in enumerate(arrays) if i != drop], pad=pad,
+                                      stray_sigma=stray_sigma, stray_window=stray_window,
+                                      stray_grow=stray_grow, rounds=rounds, leave_one_out=False)
+            both = np.isfinite(part["measured"][:, 0]) & covered
+            if both.sum() < 2:
+                continue
+            d = np.log(part["measured"][both].astype(np.float64)) - np.log(combined[both])
+            d = d - np.median(d, axis=0)
+            worst = max(worst, float(np.percentile(np.abs(np.expm1(np.median(d, axis=1))), 95)))
+        loo = worst
+    strays = [[int(r) for r in np.where(base_valid[i] & ~valid[i])[0]] for i in range(scans)]
+    # brightness steps the combination kept (joints that sat at the same rows in every scan):
+    # judged, like a single scan's, on the broadband response, over the rows two scans or more agree on
+    steps = []
+    two = np.where(per_row >= 2)[0]
+    if step_threshold is not None and two.size >= 8:
+        relative = np.exp(_broadband(np.log(profile)))
+        half = max(1, effective_seam_window(31, int(two.size)) // 2)
+        steps = _lasting_steps(two, relative[two], half, float(step_threshold))
+    return {"profile": profile.astype(np.float32), "measured": combined.astype(np.float32),
+            "scans_per_row": per_row.astype(int), "joints": joints, "strays": strays, "levels": levels,
+            "residual_rms": residual_rms, "leave_one_out": loo, "steps": steps,
+            "single_rows": int((per_row == 1).sum()), "uncovered_rows": int((per_row == 0).sum())}
+
+
+def plan_next_scan(scans_per_row, moving_rows, *, joints=(), earlier_joints=(), min_shift=None,
+                   max_shift=None, spacing=None):
+    """Where to move the flat-field target for the next scan, so that it helps most.
+
+    The target's joints, curled edges and blemishes move with it. Two things make a next scan
+    useful, in this order:
+
+    1. Its joints land away from every joint seen so far (``joints`` and ``earlier_joints``), by
+       ``spacing`` rows if the move allows: scans whose joints bunch up see the same stretch of the
+       target at the same rows, and their pieces' levels and blemishes cannot be told apart.
+    2. The rows it loses (``moving_rows`` shifted) fall on slit rows other scans already cover well:
+       each lost row costs ``max(0, 3 - scans on it)``.
+
+    Of equal merit the smaller move wins (the target stays over the slit more surely).
+
+    Args:
+        scans_per_row: ``(lines,)`` how many scans measure each slit row well now
+            (``combine_flatfields(...)["scans_per_row"]``, or ``1`` / ``0`` for a single scan).
+        moving_rows: Rows the latest scan loses that move with the target: its joints (and the rows
+            beside them left out) and its strays.
+        joints: The latest scan's joints ``[(first, last), ...]``: they move.
+        earlier_joints: Joints of the other scans combined (any nesting of ``(first, last)`` pairs).
+        min_shift: Smallest move in rows (default: a fiftieth of the slit, at least 10).
+        max_shift: Largest move in rows (default: a sixth of the slit): the target must still span it.
+        spacing: Rows between joints that count as apart (default: a twentieth of the slit, at
+            least 10): about how far a curled edge of a piece reaches.
+
+    Returns:
+        dict: ``shift`` (rows; positive: towards the last slit row; ``0`` when nothing moves with
+        the target), ``joints_now`` / ``joints_next`` (joint centre rows), ``thin_rows`` (rows
+        measured by fewer than two scans now), ``thin_after`` (fewer than two after a scan at the
+        shift), ``cost_now`` / ``cost_next`` (the cost at the same place / at the shift).
+    """
+    counts = np.asarray(scans_per_row, dtype=np.int64)
+    lines = counts.size
+    moving = np.unique(np.asarray([int(r) for r in moving_rows if 0 <= int(r) < lines], dtype=np.int64))
+    weight = np.maximum(0, 3 - counts).astype(np.float64)
+    centres = [int(round((a + b) / 2)) for a, b in joints]
+    thin = int(np.count_nonzero(counts < 2))
+    if moving.size == 0:
+        return {"shift": 0, "joints_now": centres, "joints_next": centres, "thin_rows": thin,
+                "thin_after": int(np.count_nonzero(counts + 1 < 2)), "cost_now": 0.0, "cost_next": 0.0}
+    low = max(10, lines // 50) if min_shift is None else max(1, int(min_shift))
+    high = max(low, lines // 6) if max_shift is None else max(low, int(max_shift))
+    apart = max(10, lines // 20) if spacing is None else max(1, int(spacing))
+    seen = np.array(centres + [int(round((a + b) / 2)) for a, b in _pairs(earlier_joints)], dtype=np.int64)
+
+    def cost(shift):
+        rows = moving + shift
+        rows = rows[(rows >= 0) & (rows < lines)]
+        return float(weight[rows].sum())
+
+    def distance(shift):
+        if not centres or not seen.size:
+            return apart
+        moved = np.array([c + shift for c in centres if 0 <= c + shift < lines])
+        if not moved.size:
+            return apart
+        return int(min(apart, np.abs(moved[:, None] - seen[None, :]).min()))
+
+    candidates = [s for s in range(-high, high + 1) if abs(s) >= low]
+    on_slit = [s for s in candidates if all(0 <= c + s < lines for c in centres)]
+    candidates = on_slit or candidates          # advice names rows where the joints go: keep them on the slit
+    best = min(candidates, key=lambda s: (-distance(s), round(cost(s), 6), abs(s), s))
+    after = counts + 1
+    lost = moving + best
+    after[lost[(lost >= 0) & (lost < lines)]] -= 1
+    return {"shift": int(best), "joints_now": centres,
+            "joints_next": [c + best for c in centres if 0 <= c + best < lines],
+            "thin_rows": thin, "thin_after": int(np.count_nonzero(after < 2)),
+            "cost_now": cost(0), "cost_next": cost(best)}
+
+
+def _pairs(nested):
+    """Every ``(first, last)`` pair in ``nested`` (a pair, a list of pairs, or lists of those)."""
+    out = []
+    for item in nested or ():
+        if len(item) == 2 and all(np.isscalar(v) for v in item):
+            out.append((int(item[0]), int(item[1])))
+        else:
+            out.extend(_pairs(item))
+    return out
+
+
+def effective_seam_window(seam_window, measured_rows):
+    """The seam window :func:`compute_flatfield` uses: ``seam_window`` capped at a quarter of the
+    measured slit rows, never below 3 (and never above ``seam_window``).
+
+    Args:
+        seam_window: Requested window in slit rows.
+        measured_rows: Number of slit rows with a response.
+
+    Returns:
+        int: The window in slit rows.
+
+    Example:
+        >>> effective_seam_window(31, 1104), effective_seam_window(31, 60), effective_seam_window(9, 60)
+        (31, 15, 9)
+    """
+    requested = max(1, int(seam_window))
+    return min(requested, max(3, int(measured_rows) // 4))
 
 
 def check_profile(profile, lines=None, bands=None):
