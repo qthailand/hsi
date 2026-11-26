@@ -459,7 +459,10 @@ class MainWindow(QMainWindow):
         if key == "wavelength":
             from modules.profile_peek import text_peek
             card = controller.win.status_card("wavelength")
-            details = [line for line in (card.toolTip() or card.detail.text()).splitlines()]
+            # the tooltip starts "WAVELENGTH: <value>": the value is the peek's first line already
+            heading = f"{card.title.text()}:"
+            details = [line for line in (card.toolTip() or card.detail.text()).splitlines()
+                       if not line.strip().startswith(heading)]
             return text_peek("Wavelength", card.value.text(), details, color=card.color_name())
         method = {"flatfield": "flatfield_peek_data", "radiometric": "reference_peek_data"}.get(key)
         for integration in self.integrations:

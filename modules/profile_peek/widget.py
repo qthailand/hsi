@@ -37,7 +37,9 @@ GAP = 6
 
 
 def _decade_ticks(y):
-    """Ticks of a log axis at whole decades only (the minor labels overlap in a plot this small).
+    """Ticks of a log axis: whole decades (the minor labels overlap in a plot this small); a
+    curve spanning less than about a decade gets 1-2-5 ticks, then every 1..9 x 10^n, so that at
+    least two labels fall inside it.
 
     Returns ``[[(log10 value, label), ...], []]`` for ``AxisItem.setTicks``, or ``None`` (automatic
     ticks) when ``y`` has no positive finite value.
@@ -46,8 +48,16 @@ def _decade_ticks(y):
     y = y[np.isfinite(y) & (y > 0)]
     if not y.size:
         return None
-    lo, hi = int(np.floor(np.log10(y.min()))), int(np.ceil(np.log10(y.max())))
-    return [[(float(e), f"{10.0 ** e:g}") for e in range(lo, hi + 1)], []]
+    low, high = float(np.log10(y.min())), float(np.log10(y.max()))
+    lo, hi = int(np.floor(low)), int(np.ceil(high))
+    ticks = [float(e) for e in range(lo, hi + 1)]
+    for mantissas in ((1, 2, 5), tuple(range(1, 10))):
+        if sum(low <= t <= high for t in ticks) >= 2:
+            break
+        ticks = [float(np.log10(m * 10.0 ** e)) for e in range(lo, hi + 1) for m in mantissas]
+    if high - low < 1e-9 or sum(low <= t <= high for t in ticks) < 2:
+        return None                                         # flatter than 1..9: automatic ticks
+    return [[(t, f"{10.0 ** t:.3g}") for t in ticks], []]
 
 
 class ProfilePeek(QFrame):

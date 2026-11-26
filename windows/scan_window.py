@@ -1772,6 +1772,21 @@ class ScanWindow(QWidget):
 
     # ── lifecycle ────────────────────────────────────────────────
 
+    def showEvent(self, event):
+        """Qt handler: refresh the inspector at once, then every :data:`INSPECTOR_REFRESH_MS`."""
+        super().showEvent(event)
+        timer = getattr(self, "_inspector_timer", None)
+        if timer is not None and not timer.isActive():
+            self._refresh_inspector()
+            timer.start()
+
+    def hideEvent(self, event):
+        """Qt handler: hidden or minimised, nobody reads the inspector: its timer pauses."""
+        super().hideEvent(event)
+        timer = getattr(self, "_inspector_timer", None)
+        if timer is not None:
+            timer.stop()
+
     def closeEvent(self, event):
         confirmed, self._close_confirmed = self._close_confirmed, False
         if not confirmed and not self.confirm_close():

@@ -849,3 +849,31 @@ def test_ready_list_locks_its_buttons_and_updates_text_in_place():
     ready.findChildren(QPushButton)[-1].click()
     assert calls == ["on2"]                                  # the latest callback runs
     ready.deleteLater()
+
+
+def test_the_wavelength_peek_shows_its_value_once():
+    from types import SimpleNamespace as NS
+    import config as app_config
+    from windows.main_window import MainWindow
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.status_card("wavelength").set_content("Applied", "bin 2, 224 bands", color="green")
+    data = MainWindow._profile_peek_data(NS(scan_controller=NS(win=win), integrations=[]), "wavelength")
+    assert data.lines == ("Applied", "bin 2, 224 bands")
+    win.close()
+
+
+def test_the_inspector_pauses_while_the_window_is_hidden():
+    import config as app_config
+    from windows.scan_window import ScanWindow
+    app = QApplication.instance() or QApplication([])
+    win = ScanWindow(app_config.AppConfig())
+    win.show()
+    app.processEvents()
+    assert win._inspector_timer.isActive()
+    win.hide()
+    assert not win._inspector_timer.isActive()
+    win.show()
+    assert win._inspector_timer.isActive()
+    win.close()

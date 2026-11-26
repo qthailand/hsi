@@ -212,7 +212,8 @@ def text_peek(title: str, value: str = "", details: Sequence[str] = (), color: s
     Args:
         title: Card title.
         value: The card's value, shown as the first line.
-        details: Further lines (empty ones are dropped; at most five are kept).
+        details: Further lines (empty ones are dropped; past six lines in all, the rest become
+            one ``… N more`` line).
         color: Key of :data:`COLORS`.
         open_label: Button text (``''``: no Open button).
         actions: Further buttons ``((key, label), ...)``, see :attr:`PeekData.actions`.
@@ -222,5 +223,7 @@ def text_peek(title: str, value: str = "", details: Sequence[str] = (), color: s
     """
     lines = [str(value)] if value else []
     lines += [str(d).strip() for d in details if str(d).strip()]
-    return PeekData(title, color if color in COLORS else "cyan", tuple(lines[:6]), None, "", open_label,
+    if len(lines) > 6:                     # say what was left out (warnings must not vanish silently)
+        lines = lines[:5] + [f"… {len(lines) - 5} more"]
+    return PeekData(title, color if color in COLORS else "cyan", tuple(lines), None, "", open_label,
                     tuple((str(k), str(l)) for k, l in actions))
