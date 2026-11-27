@@ -8,7 +8,8 @@ Pipeline per frame (worker thread)::
       -> Smile correction (if a model is loaded) /
       -> spectral binning (LambdaBinner)          (modules.spectral_processing)
          (with a wavelength range: only the bins inside it, a subset of the full grid)
-      -> record every frame while armed           (ScanRecorder)
+      -> saturation mask (when tracking is on)    (modules.saturation_mask, same snapshot)
+      -> record every frame while armed           (ScanRecorder, with its saturation)
       -> sharpness every 0.2 s, display frame at <= 30 fps  -> sink
 
 During dark capture the frame skips corrections and binning and is delivered raw.
@@ -81,8 +82,11 @@ def keystone_row_margin(calibration, height: int) -> tuple:
     return (top, bottom)
 from modules.spectral_processing import LambdaBinner
 
+from modules.saturation_mask import scan_summary
+
 from .profiler import StageProfiler
 from .recorder import ScanRecorder
+from .saturation_tracking import SaturationTracker, format_scan_info
 
 logger = logging.getLogger(__name__)
 
@@ -197,6 +201,7 @@ class AcquisitionEngine:
     _range_candidate = _NO_CHANGE   # request taken by the worker, until it is resolved
     _binner_full = None             # the full-grid binner the current one was cut from
     _bin_in_flight = False          # bin request taken by the worker, until its outcome is sent
+    _saturation_tracker = None      # SaturationTracker (None in engines built with __new__)
 
     def __init__(self, backend, config=None, sink: AcquisitionSink | None = None, profile: bool = True):
         self.backend = backend
@@ -242,6 +247,9 @@ class AcquisitionEngine:
         self._shared_preprocessing = getattr(getattr(type(backend), 'read_frame', None), '__qualname__', '') == 'AbstractCameraBackend.read_frame'
         self._passthrough_dark = DarkProcessor()
         self._passthrough_dark.set_dark_enabled(False)
+        # raw saturation followed to the recorded bands (off unless switched on: see set_saturation_tracking)
+        self._saturation_tracker = SaturationTracker(
+            backend, self._shared_preprocessing, enabled=bool(getattr(config, 'saturation_tracking', False)))
 
         self._last_frame_time: float | None = None
         self._intervals: list[float] = []
@@ -286,6 +294,8 @@ class AcquisitionEngine:
         self._last_emit_time = 0.0
         self._emitted = 0
         self._skipped = 0
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.reset_level()      # another session: the camera may be set up anew
 
     def request_stop(self):
         """Ask the loop to end; it closes the camera on its way out. Any thread."""
@@ -323,6 +333,8 @@ class AcquisitionEngine:
             with self._lock:
                 if not self.recorder.enabled:
                     self._armed_ns = time.perf_counter_ns()
+                    if self._saturation_tracker is not None:
+                        self._saturation_tracker.start_scan()
                 self._record_start_ns = start_ns
         if factors is None:
             self.recorder.set_recording(active)      # also what a wrapped recorder (tools) expects
@@ -372,7 +384,69 @@ class AcquisitionEngine:
         self._log_trim(frames, offset, motion_start_ns, motion_end_ns,
                        motion_start_ns if reference_ns is None else reference_ns)
         self._log_line_rate()
+        self._log_saturation()
         return frames
+
+    def take_recorded_saturation(self) -> list:
+        """The saturation of the frames the last :meth:`take_recorded_frames` returned, index for
+        index: a :class:`modules.saturation_mask.SaturationRecord` per checked frame, ``None`` for
+        a frame not checked (see :func:`modules.saturation_mask.scan_status`). Handed over once."""
+        take = getattr(self.recorder, 'take_saturation', None)
+        return take() if take is not None else []
+
+    def _log_saturation(self):
+        """The ``Scan saturation:`` line after ``Scan line rate:`` (records of the kept frames,
+        cost over all recorded frames)."""
+        tracker = self._saturation_tracker
+        if tracker is None:
+            return
+        kept = getattr(self.recorder, '_taken_saturation', None)
+        summary = scan_summary(kept if isinstance(kept, list) else [])
+        logger.info('Scan saturation: %s', format_scan_info(tracker.scan_info(*self._frame_period()), summary))
+
+    # ── saturation tracking ───────────────────────────────
+
+    def set_saturation_tracking(self, enabled: bool):
+        """Check every corrected frame for raw saturation (True) or not (False). Any thread;
+        from the next frame. A recording made with it off is ``not_checked``; switched during
+        a recording, ``partial``."""
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.set_enabled(enabled)
+
+    @property
+    def saturation_tracking(self) -> bool:
+        """Whether frames are checked for raw saturation."""
+        return bool(self._saturation_tracker is not None and self._saturation_tracker.enabled)
+
+    def latest_saturation(self):
+        """The newest frame's :class:`~modules.acquisition.saturation_tracking.SaturationLatest`
+        (a mailbox: read it when convenient; ``None`` before the first frame)."""
+        return self._saturation_tracker.latest() if self._saturation_tracker is not None else None
+
+    def saturation_live_info(self) -> dict:
+        """Cost of the last seconds (``SaturationTracker.live_info``), against the frame period."""
+        if self._saturation_tracker is None:
+            return {}
+        return self._saturation_tracker.live_info(*self._frame_period())
+
+    def saturation_scan_info(self) -> dict:
+        """Cost and counts of the current / last recording (``SaturationTracker.scan_info``)."""
+        if self._saturation_tracker is None:
+            return {}
+        return self._saturation_tracker.scan_info(*self._frame_period())
+
+    def _frame_period(self):
+        """``(ms, source)``: the frame period the camera reports (``'reported'``), else the one
+        measured between processed frames (``'measured'``: an estimate, which equals the
+        worker's own pace when it falls behind); ``(None, None)`` when neither is known."""
+        hz = getattr(self, '_camera_hz', None)
+        if hz:
+            return 1000.0 / float(hz), 'reported'
+        intervals = list(getattr(self, '_intervals', None) or [])
+        total = sum(intervals)
+        if intervals and total > 0:
+            return 1000.0 * total / len(intervals), 'measured'
+        return None, None
 
     def line_rate_info(self) -> dict:
         """The line rate the frames of the last :meth:`take_recorded_frames` actually reached.
@@ -1204,6 +1278,8 @@ class AcquisitionEngine:
             logger.error("Apply params failed: %s", exc)
             self.sink.params_failed(str(exc))
         self.backend.start_stream()
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.reset_level()
         if not failed:
             self.sink.params_applied()
         self._report_frame_rate("exposure/gain change")
@@ -1268,6 +1344,8 @@ class AcquisitionEngine:
         with self._binner_lock:
             self._binner_fitted = False
             self._binner = None
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.reset_level()      # bits / format may differ at the new bin
         if failure is None:
             self.sink.bin_applied(int(self.backend.current_bin))
         else:
@@ -1549,6 +1627,7 @@ class AcquisitionEngine:
 
                 if frame is None:
                     continue
+                read_done = time.perf_counter()
                 self._frame_shape = frame.shape
                 stamp = self._note_frame_info(prof) if not dark_capture else None
 
@@ -1569,6 +1648,9 @@ class AcquisitionEngine:
                             inverted=self._raw_inverted,
                             snapshot=self._snapshot_requested() or 'dark' in wanted,
                             full=bool(wanted & {'geometry', 'valid'}), profiler=prof)
+                        # this frame's snapshot, now: the saturation ceiling below may run
+                        # process_binned again on a synthetic frame and replace last_prepared
+                        prepared = self._preprocessor.last_prepared
                         if grabbed is not None:
                             self._publish_snapshot_if_requested(grabbed, raw=frame)
                     except Exception as exc:
@@ -1586,8 +1668,17 @@ class AcquisitionEngine:
                         except Exception:              # a saved frame is a convenience: keep running
                             logger.exception("Could not copy the frame stages %s", sorted(wanted))
                     self._update_saturation_ceiling(frame, correction, dark_capture=False)
+                    tracker = self._saturation_tracker
+                    saturation = None
+                    if tracker is not None:
+                        # the dark snapshot, switch, orientation and model this frame was corrected with
+                        saturation = tracker.track(frame, prepared, binner,
+                                                   keystone_row_margin(calibration, frame.shape[0]), prof)
                     # transform() allocates a new array per call, so it is safe to keep
-                    self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp)
+                    recorded = self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp,
+                                                   saturation=saturation)
+                    if tracker is not None:
+                        tracker.note_frame((time.perf_counter() - read_done) * 1000.0, bool(recorded))
 
                 # sharpness
                 now = time.monotonic()

@@ -207,6 +207,7 @@ class GenICamBackend(AbstractCameraBackend):
         self._gain_range = (0, 255)
         self._supported_bins = ()
         self._source_bits = 12              # transmitted bits per pixel (see pixel_format_bits)
+        self._source_bits_from = None       # the node that gave _source_bits (None: the 12-bit fallback)
         # buffer data_format -> bits, worked out on the first frame of each format so _fetch reads
         # no camera node per frame (a node read is a GigE round trip); emptied by _refresh_info
         self._bits_by_format: dict = {}
@@ -387,6 +388,7 @@ class GenICamBackend(AbstractCameraBackend):
         height = int(self._read_node("Height") or 0)
         pixel_format = self._read_node("PixelFormat")
         self._source_bits = self._bits_for(pixel_format)
+        self._source_bits_from = self._bits_origin(pixel_format)
         self._bits_by_format = {}           # format or SensorPixelSize may have changed
         self._info = CameraBackendInfo(
             camera_id=self.camera_index,
@@ -937,6 +939,25 @@ class GenICamBackend(AbstractCameraBackend):
             if sensor_bits is not None and sensor_bits < 16:
                 return sensor_bits
         return bits if bits is not None else 12
+
+    def _bits_origin(self, pixel_format) -> str | None:
+        """Which node :meth:`_bits_for` took the bits from, or ``None`` when it fell back to 12."""
+        bits = pixel_format_bits(pixel_format)
+        if bits is None or bits >= 16:
+            sensor_bits = pixel_format_bits(self._read_node("SensorPixelSize"))
+            if sensor_bits is not None and sensor_bits < 16:
+                return f"SensorPixelSize {sensor_bits}"
+        return None if bits is None else f"PixelFormat {pixel_format}"
+
+    def saturation_level_source(self) -> str | None:
+        """Stated when the bits came from ``PixelFormat`` / ``SensorPixelSize``; ``None`` with the
+        12-bit fallback."""
+        origin = getattr(self, "_source_bits_from", None)
+        if origin is None:
+            return None
+        bits = int(self._source_bits)
+        scaling = f"shifted << {16 - bits}" if 8 < bits < 16 else "unscaled"
+        return f"{origin}: {bits}-bit values {scaling}"
 
     def saturation_level(self) -> int:
         """Full scale of the delivered frames: ``(2**bits - 1) << (16 - bits)`` for 10-14 bits."""

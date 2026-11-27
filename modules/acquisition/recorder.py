@@ -13,6 +13,10 @@ Data conventions:
     calibration factors) stores every binned frame as ``float32(frame) * factors`` instead
     (a new float32 array; the frame offered is not changed): one recording is either all
     counts or all multiplied, since the factors are latched when recording is armed.
+    Each frame also carries its saturation (``offer(..., saturation=)``: a
+    ``modules.saturation_mask.SaturationRecord``, or ``None`` when that frame was not
+    checked); :meth:`ScanRecorder.take_saturation` gives them for the frames
+    :meth:`ScanRecorder.take_frames` kept, index for index.
 
 Threading:
     All methods take one internal lock and may be called from any thread.
@@ -100,6 +104,8 @@ class ScanRecorder:
         self._stamps: list = []         # camera time (ns or None) of each binned frame
         self._host_stamps: list = []    # host perf_counter_ns when each binned frame was offered
         self._raw_stamps: list = []     # ... and of each raw frame
+        self._saturation: list = []     # SaturationRecord (None = not checked) of each binned frame
+        self._taken_saturation: list = []   # ... of the frames the last take_frames kept
         self._min_stamp = None          # frames stamped earlier are not recorded (set_min_stamp)
         self._live_dropped = 0          # ... and how many were refused so far
         self._factors = None            # multiplied into every recorded frame (set_recording)
@@ -137,6 +143,8 @@ class ScanRecorder:
                 self._stamps = []
                 self._host_stamps = []
                 self._raw_stamps = []
+                self._saturation = []
+                self._taken_saturation = []
                 self._min_stamp = None
                 self._live_dropped = 0
                 self._factors = factors
@@ -193,6 +201,8 @@ class ScanRecorder:
             self._enabled = False
             frames, stamps, self._frames, self._stamps = self._frames, self._stamps, [], []
             host, self._host_stamps = self._host_stamps, []
+            saturation, self._saturation = self._saturation, []
+            self._taken_saturation = saturation
             self.last_line_rate = line_rate_stats(stamps, host)     # of all frames, unless trimmed
             self.last_trim = (0, 0)
             self.last_live_dropped, self._live_dropped = self._live_dropped, 0
@@ -210,7 +220,16 @@ class ScanRecorder:
             self._raw_stamps = []
             self.last_line_rate = line_rate_stats([s for s, k in zip(stamps, keep) if k == 0],
                                                   [h for h, k in zip(host, keep) if k == 0])
+            self._taken_saturation = [r for r, k in zip(saturation, keep) if k == 0]
             return [f for f, k in zip(frames, keep) if k == 0]
+
+    def take_saturation(self) -> list:
+        """Hand over (and empty) the saturation of the frames the last :meth:`take_frames`
+        kept: one entry per kept frame, in order (a ``SaturationRecord``, ``None`` = not
+        checked). Call after :meth:`take_frames`."""
+        with self._lock:
+            taken, self._taken_saturation = self._taken_saturation, []
+            return taken
 
     def take_raw(self) -> list:
         """Hand over (and empty) the raw sensor frames kept alongside the binned ones."""
@@ -218,7 +237,8 @@ class ScanRecorder:
             raw, self._raw, self._raw_stamps = self._raw, [], []
             return raw
 
-    def offer(self, binned: np.ndarray, raw_frame: np.ndarray, keep_raw: bool, stamp=None) -> bool:
+    def offer(self, binned: np.ndarray, raw_frame: np.ndarray, keep_raw: bool, stamp=None,
+              saturation=None) -> bool:
         """Record one processed frame if armed (worker thread).
 
         Args:
@@ -229,6 +249,8 @@ class ScanRecorder:
             keep_raw: Also keep the raw frame (the "Keep Spectrogram" option).
             stamp: Camera time of the frame in ns (``None`` if unknown), used by
                 ``take_frames(window)`` and the :meth:`set_min_stamp` bound.
+            saturation: The frame's ``SaturationRecord``, or ``None`` when it was not checked;
+                kept with the frame (and trimmed with it).
 
         Returns:
             True if the frame was recorded (not when disarmed, or stamped before the
@@ -262,6 +284,7 @@ class ScanRecorder:
             self._frames.append(frame)
             self._stamps.append(stamp)
             self._host_stamps.append(offered_ns)
+            self._saturation.append(saturation)
             if keep_raw:
                 self._raw.append(raw_frame.copy())
                 self._raw_stamps.append(stamp)

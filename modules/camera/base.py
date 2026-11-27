@@ -315,6 +315,16 @@ class AbstractCameraBackend(DarkProcessor, ABC):
         """
         return (1 << int(self.info.bit_depth)) - 1
 
+    def saturation_level_source(self) -> str | None:
+        """Where :meth:`saturation_level` comes from, when the camera stated it; ``None`` when it is
+        assumed (a default, a fallback bit depth, an unconfirmed scaling).
+
+        Only a stated level lets ``modules.saturation_mask`` mark frames *checked*; the default is
+        ``None``, so a backend has to say how it knows (e.g. ``"PixelFormat Mono12: 12-bit values
+        shifted << 4"``). The level itself is still used for display ceilings either way.
+        """
+        return None
+
     def sensor_bit_depth(self) -> int:
         """Return how many bits of real data each pixel carries before any scaling to 16 bits.
 

@@ -59,6 +59,10 @@ STAGE_SETTING_KEYS = ("rotation_speed_dps", "rotation_degree", "linear_distance_
                       "free_duration_s")
 #: processing.json key of the per-backend wavelength range.
 RANGE_SETTING_KEY = "wavelength_range_nm"
+#: Saved settings of the processing section (processing.json) the window edits.
+PROCESSING_SETTING_KEYS = ("saturation_tracking",)
+#: Seconds between two updates of the saturation-cost label.
+SATURATION_COST_INTERVAL_S = 1.0
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,8 @@ class ScanController:
     _scan_temps = ()
     last_scan_header: dict = {}
     last_scan_saturation_ceiling = None
+    last_scan_saturation = None
+    _saturation_cost_shown = 0.0
     _frame_calibration = None     # modules.radiometric.auto.FrameCalibration of the scan running
     dark_reference = None
     _closing = False                    # cleanup started: the worker's end is not a failure
@@ -179,6 +185,10 @@ class ScanController:
         self.win.geometry_requested.connect(self.preview_thread.set_geometry)
         self.preview_thread.saturation_ready.connect(self._on_saturation)
         self.preview_thread.set_raw_inverted(self.config.raw_inverted)
+        # Track Saturation: the engine starts with the saved choice; the box shows it.
+        show_tracking = getattr(self.win.camera_controls, "set_saturation_tracking", None)
+        if show_tracking is not None:
+            show_tracking(self.preview_thread.saturation_tracking)
         # A Smile model measured at another camera setting is refused (worker thread).
         self.preview_thread.set_smile_setting_check(self._smile_setting_problems)
         # Wavelength calibrations stored per camera setting replace config m/c at start and on bin changes.
@@ -453,6 +463,9 @@ class ScanController:
         self.win.camera_controls.params_changed.connect(self.apply_params)
         self.win.camera_controls.bin_changed.connect(self.apply_bin)
         self.win.camera_controls.target_temperature_changed.connect(self.set_target_temperature)
+        tracking_changed = getattr(self.win.camera_controls, "saturation_tracking_changed", None)
+        if tracking_changed is not None:
+            tracking_changed.connect(self.set_saturation_tracking)
         # Only the settings the user edits are saved, each on its own: start-up values (possibly
         # clamped to the camera) are not, and another open copy of the app cannot overwrite them.
         controls = self.win.camera_controls
@@ -1035,6 +1048,23 @@ class ScanController:
     #  Saved settings
     # ══════════════════════════════════════════════════════════════
 
+    def set_saturation_tracking(self, enabled: bool):
+        """Track Saturation ticked / cleared: the engine checks frames from the next one; saved."""
+        if self.preview_thread is not None:
+            self.preview_thread.set_saturation_tracking(bool(enabled))
+        self._saturation_cost_shown = 0.0
+        self._schedule_settings_save("saturation_tracking")
+
+    def _show_saturation_cost(self, now: float):
+        """The Track Saturation cost label, once per :data:`SATURATION_COST_INTERVAL_S`."""
+        if now - self._saturation_cost_shown < SATURATION_COST_INTERVAL_S:
+            return
+        self._saturation_cost_shown = now
+        show = getattr(self.win.camera_controls, "show_saturation_cost", None)
+        live = getattr(self.preview_thread, "saturation_live_info", None)
+        if show is not None and live is not None:
+            show(live())
+
     def _schedule_settings_save(self, key: str):
         """Mark one setting (a camera.json/scan.json key) as edited; it is written once edits pause."""
         if self._settings_timer is None:
@@ -1053,6 +1083,8 @@ class ScanController:
             return int(self.backend.current_bin)
         if key == "target_temperature_c":
             return controls.target_temperature()
+        if key == "saturation_tracking":
+            return bool(controls.saturation_tracking())
         return float(dict(zip(STAGE_SETTING_KEYS, self.win.stage_spins()))[key].value())
 
     def _save_settings(self):
@@ -1068,14 +1100,18 @@ class ScanController:
         save_range = RANGE_SETTING_KEY in dirty
         values = {key: self._current_setting(key) for key in dirty - {RANGE_SETTING_KEY}}
         values = {key: value for key, value in values.items() if value is not None}
-        camera = {k: v for k, v in values.items() if k not in STAGE_SETTING_KEYS}
+        camera = {k: v for k, v in values.items()
+                  if k not in STAGE_SETTING_KEYS and k not in PROCESSING_SETTING_KEYS}
         scan = {k: v for k, v in values.items() if k in STAGE_SETTING_KEYS}
+        processing = {k: v for k, v in values.items() if k in PROCESSING_SETTING_KEYS}
         backend, saved = self._range_backend(), self._range_saved
         try:
             if camera:
                 store.update_section("camera", camera)
             if scan:
                 store.update_section("scan", scan)
+            if processing:
+                store.update_section("processing", processing)
             if save_range:
                 # Only this camera's entry: the file keeps the other backends' ranges.
                 store.update_section_entry("processing", RANGE_SETTING_KEY, backend,
@@ -1342,6 +1378,7 @@ class ScanController:
 
         self._update_live_spectrum(frame_data, now)
         self._update_live_histogram(frame_data, now)
+        self._show_saturation_cost(now)
 
         if self.recording:
             # Cube frames are recorded per camera frame in the worker thread;
@@ -1978,6 +2015,7 @@ class ScanController:
             *window, reference_ns=getattr(self.stage, 'motion_start_ns', None))
         recorded_s = self._free_scan_recorded_seconds()     # the recorder has just been disarmed
         line_rate, line_rate_metadata = self._take_line_rate()     # of the kept frames
+        self.last_scan_saturation = self._take_scan_saturation(len(images))
         raw = self.preview_thread.take_recorded_raw()
         self.win.set_recorded_count(len(images))     # the frames kept for the cube (after the trim)
         self.win.set_line_rate(line_rate)
@@ -2090,6 +2128,23 @@ class ScanController:
             logger.exception("Failed to create cube: %s", e)
             self._hide_scan_calibration_note()
             self.win.set_status(f"Cube could not be built: {e}")
+
+    def _take_scan_saturation(self, frames: int):
+        """The saturation of the frames just taken: ``{'records', 'summary', 'cost'}`` (records
+        index for index with the cube's lines, ``None`` = not checked; ``summary`` from
+        :func:`modules.saturation_mask.scan_summary`; ``cost`` the tracker's scan totals), or
+        ``None`` when the acquisition thread does not track saturation."""
+        take = getattr(self.preview_thread, "take_recorded_saturation", None)
+        if take is None:
+            return None
+        from modules.saturation_mask import scan_summary
+        records = list(take())
+        if len(records) != frames:          # never pair a record with another frame
+            logger.error("Saturation records (%d) do not match the frames (%d); scan not checked",
+                         len(records), frames)
+            records = [None] * frames
+        cost = getattr(self.preview_thread, "saturation_scan_info", None)
+        return {"records": records, "summary": scan_summary(records), "cost": cost() if cost else {}}
 
     @staticmethod
     def _reflectance_cube_memory_problem(frames, factors):

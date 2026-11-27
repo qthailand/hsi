@@ -74,7 +74,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
     store = ConfigStore(path or str(Path(PROJECT_ROOT) / 'config'), sections=config_sections())
     repairs = store.repair_missing(default_settings())
     data = store.read()
-    missing = set(AppConfig.__dataclass_fields__) - set(data) - {"preprocessing_backend", "sensor_pixel_size", "profile_timing",
+    missing = set(AppConfig.__dataclass_fields__) - set(data) - {"preprocessing_backend", "sensor_pixel_size", "profile_timing", "saturation_tracking",
                                                                  "resolution_source", "fwhm_step_factor",
                                                                  "target_temperature_c", "rotation_degree",
                                                                  "rotation_speed_dps", "linear_distance_mm",
@@ -116,6 +116,7 @@ def load_app_config(path: str | None = None) -> AppConfig:
         camera_profile_folder=str(data.get("camera_profile_folder", "camera_profiles")),
         rgb_target_wavelengths=tuple(float(v) for v in data.get("rgb_target_wavelengths", [645.0, 555.0, 465.0])),
         profile_timing=bool(data.get("profile_timing", True)),
+        saturation_tracking=bool(data.get("saturation_tracking", False)),
         wavelength_range_nm=parse_wavelength_ranges(data.get("wavelength_range_nm")),
     )
 

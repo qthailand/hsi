@@ -41,7 +41,8 @@ __all__ = [
     "AcquisitionEngine", "AcquisitionSink", "CameraPreviewThread", "ScanRecorder",
     "ScanSession", "ScanOutcome", "StageProfiler", "CorrectionStatusDisplay",
 ]
-__requires__ = ("dark", "frame_exchange", "preprocessing", "sharpness", "smile", "spectral_processing", "status_card")
+__requires__ = ("dark", "frame_exchange", "preprocessing", "saturation_mask", "sharpness", "smile",
+                "spectral_processing", "status_card")
 # CorrectionStatusDisplay is a QObject (two StatusCards), not a QWidget, so it is not listed.
 __widgets__ = ()
 

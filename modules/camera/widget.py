@@ -1,5 +1,6 @@
 # widgets/camera_controls.py
-"""Camera parameter controls widget: gain, exposure, binning, temperature, keep_spectrogram.
+"""Camera parameter controls widget: gain, exposure, binning, temperature, keep_spectrogram,
+saturation tracking.
 
 Self-contained widget that emits signals when the user changes parameters.
 It has no backend coupling; the host connects the signals to its camera calls
@@ -66,6 +67,12 @@ class CameraControls(QGroupBox):
             Toggling "Keep Spectrogram" emits nothing; poll :meth:`keep_spectrogram`.
         target_temperature_changed(float): The user finished editing the target temperature
             (°C); only while cooling is supported. Not emitted by :meth:`set_target_temperature`.
+        saturation_tracking_changed(bool): The user ticked / cleared "Track Saturation". Not
+            emitted by :meth:`set_saturation_tracking`.
+
+    Below "Keep Spectrogram", "Track Saturation" switches the per-frame raw saturation mask; the
+    small label beside it (:meth:`show_saturation_cost`) shows what it costs per frame, coloured
+    by how much of the camera's frame period the worker uses.
 
     Temperature row: with :meth:`set_cooling_supported` ``True`` it is an editable
     "Target Temp"; otherwise (the default, fan-cooled cameras) a read-only "Sensor Temp"
@@ -79,6 +86,7 @@ class CameraControls(QGroupBox):
     params_changed = pyqtSignal()
     bin_changed = pyqtSignal()
     target_temperature_changed = pyqtSignal(float)
+    saturation_tracking_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         """Build the controls with default ranges (gain 1-300, exposure 1-1000 ms).
@@ -131,6 +139,16 @@ class CameraControls(QGroupBox):
             "จำนวนและลำดับเฟรมตรงกับ cube 1:1"
         )
 
+        # ── raw saturation followed to the recorded bands (cost shown beside it) ──
+        self.saturation_check = QCheckBox("Track Saturation")
+        self.saturation_check.setToolTip(
+            "ตรวจ raw pixel ที่ clip ทุกเฟรม แล้วตามไปถึง band ที่บันทึก\n"
+            "(ผ่าน hot pixel, smile/keystone และ binning ชุดเดียวกับภาพ)\n"
+            "ปิด: สแกนจะถูกบันทึกว่า not checked")
+        self.saturation_cost_label = QLabel()
+        self.saturation_cost_label.setObjectName("saturationCost")
+        self.saturation_cost_label.hide()
+
         # ── layout: Exposure | Gain, the bin bar, the temperature row, Keep Spectrogram ──
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -148,6 +166,12 @@ class CameraControls(QGroupBox):
         temp_row.addWidget(self.cooling_state_label)
         grid.addLayout(temp_row, 4, 0, 1, 2)
         grid.addWidget(self.keep_spectrogram_check, 5, 0, 1, 2)
+        saturation_row = QHBoxLayout()
+        saturation_row.setContentsMargins(0, 0, 0, 0)
+        saturation_row.addWidget(self.saturation_check)
+        saturation_row.addStretch(1)
+        saturation_row.addWidget(self.saturation_cost_label)
+        grid.addLayout(saturation_row, 6, 0, 1, 2)
         self.setLayout(grid)
         self.set_cooling_supported(False)
 
@@ -155,6 +179,7 @@ class CameraControls(QGroupBox):
         self.gain_spin.valueChanged.connect(self.params_changed.emit)
         self.exp_spin.valueChanged.connect(self.params_changed.emit)
         self.temp_spin.editingFinished.connect(self._on_target_edited)
+        self.saturation_check.toggled.connect(self._on_saturation_toggled)
 
     # ── the bin bar ─────────────────────────────────────────────
 
@@ -226,6 +251,75 @@ class CameraControls(QGroupBox):
     def keep_spectrogram(self) -> bool:
         """True if full-resolution frames should be stored during scan."""
         return self.keep_spectrogram_check.isChecked()
+
+    # ── saturation tracking ─────────────────────────────────────
+
+    def saturation_tracking(self) -> bool:
+        """True while "Track Saturation" is ticked."""
+        return self.saturation_check.isChecked()
+
+    def set_saturation_tracking(self, enabled: bool) -> None:
+        """Tick / clear "Track Saturation" without emitting :attr:`saturation_tracking_changed`."""
+        blocked = self.saturation_check.blockSignals(True)
+        self.saturation_check.setChecked(bool(enabled))
+        self.saturation_check.blockSignals(blocked)
+        if not enabled:
+            self.show_saturation_cost(None)
+
+    def _on_saturation_toggled(self, checked: bool) -> None:
+        if not checked:
+            self.show_saturation_cost(None)
+        self.saturation_tracking_changed.emit(bool(checked))
+
+    def show_saturation_cost(self, info) -> None:
+        """Show the cost of tracking beside the box, or hide it (``None`` / tracking off).
+
+        Args:
+            info: ``AcquisitionEngine.saturation_live_info()``: ``sat_ms`` (the mask's overhead per
+                checked frame), ``busy_ms`` (the whole frame in the worker), ``period_ms`` /
+                ``period_source`` (``'reported'`` by the camera, else measured: shown with ``~``),
+                ``load`` / ``overhead`` (shares of that period), ``status`` / ``reason``,
+                ``near_frames`` / ``clipped_frames`` / ``frames`` of the last seconds.
+        """
+        label = self.saturation_cost_label
+        if not info or not info.get("tracking"):
+            label.hide()
+            return
+        if info.get("status") != "checked":
+            label.setText("not checked")
+            label.setStyleSheet("color: #ffa726;")
+            label.setToolTip(str(info.get("reason") or "frames are not checked"))
+            label.show()
+            return
+        sat, busy, load = info.get("sat_ms"), info.get("busy_ms"), info.get("load")
+        estimated = info.get("period_source") != "reported"
+        # overhead (what tracking adds) and load (the whole frame's share of the period) apart
+        text = "mask –" if sat is None else f"mask +{sat:.1f} ms"
+        if load is not None:
+            text += f" · load {'~' if estimated else ''}{100.0 * load:.0f} %"
+        colour = ("#9e9e9e" if load is None else "#66bb6a" if load < 0.7
+                  else "#ffa726" if load < 0.95 else "#ef5350")
+        label.setText(text)
+        label.setStyleSheet(f"color: {colour};")
+        lines = [f"Saturation overhead: {'–' if sat is None else f'{sat:.2f}'} ms per frame "
+                 f"(max {info.get('sat_max_ms') or 0:.2f} ms)"]
+        overhead = info.get("overhead")
+        if overhead is not None:
+            lines[0] += f", {100.0 * overhead:.0f} % of the frame period"
+        if busy is not None:
+            lines.append(f"Load: the whole frame (read to recorder, mask included) {busy:.2f} ms"
+                         + (f" = {100.0 * load:.0f} % of the period" if load is not None else "")
+                         + (" - frames may be lost" if load is not None and load >= 0.95 else ""))
+        if load is not None:
+            lines.append(f"Frame period {info['period_ms']:.2f} ms: "
+                         + ("reported by the camera" if not estimated else
+                            "measured between processed frames (estimate; frames lost before the "
+                            "worker do not show)"))
+        lines.append(f"Last {info.get('frames', 0)} frames: {info.get('near_frames', 0)} near saturation, "
+                     f"{info.get('clipped_frames', 0)} clipped")
+        lines.append(str(info.get("reason") or ""))
+        label.setToolTip("\n".join(line for line in lines if line))
+        label.show()
 
     def cooling_supported(self) -> bool:
         """True while the temperature row is an editable target."""
@@ -387,7 +481,8 @@ class CameraControls(QGroupBox):
         self.bin_segments.setEnabled(bool(enabled))
 
     def set_settings_enabled(self, enabled: bool) -> None:
-        """Enable / disable gain, exposure, cooling target and Keep Spectrogram (disabled during scan).
+        """Enable / disable gain, exposure, cooling target, Keep Spectrogram and Track Saturation
+        (disabled during scan: a recording is checked throughout or not at all).
 
         The bin has its own :meth:`set_bin_enabled`. A read-only sensor temperature stays
         enabled, so it remains readable.
@@ -395,6 +490,6 @@ class CameraControls(QGroupBox):
         Args:
             enabled: True to let the user change the settings.
         """
-        for widget in (self.gain_spin, self.exp_spin, self.keep_spectrogram_check):
+        for widget in (self.gain_spin, self.exp_spin, self.keep_spectrogram_check, self.saturation_check):
             widget.setEnabled(enabled)
         self.temp_spin.setEnabled(enabled or not self._cooling_supported)

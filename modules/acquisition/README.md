@@ -13,6 +13,7 @@ session are Qt-free.
 | `AcquisitionSink` | no | base class with no-op callbacks (`frame`, `correction_status`, `sharpness`, `snapshot`, `processed_frame`, `error`, `bin_applied`, `bin_failed`, `params_applied`, `params_failed`, `wavelength_applied`, `wavelength_failed`, `wavelength_range_applied`, `wavelength_range_failed`) |
 | `CameraPreviewThread` | yes | the engine on a `QThread`; sink callbacks become signals |
 | `ScanRecorder` | no | thread-safe "record every frame" buffers (owned by the engine) |
+| `SaturationTracker` | no | per-frame raw saturation mask: on/off, level evidence, mailbox, cost meter (owned by the engine) |
 | `ScanSession` / `ScanOutcome` | no | GUI-independent scan state machine |
 | `StageProfiler` | no | running per-stage timing |
 | `CorrectionStatusDisplay` | yes | two `StatusCard`s (Dark, Smile) fed by the status dict |
@@ -20,7 +21,7 @@ session are Qt-free.
 ## Requirements
 
 numpy and a camera backend from `modules.camera` (passed in). Declared dependencies
-(`__requires__`): `dark`, `frame_exchange`, `preprocessing`, `sharpness`, `smile`,
+(`__requires__`): `dark`, `frame_exchange`, `preprocessing`, `saturation_mask`, `sharpness`, `smile`,
 `spectral_processing`, `status_card`. PyQt5 is needed only for `CameraPreviewThread` and
 `CorrectionStatusDisplay`; `import modules.acquisition` does not import it.
 
@@ -139,8 +140,28 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `line_rate_info` (the line rate the frames just taken reached: `line_rate_hz`, `line_rate_source`, `frames`, `frames_missing`, `camera_hz`; also logged as `Scan line rate:`), `take_recorded_raw`,
   `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
   `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
-* `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer`, `count`, `live_frames`,
-  `take_frames`, `take_raw`, `factors`, `factor_error`. Armed with `factors` (`(slit, bins)` float32,
+* Saturation tracking (`config.saturation_tracking`, off by default; the Camera panel's *Track
+  Saturation* box): `set_saturation_tracking(on)`, `saturation_tracking`, `latest_saturation()` (newest
+  frame's `SaturationLatest`: a mailbox the GUI reads when it wants, nothing queued per frame),
+  `saturation_live_info()` (last 2 s: mask ms, worker ms per frame, share of the camera's frame
+  period), `saturation_scan_info()` (the same over the recording), `take_recorded_saturation()` (one
+  `modules.saturation_mask.SaturationRecord` per frame `take_recorded_frames` returned, `None` = not
+  checked; logged as `Scan saturation:`). A frame is checked with the dark-reference snapshot, switch,
+  orientation and model its intensities used (`PreprocessingRuntime.last_prepared`), the same binner
+  and keystone row crop; it is *not checked* when tracking is off, when the backend corrects its own
+  frames, or when the full scale is not stated (`modules.saturation_mask.level_evidence`). The level
+  is asked again when the frame dtype, bin, `info.bit_depth` / `info.image_format` change, after a bin
+  or parameter change or a restart, and one second after a failed SDK query; every scan keeps the
+  levels it was checked against with their provenance (`saturation_scan_info()['levels']`) and the
+  reasons frames were not (`['not_checked']`). Live and scan info give the mask's *overhead* apart
+  from the whole frame's *load*, and say whether the frame period was `reported` by the camera or
+  `measured` (an estimate). Profile spans: `sat_total`, `sat_detect`, `sat_hot`, `sat_remap`,
+  `sat_bin`, `sat_pack`. `latest_saturation()` is the newest *tracked* frame: a viewer that draws a
+  mask over a displayed frame must pair the two by frame identity, never by reading the display
+  mailbox and this one separately.
+* `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer(..., saturation=None)`,
+  `count`, `live_frames`, `take_frames`, `take_raw`, `take_saturation` (the kept frames' records, trimmed
+  with them), `factors`, `factor_error`. Armed with `factors` (`(slit, bins)` float32,
   e.g. radiometric factors; `engine.set_recording(True, start_ns, factors=F)`), every recorded frame is
   stored as `float32(frame) * factors` (a new array, outside the lock); the offered frame (displayed,
   sharpness) is not changed. The factors are latched for the whole recording; a frame of another

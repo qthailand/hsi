@@ -50,6 +50,7 @@ Example:
     ((4, 6), None, 'cpu')
 """
 import logging
+from typing import NamedTuple
 import numpy as np
 from modules.compute_runtime import get_compute_capabilities, set_processing_backend
 from .cpu import CPUBackend
@@ -70,6 +71,21 @@ _ORDER = {
     'cpu': ('cpu',),
 }
 
+class PreparedFrame(NamedTuple):
+    """What one frame was corrected with (:attr:`PreprocessingRuntime.last_prepared`).
+
+    ``hot`` is the dark-reference snapshot used for the dark and the hot-pixel repair (an
+    empty reference when the stored one does not fit the frame); ``enabled`` the dark /
+    hot-pixel switch; ``frame`` the input array itself (to match the call).
+    """
+
+    frame: object
+    hot: object
+    enabled: bool
+    inverted: bool
+    calibration: object
+
+
 class PreprocessingRuntime:
     """Per-frame preprocessing with CPU reference and optional CUDA backends.
 
@@ -79,6 +95,11 @@ class PreprocessingRuntime:
         fallback_reason: Message of the last backend initialisation/validation
             failure that caused a fallback (``''`` if none).  It is kept after the
             runtime returns to the GPU.
+        last_prepared: :class:`PreparedFrame` of the last frame :meth:`process` /
+            :meth:`process_binned` took (``None`` before the first): the dark-reference
+            snapshot, the hot-pixel switch, the orientation and the model that frame was
+            corrected with, so a companion computation (the saturation mask) can use exactly
+            the same ones.  Read it on the thread that called, right after the call.
     """
 
     def __init__(self, backend='auto', capabilities=None):
@@ -105,6 +126,7 @@ class PreprocessingRuntime:
         self._validated = None
         self._suspended = None        # (GPU backend, configuration it could not run)
         self.fallback_reason = ''
+        self.last_prepared = None
 
     @property
     def backend_name(self):
@@ -177,6 +199,7 @@ class PreprocessingRuntime:
             # Reference from another camera/bin: neither its dark nor its hot-pixel
             # coordinates (which would index outside this frame) may be applied.
             dark_processor, dark = _NO_REFERENCE, None
+        self.last_prepared = PreparedFrame(frame, dark_processor, enabled, bool(inverted), calibration)
         return (frame, dark, dark_processor, enabled, bool(inverted), calibration, snapshot)
 
     @staticmethod
@@ -359,5 +382,5 @@ class _NoProfiler:
     def time(self, name): return self.Span()
     def _record(self, *args): pass
 
-__all__ = ['PreprocessingRuntime']
+__all__ = ['PreprocessingRuntime', 'PreparedFrame']
 __requires__ = ('compute_runtime',)

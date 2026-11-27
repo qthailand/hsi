@@ -96,6 +96,26 @@ class POACameraBackend(AbstractCameraBackend):
         """Bit depth the SDK reports for the sensor (e.g. 12), before RAW16 scales it to 16 bits."""
         return int(getattr(self, "_sensor_bits", self.bit_depth))
 
+    def saturation_level(self) -> int:
+        """Full scale of the RAW16 frames: the SDK shifts a 10/12-bit sensor's values to the top of
+        16 bits (every value a multiple of ``2**(16 - bits)``), so a clipped pixel reads
+        ``(2**bits - 1) << (16 - bits)`` (12-bit: 65520), never the 65535 of ``2**16 - 1``."""
+        bits = self.sensor_bit_depth()
+        if int(self.bit_depth) == 16 and 8 < bits < 16:
+            return ((1 << bits) - 1) << (16 - bits)
+        return super().saturation_level()
+
+    #: Sensor bit depths whose RAW16 scaling was confirmed on real frames (Apollo-M MAX: every
+    #: value a multiple of 16, ``poa_sat.npy``). Others keep their level for display only.
+    CONFIRMED_SHIFT_BITS = (12,)
+
+    def saturation_level_source(self) -> str | None:
+        """Stated only for a confirmed scaling (:data:`CONFIRMED_SHIFT_BITS`), else ``None``."""
+        bits = self.sensor_bit_depth()
+        if int(self.bit_depth) == 16 and bits in self.CONFIRMED_SHIFT_BITS:
+            return f"POA RAW16: {bits}-bit sensor values shifted << {16 - bits} (confirmed on real frames)"
+        return None
+
     def model_name(self) -> str | None:
         """``cameraModelName`` from the camera properties (``None`` before ``open``)."""
         return self._model_name

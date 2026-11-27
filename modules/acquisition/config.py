@@ -57,6 +57,9 @@ class ProcessingConfig:
         rgb_target_wavelengths: Wavelengths (nm) used for the default R, G, B preview bands.
         profile_timing: Log per-stage timings of the acquisition loop (``[profile]`` lines);
             GPU per-kernel stages are sampled on one frame in ten.
+        saturation_tracking: Follow clipped raw pixels of every frame to the recorded bands
+            (``modules.saturation_mask``); off: recordings are ``not_checked``. The Camera
+            panel's *Track Saturation* box sets it and the application saves it.
         wavelength_range_nm: Recorded wavelength range per camera backend,
             ``{backend: (lo_nm, hi_nm)}`` (see :func:`parse_wavelength_ranges`); a backend
             without an entry records the full calibrated range.
@@ -71,4 +74,5 @@ class ProcessingConfig:
     preprocessing_backend: str = "auto"
     rgb_target_wavelengths: tuple = (645.0, 555.0, 465.0)
     profile_timing: bool = True
+    saturation_tracking: bool = False
     wavelength_range_nm: dict = field(default_factory=dict, repr=False)   # the 'Loaded config' log stays as before
