@@ -44,7 +44,7 @@ A frame with nothing near saturation stops after the raw comparison (`sat_detect
 
 | Item | Meaning |
 |---|---|
-| `level_evidence(backend, dtype)` | the full scale to check against, only when the backend states it (`saturation_level_source()`, kept as `provenance`, `source='stated'`); otherwise `level=None`: `'assumed'` (a default / fallback bit depth / unconfirmed scaling), `'error'` (`transient`: the SDK query failed, ask again later) or `'none'` (no level, or one the frames cannot hold) |
+| `LevelEvidence` | the level to check against: hosts build it from a **verified saturation profile** (`modules.saturation_profile`, `source='measured'`, `provenance`, `profile_id`, `profile_status`); otherwise `level=None` with the reason (`missing`, `inconclusive`, `incompatible`, `gain_outside`, or `'error'`: `transient`, the lookup failed, ask again later). The nominal full scale of the bit depth is never evidence |
 | `SaturationRecord` | one frame, compact: values only at the near-saturated cells (sparse `uint32` indices, or a packed mask when that is smaller), clipped flags as packed bits over them, affected pixel counts (`fraction × w`, exact) |
 | `scan_status(records)` | `checked` (every frame has a record), `partial`, `not_checked` (`None` = frame not checked) |
 | `scan_summary(records)` | status, frames, checked, near / clipped frames, bytes |

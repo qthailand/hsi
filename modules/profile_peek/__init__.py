@@ -1,10 +1,12 @@
 """Profile peek: a small popup with a calibration's key curve and facts, before its full viewer.
 
-A status card (Dark, Smile, Flat-field, Radiometric, Wavelength) opens a peek next to itself;
+A status card (Dark, Smile, Flat-field, Radiometric, Wavelength, Saturation level) opens a peek
+next to itself;
 *Open ▸* in the peek opens the full viewer.
 
 * :class:`PeekData`, :class:`PeekCurve` and the builders :func:`dark_peek`, :func:`smile_peek`,
-  :func:`flatfield_peek`, :func:`reference_peek`, :func:`text_peek` - Qt-free (``core.py``);
+  :func:`flatfield_peek`, :func:`reference_peek`, :func:`saturation_peek`, :func:`text_peek` -
+  Qt-free (``core.py``);
 * :class:`ProfilePeek` - the popup widget (``widget.py``, loaded lazily).
 
 Data conventions:
@@ -20,11 +22,11 @@ Example:
     >>> dark_peek({"mean": np.zeros((3, 5))}).color
     'green'
 """
-from .core import (COLORS, PeekCurve, PeekData, dark_peek, flatfield_peek, reference_peek, smile_peek,
-                   text_peek)
+from .core import (COLORS, SATURATION_STATES, PeekCurve, PeekData, dark_peek, flatfield_peek, reference_peek,
+                   saturation_peek, smile_peek, text_peek)
 
-__all__ = ["COLORS", "PeekCurve", "PeekData", "dark_peek", "smile_peek", "flatfield_peek", "reference_peek",
-           "text_peek", "ProfilePeek"]
+__all__ = ["COLORS", "SATURATION_STATES", "PeekCurve", "PeekData", "dark_peek", "smile_peek", "flatfield_peek",
+           "reference_peek", "saturation_peek", "text_peek", "ProfilePeek"]
 __requires__ = ()                   # duck-typed: takes the objects of other modules, imports none
 __widgets__ = ("ProfilePeek",)
 

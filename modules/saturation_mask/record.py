@@ -1,11 +1,10 @@
 """What a recording keeps of each frame's saturation, and when a level counts as evidence.
 
-* :func:`level_evidence` - the camera's full scale, or why there is none to trust. A frame is
-  only *checked* against a level the camera backend **states** (``saturation_level_source()``
-  names where it comes from: a pixel-format node, an SDK bit depth, a scaling confirmed on real
-  frames). An assumed level (a default, a fallback bit depth, an unconfirmed scaling), an SDK
-  error or a value the frames cannot hold gives ``level=None``: the frame is *not checked*,
-  never "no saturation".
+* :class:`LevelEvidence` - the level frames are checked against, or why there is none. Hosts
+  build it from a **verified saturation profile** (``modules.saturation_profile``: the value a
+  clipped pixel was measured to read); no profile, an unverified one, another configuration or
+  a gain outside the verified range gives ``level=None``: the frame is *not checked*, never
+  "no saturation". The nominal full scale of the bit depth is never evidence.
 * :class:`SaturationRecord` - one frame's :class:`~.core.FrameSaturation` in a compact form:
   values only at the near-saturated cells. A frame with nothing near saturation holds nothing.
 * :func:`scan_status` - ``checked`` / ``partial`` / ``not_checked`` of a recording's records
@@ -29,21 +28,25 @@ STATUS_NOT_CHECKED = "not_checked"
 
 @dataclass(frozen=True)
 class LevelEvidence:
-    """The full scale frames are checked against, or why they cannot be.
+    """The level frames are checked against, or why they cannot be.
 
     Attributes:
         level: Counts a clipped raw pixel reads, or ``None`` (no evidence: do not check).
-        source: ``'stated'`` (the backend says where its level comes from), ``'assumed'`` (it
-            has a level but cannot say), ``'error'`` (the query failed: may work next time) or
-            ``'none'`` (no level, or one the frames cannot hold).
-        reason: One line for logs and tooltips (for ``'stated'``: the provenance itself).
-        provenance: The backend's own statement (``saturation_level_source()``), or ``None``.
+        source: ``'measured'`` (a verified saturation profile), ``'error'`` (the lookup failed:
+            may work next time) or another word saying why there is no level (``'missing'``,
+            ``'inconclusive'``, ``'incompatible'``, ``'gain_outside'``, ...).
+        reason: One line for logs and tooltips (for ``'measured'``: the provenance itself).
+        provenance: Where the level comes from (the profile and its measurement), or ``None``.
+        profile_id: The saturation profile's id (``<file stem>@<measured_at>``), when one was found.
+        profile_status: That profile's state (``verified``, ``inconclusive``, ...), when found.
     """
 
     level: Optional[int]
     source: str
     reason: str
     provenance: Optional[str] = None
+    profile_id: Optional[str] = None
+    profile_status: Optional[str] = None
 
     @property
     def trusted(self) -> bool:
@@ -54,37 +57,6 @@ class LevelEvidence:
     def transient(self) -> bool:
         """Whether asking again may give another answer (an SDK query failed)."""
         return self.source == "error"
-
-
-def level_evidence(backend, dtype) -> LevelEvidence:
-    """The saturation level of ``backend``'s frames, if the backend states it.
-
-    Args:
-        backend: A camera backend (duck-typed: ``saturation_level()`` and
-            ``saturation_level_source()``; without the latter every level counts as assumed).
-        dtype: dtype of the raw frames.
-
-    Returns:
-        LevelEvidence: ``level`` set only for a stated level the frames can hold.
-    """
-    method = getattr(backend, "saturation_level", None)
-    if method is None:
-        return LevelEvidence(None, "none", "the camera backend reports no saturation level")
-    stated = getattr(backend, "saturation_level_source", None)
-    try:
-        level = int(method())
-        provenance = stated() if stated is not None else None
-    except Exception as exc:          # noqa: BLE001 - an SDK read that failed: try again later
-        return LevelEvidence(None, "error", f"saturation level query failed: {exc}")
-    dtype = np.dtype(dtype)
-    if level <= 0:
-        return LevelEvidence(None, "none", f"saturation level {level} is not positive")
-    if dtype.kind in "ui" and level > np.iinfo(dtype).max:
-        return LevelEvidence(None, "none", f"saturation level {level} exceeds the {dtype} frames")
-    if not provenance:
-        return LevelEvidence(None, "assumed", f"{type(backend).__name__} level {level} is assumed, not "
-                                              "stated by the camera (default or fallback bit depth)")
-    return LevelEvidence(level, "stated", str(provenance), str(provenance))
 
 
 # ── one recorded frame ────────────────────────────────────────────────────

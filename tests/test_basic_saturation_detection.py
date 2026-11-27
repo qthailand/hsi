@@ -34,7 +34,7 @@ from modules.saturation_mask import count as count_module  # noqa: E402
 from modules.spectral_processing import LambdaBinner  # noqa: E402
 
 from test_saturation_tracking import (H, LEVEL, W, BaseLevel, StatedLevel, _record, _wait,  # noqa: E402,F401
-                                      clip_engine)
+                                      clip_engine, stated)
 
 NEAR = near_threshold(LEVEL)
 
@@ -151,16 +151,17 @@ def _frame(clipped=0, near=0, shape=(10, 20)):
 
 
 def test_tracker_keeps_the_peak_and_saturated_frames_since_reset():
-    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True)       # full tracking off
+    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, level_source=stated)       # full tracking off
     assert tracker.latest_raw() is None
     for clipped, near in ((0, 0), (4, 2), (1, 0), (0, 3)):
-        assert tracker.count(_frame(clipped, near)) == (clipped, clipped + near, LEVEL)
+        assert tracker.count(_frame(clipped, near))[:3] == (clipped, clipped + near, LEVEL)
     stats = tracker.latest_raw()
     assert isinstance(stats, RawSaturationStats) and stats.status == STATUS_CHECKED
     assert (stats.clipped, stats.near, stats.pixels) == (0, 3, 200)
     assert stats.clipped_percent == 0.0 and stats.near_percent == pytest.approx(1.5)
     assert stats.level == LEVEL and stats.near_level == NEAR and stats.count_ms >= 0
-    assert stats.provenance == "test: 12-bit values shifted << 4"
+    assert stats.provenance == "test profile: saturated pixels read 65520"
+    assert stats.profile_id == "test-profile@2026-11-27"
     assert (stats.frames, stats.checked_frames, stats.saturated_frames, stats.near_frames) == (4, 4, 2, 3)
     assert stats.peak_clipped_percent == pytest.approx(2.0) and stats.peak_near_percent == pytest.approx(3.0)
     assert stats.window_status == STATUS_CHECKED
@@ -177,21 +178,21 @@ def test_tracker_keeps_the_peak_and_saturated_frames_since_reset():
 
 def test_tracker_without_evidence_is_not_checked_or_partial(caplog):
     backend = StatedLevel()
-    tracker = SaturationTracker(backend, shared_preprocessing=True)
+    tracker = SaturationTracker(backend, shared_preprocessing=True, level_source=stated)
     tracker.count(_frame(3))
-    backend.provenance = None                                            # level no longer stated
+    backend.provenance = None                                            # no verified profile any more
     tracker.reset_level()
     assert tracker.count(_frame(3)) is None
     stats = tracker.latest_raw()
-    assert stats.status == STATUS_NOT_CHECKED and stats.clipped_percent is None and "assumed" in stats.reason
+    assert stats.status == STATUS_NOT_CHECKED and stats.clipped_percent is None and "no verified" in stats.reason
     assert stats.window_status == STATUS_PARTIAL and stats.peak_clipped_percent == pytest.approx(1.5)
     tracker.reset_peak()
     tracker.count(_frame(3))
     assert tracker.latest_raw().window_status == STATUS_NOT_CHECKED
     assert SaturationTracker(BaseLevel(16), shared_preprocessing=True).count(_frame(1)) is None
-    legacy = SaturationTracker(StatedLevel(), shared_preprocessing=False)
+    legacy = SaturationTracker(StatedLevel(), shared_preprocessing=False, level_source=stated)
     assert legacy.count(_frame(1)) is None and "itself" in legacy.latest_raw().reason
-    broken = SaturationTracker(StatedLevel(), shared_preprocessing=True)
+    broken = SaturationTracker(StatedLevel(), shared_preprocessing=True, level_source=stated)
     for _ in range(3):
         assert broken.count(np.zeros(5, np.uint16)) is None             # 1-D: the count raises
     assert "count failed" in broken.latest_raw().reason
@@ -199,7 +200,7 @@ def test_tracker_without_evidence_is_not_checked_or_partial(caplog):
 
 
 def test_scan_totals_count_only_the_recorded_frames():
-    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True)
+    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, level_source=stated)
     tracker.start_scan()
     for i, clipped in enumerate((0, 6, 2, 9)):
         tracker.count(_frame(clipped))
@@ -262,6 +263,8 @@ def test_engine_counts_every_frame_and_hands_the_count_to_tracking(clip_engine):
 def test_engine_with_tracking_off_still_counts(clip_engine):
     engine, _, _ = clip_engine
     engine.set_saturation_tracking(False)
+    # a frame in flight when the switch flipped is still tracked: record from the first frame after it
+    assert _wait(lambda: getattr(engine.latest_saturation(), "status", None) == "off")
     _, _, saturation = _record(engine, frames=10)
     assert all(s is None for s in saturation)                            # no mask
     info = engine.saturation_scan_info()

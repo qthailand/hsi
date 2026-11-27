@@ -115,6 +115,9 @@ class ScanController:
     last_scan_header: dict = {}
     last_scan_saturation_ceiling = None
     last_scan_saturation = None
+    _saturation_measuring = False       # a saturation-level measurement drives the camera
+    _saturation_restore_problem = None  # why the camera / calibration state was not restored after one
+    _saturation_dialog = None
     _saturation_cost_shown = 0.0
     _frame_calibration = None     # modules.radiometric.auto.FrameCalibration of the scan running
     dark_reference = None
@@ -280,6 +283,7 @@ class ScanController:
         self._poll_temperature(time.time())   # the first dark lookup uses the real temperature
         self.apply_params()  # also looks up the stored dark for these params
         self.preview_thread.start()
+        self._refresh_saturation_card()
 
     # ══════════════════════════════════════════════════════════════
     #  Smile correction
@@ -838,6 +842,43 @@ class ScanController:
         from modules.profile_peek import smile_peek
         return smile_peek(cal, str(getattr(runtime, "path", "") or ""))
 
+    def saturation_peek_data(self):
+        """:class:`~modules.profile_peek.PeekData` of the saturation level (the Saturation level
+        row's peek): the active setting's profile and every bin of this camera and format, or
+        ``None`` without a camera profile (the row then opens the measurement window directly).
+
+        Read-only: it reads the profile files and the backend's current setting (bin, gain, pixel
+        format, bits); it sends nothing to the camera and writes nothing."""
+        store = self._saturation_store()
+        backend = getattr(self, "backend", None)
+        if store is None or backend is None:
+            return None
+        from modules.profile_peek import saturation_peek
+        from modules.saturation_mask import NEAR_RATIO
+        from modules.saturation_profile.sources import identity_of, nominal_full_scale_of
+        found = self.saturation_profile_lookup()
+        identity = identity_of(backend, getattr(self.config, "camera_backend", ""))
+        same_format = (identity.pixel_format, identity.delivered_bits, identity.sensor_bits)
+        bins = []
+        for path, record, _error in store.active():
+            if record is None:
+                stem = path.stem
+                if stem.startswith(f"saturation_{identity.pixel_format}_d{identity.delivered_bits}"
+                                   f"s{identity.sensor_bits}_bin"):
+                    bins.append({"bin": int(stem.rsplit("bin", 1)[1]), "status": "invalid", "level": None})
+                continue
+            rid = record.identity
+            if (rid.pixel_format, rid.delivered_bits, rid.sensor_bits) == same_format:
+                bins.append({"bin": rid.bin, "status": record.status, "level": record.level})
+        camera = {"model": identity.model, "serial": identity.serial, "pixel_format": identity.pixel_format,
+                  "delivered_bits": identity.delivered_bits, "sensor_bits": identity.sensor_bits,
+                  "bin": identity.bin, "gain": getattr(backend, "gain", None),
+                  "nominal_full_scale": nominal_full_scale_of(backend)}
+        state = found.state if found is not None else "missing"
+        reason = "" if found is None or found.usable else found.reason
+        return saturation_peek(camera, found.record if found is not None else None, bins, state, reason,
+                               near_ratio=NEAR_RATIO)
+
     @staticmethod
     def _dark_capture_time(result: dict) -> str:
         """When the loaded dark was captured (its ``captured_at``), or for an older file without it
@@ -968,7 +1009,10 @@ class ScanController:
                          "resolution_nm", "stage_type",
                          "speed_um_s", "speed_um_s_achieved", "degree_per_second",
                          "degree_per_second_achieved", "duration_s", "duration_s_recorded",
-                         "line_rate_hz", "line_rate_source", "frames_missing", "along_track_step_um")
+                         "line_rate_hz", "line_rate_source", "frames_missing", "along_track_step_um",
+                         "saturation_level", "saturation_level_source", "saturation_profile_status",
+                         "saturation_profile_id", "saturation_checked_frames", "saturation_unchecked_frames",
+                         "saturation_clipped_frames", "saturation_peak_clipped_percent")
 
     def _scan_header_metadata(self) -> dict:
         """Export-header metadata of the scan that just ended (see ``HypercubeWriter``):
@@ -1146,8 +1190,176 @@ class ScanController:
             return
         self._load_dark_reference_for_current_params()
 
+    # ══════════════════════════════════════════════════════════════
+    #  Saturation level (modules.saturation_profile)
+    # ══════════════════════════════════════════════════════════════
+
+    def _saturation_store(self):
+        from modules.saturation_profile import SaturationProfileStore
+        profile = getattr(self, "camera_profile", None)
+        return None if profile is None else SaturationProfileStore(profile.saturation_folder)
+
+    def saturation_profile_lookup(self):
+        """The saturation profile of the active camera setting (``ProfileLookup``), or ``None``."""
+        store = self._saturation_store()
+        if store is None or self.backend is None:
+            return None
+        from modules.saturation_profile.sources import identity_of
+        try:
+            identity = identity_of(self.backend, getattr(self.config, "camera_backend", ""))
+            return store.lookup(identity, getattr(self.backend, "gain", None))
+        except Exception:
+            logger.debug("Saturation profile lookup failed", exc_info=True)
+            return None
+
+    def _refresh_saturation_card(self):
+        """The Corrections row: Measured / Missing / Incompatible / Inconclusive for this setting."""
+        show = getattr(self.win, "set_saturation_profile_status", None)
+        if show is None:
+            return
+        if self._saturation_restore_problem:
+            show("restore_failed", f"Camera not restored: {self._saturation_restore_problem}")
+            return
+        if self._saturation_measuring:
+            show("measuring", "Measuring - scans are locked")
+            return
+        found = self.saturation_profile_lookup()
+        if found is None:
+            show("missing", "No camera profile")
+            return
+        record = found.record
+        detail = found.reason
+        if found.usable:
+            low, high = record.gain_range
+            detail = f"bin {record.identity.bin}: saturated pixels read {record.level} (gain {low:g}-{high:g})"
+        show(found.state, detail, f"Profile: {found.path.name}" + (
+            f"\nMeasured {record.measured_at}, software {record.software}" if record is not None else ""))
+
+    def _calibration_state(self) -> dict:
+        """What a bin change can reload (dark file, Smile / keystone model, wavelength profile and
+        the corrections in effect) plus the setting shown in the window: compared after a
+        saturation measurement put the camera back."""
+        state = {"dark_path": getattr(self, "_dark_path", None),
+                 "bin": self.win.selected_bin() if hasattr(self.win, "selected_bin") else None,
+                 "gain": self.win.camera_controls.gain(), "exposure_ms": self.win.camera_controls.exposure_ms()}
+        try:
+            info = dict(self.preview_thread.correction_info())
+        except Exception:
+            info = {}
+        info.pop("frame_rate_hz", None)
+        state["corrections"] = info
+        return state
+
+    def open_saturation_measurement(self):
+        """Open the saturation level calibration window (not while scanning or capturing a dark)."""
+        if self.state != self.PREVIEW or self.preview_thread is None or self.dark_lib.is_collecting:
+            self.win.set_status("Saturation level: measure while the live preview runs (no scan, no dark capture)")
+            return None
+        dialog = self._saturation_dialog
+        if dialog is None:
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout
+            from modules.saturation_profile import SaturationMeasureWidget
+            dialog = QDialog(self.win)
+            dialog.setWindowTitle("Saturation level")
+            widget = SaturationMeasureWidget(dialog)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(widget)
+            dialog.widget = widget
+            widget.set_session_provider(self._saturation_session)
+            widget.running_changed.connect(self._on_saturation_running)
+            widget.measurement_finished.connect(self._on_saturation_finished)
+            widget.profiles_saved.connect(self._on_saturation_saved)
+            dialog.resize(1000, 640)
+            self._saturation_dialog = dialog
+        from modules.saturation_profile.sources import nominal_full_scale_of
+        backend = self.backend
+        low, high = backend.exposure_range_us
+        dialog.widget.set_store(self._saturation_store())
+        dialog.widget.set_camera(backend.get_bins(), int(backend.current_bin), float(backend.gain),
+                                 backend.gain_range, float(backend.exposure_ms), (low / 1000.0, high / 1000.0),
+                                 nominal_full_scale_of(backend),
+                                 f"{backend.model_name() or 'Camera'} {backend.serial_number() or ''}: point it at a "
+                                 f"bright, steady light, then Measure")
+        dialog.show()
+        dialog.raise_()
+        return dialog
+
+    def _saturation_session(self):
+        """The measurement session (called by the window on Measure): the camera through the
+        engine, its setting and the calibration state to put back."""
+        if self.state != self.PREVIEW or self.dark_lib.is_collecting or self.stage is not None:
+            raise RuntimeError("Not now: a scan, a dark capture or the stage is running")
+        if self._saturation_restore_problem:
+            raise RuntimeError(f"The last measurement did not restore the camera: {self._saturation_restore_problem}")
+        from modules.acquisition.saturation_measure import EngineFrameSource
+        from modules.saturation_profile import software_revision
+        source = EngineFrameSource(self.preview_thread, getattr(self.config, "camera_backend", ""))
+        controller = self
+
+        class Session:
+            def __init__(self):
+                self.source = source
+                self.camera = source.snapshot()
+                self.software = software_revision()
+                self.calibration = controller._calibration_state()
+
+            def finish(self):
+                return source.restore(self.camera)
+
+        session = Session()
+        self._saturation_session_state = session
+        return session
+
+    def _on_saturation_running(self, running: bool):
+        """Lock scans, dark capture and the camera settings while the measurement drives the camera."""
+        self._saturation_measuring = bool(running)
+        self.win.camera_controls.set_settings_enabled(not running)
+        self.win.set_status("Measuring the saturation level - scans are locked" if running else "")
+        self._refresh_saturation_card()
+
+    def _on_saturation_finished(self, records, problems):
+        """The camera is back (or not): check the calibration state the bin changes may have
+        reloaded, then unlock - or keep scans locked and say why."""
+        if problems:
+            self._saturation_restore_failed("; ".join(problems))
+            return
+        session = getattr(self, "_saturation_session_state", None)
+        expected = session.calibration if session is not None else None
+        self._verify_saturation_restore(expected, attempts=20)
+
+    def _verify_saturation_restore(self, expected, attempts: int):
+        """Compare the calibration state with ``expected`` (retrying while the bin reloads settle)."""
+        if expected is None:
+            return
+        now = self._calibration_state()
+        diff = sorted(key for key in set(expected) | set(now) if expected.get(key) != now.get(key))
+        if not diff:
+            self._saturation_restore_problem = None
+            self._refresh_saturation_card()
+            self.win.set_status("Saturation measurement done; camera and calibration state restored")
+            return
+        if attempts > 0:
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(500, lambda: self._verify_saturation_restore(expected, attempts - 1))
+            return
+        details = ", ".join(f"{key}: {expected.get(key)!r} -> {now.get(key)!r}" for key in diff)
+        self._saturation_restore_failed(f"calibration state differs ({details})")
+
+    def _saturation_restore_failed(self, reason: str):
+        logger.error("Saturation measurement: camera / calibration not restored: %s", reason)
+        self._saturation_restore_problem = reason
+        self.win.set_status(f"Camera NOT restored after the saturation measurement: {reason} - scans are locked")
+        self._refresh_saturation_card()
+
+    def _on_saturation_saved(self, results):
+        """Profiles saved: the engine reads the level again, the Corrections row shows it."""
+        reload = getattr(self.preview_thread, "reload_saturation_profile", None)
+        if reload is not None:
+            reload()
+        self._refresh_saturation_card()
+
     def start_dark_capture(self):
-        if self.state == self.SCANNING:
+        if self.state == self.SCANNING or self._saturation_measuring:
             return
         try:
             bin_value, exposure_ms, gain = self._current_dark_params()
@@ -1230,11 +1442,14 @@ class ScanController:
         self.win.camera_controls.set_selected_bin(bin_value)
         self.win.reset_sharpness_scale()
         self._refresh_dark_reference("Bin changed — dark cleared")
-        self._schedule_settings_save("default_bin")      # bins change only on the user's request
+        if not self._saturation_measuring:               # the measurement's bins are not the user's
+            self._schedule_settings_save("default_bin")      # bins change only on the user's request
+        self._refresh_saturation_card()
 
     def _on_params_applied(self):
         # Sent by the worker before any sharpness score of the new frames.
         self.win.reset_sharpness_scale()
+        self._refresh_saturation_card()
 
     def _on_bin_failed(self, requested: int, message: str):
         """The camera refused the bin: it keeps running on the previous one."""
@@ -1520,6 +1735,13 @@ class ScanController:
         if self.dark_lib.is_collecting:
             self.win.dark_panel.set_error("Finish dark capture first")
             return
+        if self._saturation_measuring:
+            self.win.set_status("Saturation level measurement running - finish or cancel it first")
+            return
+        if self._saturation_restore_problem:
+            self.win.set_status(f"Camera not restored after the saturation measurement "
+                                f"({self._saturation_restore_problem}) - reopen the Scan window")
+            return
         if self.state == self.ERROR:
             self.win.set_status("Camera stopped - reopen the Scan window to scan again")
             return
@@ -1550,6 +1772,9 @@ class ScanController:
         gc.collect()
         self.win.set_recorded_count(0)
         self.win.set_line_rate(None)            # the last scan's, until this one ends
+        clear_clipping = getattr(self.win, "set_scan_clipping", None)
+        if clear_clipping is not None:
+            clear_clipping(None)                 # the last scan's raw clipping, until this one ends
         self._set_recording(False)
         # Frame-by-frame radiometric calibration: the reference is chosen now, for the whole scan,
         # and latched with the recording (all frames reflectance, or all counts).
@@ -2037,9 +2262,13 @@ class ScanController:
         recorded_s = self._free_scan_recorded_seconds()     # the recorder has just been disarmed
         line_rate, line_rate_metadata = self._take_line_rate()     # of the kept frames
         self.last_scan_saturation = self._take_scan_saturation(len(images))
+        saturation_metadata = self._take_scan_raw_saturation(len(images))
         raw = self.preview_thread.take_recorded_raw()
         self.win.set_recorded_count(len(images))     # the frames kept for the cube (after the trim)
         self.win.set_line_rate(line_rate)
+        show_clipping = getattr(self.win, "set_scan_clipping", None)
+        if show_clipping is not None:
+            show_clipping(saturation_metadata)   # final scan statistics, apart from the live card
 
         # ── temperatures of this scan (cube header / spectrogram metadata) ──
         try:
@@ -2055,6 +2284,7 @@ class ScanController:
             if recorded_s is not None:
                 self._raw_metadata["duration_s_recorded"] = recorded_s
             self._raw_metadata.update(line_rate_metadata)
+            self._raw_metadata.update(saturation_metadata)
         self.last_scan_header = self._scan_header_metadata()
         # the saturation ceiling that applied to this scan (settings are locked while scanning; a
         # later dark / exposure / Smile change replaces the live one): a radiometric reference made
@@ -2149,6 +2379,20 @@ class ScanController:
             logger.exception("Failed to create cube: %s", e)
             self._hide_scan_calibration_note()
             self.win.set_status(f"Cube could not be built: {e}")
+
+    def _take_scan_raw_saturation(self, frames: int) -> dict:
+        """Cube-header keys of the scan's raw clipping (basic detection of the kept frames, with
+        the level and profile each was counted against); ``{}`` when the acquisition thread does
+        not count."""
+        take = getattr(self.preview_thread, "take_recorded_raw_counts", None)
+        if take is None:
+            return {}
+        from modules.acquisition.saturation_tracking import scan_saturation_metadata
+        try:
+            return scan_saturation_metadata(take(), frames)
+        except Exception:
+            logger.exception("Scan saturation metadata unavailable")
+            return {}
 
     def _take_scan_saturation(self, frames: int):
         """The saturation of the frames just taken: ``{'records', 'summary', 'cost'}`` (records

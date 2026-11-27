@@ -419,6 +419,16 @@ class _MiniHistogram(QWidget):
         p.end()
 
 
+def format_clipped_percent(percent) -> str:
+    """A clipped share for display: ``"0.35 %"``; a share that would round to 0.00 % but is not
+    zero reads ``"<0.01 %"``, so a few clipped pixels never disappear; ``"\u2014"`` for ``None``."""
+    if percent is None:
+        return "\u2014"
+    if 0.0 < float(percent) < 0.005:
+        return "<0.01 %"
+    return f"{float(percent):.2f} %"
+
+
 class ClippedTile(QFrame):
     """Clipped card: confirmed clipping of the raw frames, and the exposure histogram.
 
@@ -508,9 +518,9 @@ class ClippedTile(QFrame):
             tip = f"Clipping not checked: {stats.reason}"
         else:
             percent, near, size = self._percent, self._near_percent, 22
-            text = f"{percent:.2f} %"
-            if percent > self.warn_percent:
-                color = _RED_BAR                     # confirmed clipping
+            text = format_clipped_percent(percent)
+            if stats.clipped > 0:
+                color = _RED_BAR                     # confirmed clipping, however little
             elif near > self.warn_percent:
                 color = _AMBER                       # near full scale: exposure warning
             else:
@@ -538,7 +548,7 @@ class ClippedTile(QFrame):
         else:
             partial = stats.window_status == "partial"
             at_least = "\u2265" if partial else ""
-            text = f"max {at_least}{peak:.2f} %"
+            text = f"max {at_least}{format_clipped_percent(peak)}"
             frames = f"{at_least}{stats.saturated_frames} fr"
             tip = (f"Since the last reset (every Start scan): highest clipped share {peak:.3f} %, "
                    f"{stats.saturated_frames} of {stats.checked_frames} checked frames clipped, "
@@ -613,4 +623,4 @@ class ClippedTile(QFrame):
         self.set_values(ceiling_percent, self.counts, self.saturated_counts)
 
 
-__all__ += ["SharpnessTile", "ClippedTile", "live_column_stylesheet", "card_frame", "format_sharpness"]
+__all__ += ["SharpnessTile", "ClippedTile", "format_clipped_percent", "live_column_stylesheet", "card_frame", "format_sharpness"]

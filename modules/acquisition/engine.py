@@ -84,9 +84,11 @@ def keystone_row_margin(calibration, height: int) -> tuple:
 from modules.spectral_processing import LambdaBinner
 
 from modules.saturation_mask import scan_summary
+from modules.saturation_profile import ProfileLevelSource
 
 from .profiler import StageProfiler
 from .recorder import ScanRecorder
+from .saturation_measure import RawTap
 from .saturation_tracking import SaturationTracker, format_scan_info
 
 logger = logging.getLogger(__name__)
@@ -203,6 +205,7 @@ class AcquisitionEngine:
     _binner_full = None             # the full-grid binner the current one was cut from
     _bin_in_flight = False          # bin request taken by the worker, until its outcome is sent
     _saturation_tracker = None      # SaturationTracker (None in engines built with __new__)
+    _raw_tap = None                 # saturation_measure.RawTap a saturation measurement waits on
 
     def __init__(self, backend, config=None, sink: AcquisitionSink | None = None, profile: bool = True):
         self.backend = backend
@@ -249,8 +252,14 @@ class AcquisitionEngine:
         self._passthrough_dark = DarkProcessor()
         self._passthrough_dark.set_dark_enabled(False)
         # raw saturation followed to the recorded bands (off unless switched on: see set_saturation_tracking)
+        # the level clipping is counted against: the camera profile's verified saturation profile
+        # for the active configuration (camera, format, bits, bin, gain); none = not checked
+        profile = getattr(config, 'camera_profile', None)
+        level_source = ProfileLevelSource(getattr(profile, 'saturation_folder', None),
+                                          getattr(config, 'camera_backend', None) or getattr(profile, 'backend', ''))
         self._saturation_tracker = SaturationTracker(
-            backend, self._shared_preprocessing, enabled=bool(getattr(config, 'saturation_tracking', False)))
+            backend, self._shared_preprocessing, enabled=bool(getattr(config, 'saturation_tracking', False)),
+            level_source=level_source)
 
         self._last_frame_time: float | None = None
         self._intervals: list[float] = []
@@ -334,8 +343,9 @@ class AcquisitionEngine:
             with self._lock:
                 if not self.recorder.enabled:
                     self._armed_ns = time.perf_counter_ns()
-                    if self._saturation_tracker is not None:
-                        self._saturation_tracker.start_scan()
+                    tracker = getattr(self, '_saturation_tracker', None)   # absent on stand-in engines
+                    if tracker is not None:
+                        tracker.start_scan()
                 self._record_start_ns = start_ns
         if factors is None:
             self.recorder.set_recording(active)      # also what a wrapped recorder (tools) expects
@@ -394,6 +404,20 @@ class AcquisitionEngine:
         a frame not checked (see :func:`modules.saturation_mask.scan_status`). Handed over once."""
         take = getattr(self.recorder, 'take_saturation', None)
         return take() if take is not None else []
+
+    def take_recorded_raw_counts(self) -> list:
+        """Basic detection of the frames the last :meth:`take_recorded_frames` returned, index for
+        index (after the trim): a :class:`~modules.acquisition.saturation_tracking.RawCount` per
+        checked frame (its level and profile id kept with it), ``None`` for a frame not checked.
+        Handed over once."""
+        take = getattr(self.recorder, 'take_raw_counts', None)
+        return take() if take is not None else []
+
+    def reload_saturation_profile(self):
+        """Look the saturation level up again from the next frame (a profile was saved or
+        changed). Any thread; the profile file is read once, not per frame."""
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.reset_level()
 
     def _log_saturation(self):
         """The ``Scan saturation:`` line after ``Scan line rate:`` (records of the kept frames,
@@ -556,6 +580,38 @@ class AcquisitionEngine:
         """Queue a hardware-bin change; the outcome arrives as ``bin_applied``/``bin_failed``."""
         with self._lock:
             self._pending_bin = int(bin_value)
+
+    @property
+    def params_pending(self) -> bool:
+        """True while a requested gain / exposure is queued (until the worker applies it)."""
+        with self._lock:
+            return self._pending_params is not None
+
+    def start_raw_tap(self, count: int, target=None, skip: int = 0) -> RawTap:
+        """Copies of the next ``count`` raw frames read with ``target`` ``(bin, gain, exposure_ms)``
+        applied and nothing pending, after ``skip`` settling frames (a saturation measurement;
+        see :mod:`.saturation_measure`). One tap at a time; any thread. The frames still go
+        through the normal pipeline unchanged."""
+        tap = RawTap(count, target, skip)
+        with self._lock:
+            self._raw_tap = tap
+        return tap
+
+    def stop_raw_tap(self, tap=None):
+        """Stop feeding ``tap`` (``None``: whatever tap is running). Any thread."""
+        with self._lock:
+            if tap is None or self._raw_tap is tap:
+                self._raw_tap = None
+
+    def _feed_raw_tap(self, frame):
+        """Worker: hand ``frame`` to the running tap when nothing is pending."""
+        with self._lock:
+            tap = self._raw_tap
+            pending = self._pending_params is not None or self._pending_bin is not None or self._bin_in_flight
+        if tap is None or pending:
+            return
+        if tap.offer(frame, self.backend):
+            self.stop_raw_tap(tap)
 
     @property
     def bin_pending(self) -> bool:
@@ -1649,6 +1705,8 @@ class AcquisitionEngine:
                 self._frame_shape = frame.shape
                 # basic detection: every acquired raw frame, before any correction (counts only)
                 raw_count = tracker.count(frame, prof) if tracker is not None else None
+                if self._raw_tap is not None:          # a saturation measurement waits for raw frames
+                    self._feed_raw_tap(frame)
                 stamp = self._note_frame_info(prof) if not dark_capture else None
 
                 if dark_capture:
@@ -1697,7 +1755,7 @@ class AcquisitionEngine:
                                                    counts=raw_count)
                     # transform() allocates a new array per call, so it is safe to keep
                     recorded = self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp,
-                                                   saturation=saturation)
+                                                   saturation=saturation, raw_count=raw_count)
                     if tracker is not None:
                         tracker.note_frame((time.perf_counter() - read_done) * 1000.0, bool(recorded))
 

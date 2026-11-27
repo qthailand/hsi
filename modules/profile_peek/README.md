@@ -11,6 +11,7 @@ matters most, two or three facts, a warning when there is one, and **Open ▸**.
 | `smile_peek(calibration, path='')` | horizontal shift along the slit at the centre column (the smile); straightness before → after |
 | `flatfield_peek(profile)` | response along the slit (median over bands); brightness-step warning |
 | `reference_peek(reference)` | radiometric factor per band (median over the slit), log scale |
+| `saturation_peek(camera, record, bins, state, reason, near_ratio)` | the stored upper histogram of the active bin's profile (the most frequent raw values the measurement kept, log scale); camera, pixel format and bits, level, near-saturation level, verified gain range, nominal full scale, measurement date, every bin's status and level with the active bin marked ▶, the clipping plateau's evidence; the reason when missing / inconclusive / incompatible / gain outside. Read-only: it shows the profile files' content, never talks to the camera |
 | `text_peek(title, value, details)` | no curve: the card's value and tooltip lines (e.g. wavelength) |
 
 `ProfilePeek` (`QFrame`) shows a `PeekData`: `set_data(data)`, then `popup(anchor)` places it
@@ -21,7 +22,7 @@ closes it; **Open ▸** (or Enter) closes it and emits `openRequested`.
 
 * NumPy (core); PyQt5 and pyqtgraph for `ProfilePeek` only.
 * No other `modules.*` package (`__requires__ = ()`): the builders take the dark dict, Smile
-  model, `FlatFieldProfile` and `RadiometricReference` by duck typing.
+  model, `FlatFieldProfile`, `RadiometricReference` and `SaturationProfileRecord` by duck typing.
 
 ## Stand-alone use
 

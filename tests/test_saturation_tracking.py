@@ -24,9 +24,12 @@ from modules.acquisition.saturation_tracking import SaturationTracker, format_sc
 from modules.camera import AbstractCameraBackend  # noqa: E402
 from modules.dark import DarkProcessor  # noqa: E402
 from modules.preprocessing import PreparedFrame, PreprocessingRuntime  # noqa: E402
+from modules.contracts import CameraProfile, SaturationProfileRecord  # noqa: E402
 from modules.saturation_mask import (STATUS_CHECKED, STATUS_NOT_CHECKED, STATUS_PARTIAL,  # noqa: E402
-                                     SaturationPropagator, SaturationRecord, bin_masks, level_evidence,
+                                     LevelEvidence, SaturationPropagator, SaturationRecord, bin_masks,
                                      scan_status, scan_summary)
+from modules.saturation_profile import SaturationProfileStore  # noqa: E402
+from modules.saturation_profile.sources import identity_of  # noqa: E402
 from modules.spectral_processing import LambdaBinner  # noqa: E402
 
 from test_saturation_mask import smile_model  # noqa: E402
@@ -34,16 +37,16 @@ from test_saturation_mask import smile_model  # noqa: E402
 LEVEL = 65520
 
 
-# ---------------------------------------------------------------- level evidence
+# ---------------------------------------------------------------- the level
 class _Info:
     def __init__(self, bits, image_format="Mono16"):
         self.bit_depth, self.image_format = bits, image_format
 
 
-class StatedLevel:                       # a backend that states where its level comes from
-    def __init__(self, provenance="test: 12-bit values shifted << 4"):
+class StatedLevel:                       # a camera whose level the test level source knows
+    def __init__(self, provenance="test profile: saturated pixels read 65520"):
         self.provenance, self.calls, self.fail = provenance, 0, 0
-        self.current_bin, self.info = 1, _Info(16)
+        self.current_bin, self.info, self.gain = 1, _Info(16), 1.0
 
     def saturation_level(self):
         self.calls += 1
@@ -52,12 +55,19 @@ class StatedLevel:                       # a backend that states where its level
             raise RuntimeError("GenTL timeout")
         return LEVEL
 
-    def saturation_level_source(self):
-        return self.provenance
+
+def stated(backend, dtype):
+    """Test level source: the backend's level as if a verified profile measured it (no profile
+    when the backend has no provenance)."""
+    level = backend.saturation_level()
+    provenance = getattr(backend, "provenance", None)
+    if not provenance:
+        return LevelEvidence(None, "missing", "no verified saturation profile (test)")
+    return LevelEvidence(level, "measured", provenance, provenance, "test-profile@2026-11-27", "verified")
 
 
 class BaseLevel(AbstractCameraBackend):
-    """The base class: a level (``2**bit_depth - 1``) but no statement of where it comes from."""
+    """The base class: a nominal level (``2**bit_depth - 1``), never measured."""
 
     def __init__(self, delivered):
         super().__init__()
@@ -80,96 +90,40 @@ class BaseLevel(AbstractCameraBackend):
     def get_temperature(self): return 20.0
 
 
-class Raises:
-    def saturation_level(self):
-        raise RuntimeError("node not readable")
+def verified_profile(folder, backend_name, camera, level=LEVEL, gains=(0.0, 100.0)):
+    """Save a verified saturation profile for ``camera``'s configuration (tests of the engine)."""
+    record = SaturationProfileRecord(identity_of(camera, backend_name), "verified", level, 65520, gain_range=gains,
+                                     gains_tested=gains, measured_at="2026-11-27T10:00:00")
+    SaturationProfileStore(folder).save(record)
+    return record
 
 
-def test_level_evidence_trusts_only_a_stated_level():
-    stated = level_evidence(StatedLevel(), np.uint16)
-    assert stated.trusted and stated.level == LEVEL and stated.source == "stated"
-    assert stated.provenance == stated.reason == "test: 12-bit values shifted << 4"
-    assumed = level_evidence(BaseLevel(10), np.uint16)               # a level, but nobody says why
-    assert not assumed.trusted and assumed.source == "assumed" and not assumed.transient
-    error = level_evidence(Raises(), np.uint16)
-    assert not error.trusted and error.source == "error" and error.transient
-    for backend, dtype in ((object(), np.uint16), (StatedLevel(), np.uint8)):   # no method / above the dtype
-        evidence = level_evidence(backend, dtype)
-        assert not evidence.trusted and evidence.source == "none" and evidence.reason
-    assert not level_evidence(StatedLevel(provenance=None), np.uint16).trusted
-
-
-def _poa(sensor_bits, model="Apollo-M MAX", camera_bin=1):
+def _poa(sensor_bits):
     from modules.camera.poa_camera import POACameraBackend
     camera = POACameraBackend.__new__(POACameraBackend)
     camera.bit_depth, camera._sensor_bits = 16, sensor_bits
-    camera._model_name, camera._current_bin = model, camera_bin
+    camera._model_name, camera._current_bin = "Apollo-M MAX", 1
     camera.camera_id, camera.pixel_size, camera.img_width, camera.img_height, camera.img_format = 0, 9.0, 8, 8, 1
     return camera
 
 
-def test_poa_states_only_its_measured_saturation():
-    """Real saturated Apollo-M MAX frames (2026-11-27): the ADC tops out at 4094, so a clipped
-    pixel reads 65504 (not 4095 << 4 = 65520); bin 3's clipped blocks read 65535 or 65520."""
-    for camera_bin, level in ((1, 65504), (2, 65504), (3, 65520), (4, 65504)):
-        camera = _poa(12, camera_bin=camera_bin)
-        assert camera.saturation_level() == level
-        evidence = level_evidence(camera, np.uint16)
-        assert evidence.trusted and evidence.level == level
-        assert f"bin {camera_bin}" in evidence.provenance and "measured" in evidence.provenance
-    for camera in (_poa(12, camera_bin=5), _poa(12, model="Apollo-M MINI"), _poa(10), _poa(16)):
-        assert level_evidence(camera, np.uint16).source == "assumed"            # not measured: not checked
-    assert _poa(12, model="Apollo-M MINI").saturation_level() == 65520           # nominal, display only
+def test_backends_give_only_the_nominal_full_scale():
+    """The measured level lives in the saturation profile; a backend's level is nominal (display
+    ceilings) and no backend states one any more."""
+    assert _poa(12).saturation_level() == 4095 << 4 == 65520
     assert _poa(10).saturation_level() == 1023 << 6 and _poa(16).saturation_level() == 65535
-
-
-def test_ximea_fallback_bit_depth_is_not_checked():
-    from modules.camera.ximea_camera import XIMEACameraBackend
-
-    class XiCamera:                                                  # the xiAPI calls _refresh_info makes
-        def __init__(self, bits):
-            self.bits = bits
-        def get_image_data_bit_depth(self):
-            if self.bits is None:
-                raise RuntimeError("xiAPI: parameter not supported")
-            return f"XI_BPP_{self.bits}"
-        def get_width(self): return 64
-        def get_height(self): return 32
-        def get_pixel_size(self): return 5.3
-
-    camera = XIMEACameraBackend(camera_id=0)
-    assert level_evidence(camera, np.uint16).source == "assumed"     # before open: the legacy 10 bits
-    camera._camera = XiCamera(12)
-    camera._refresh_info()
-    evidence = level_evidence(camera, np.uint16)
-    assert evidence.trusted and evidence.level == 4095 and "image_data_bit_depth 12" in evidence.provenance
-    camera._camera = XiCamera(None)                                  # unreadable: falls back, equal bit depths
-    camera._refresh_info()
-    assert camera.sensor_bit_depth() == camera.info.bit_depth == 12
-    assert level_evidence(camera, np.uint16).source == "assumed"
-
-
-def test_genicam_fallback_bits_are_not_checked():
     from modules.camera.genicam import GenICamBackend
-    camera = GenICamBackend.__new__(GenICamBackend)
-    camera._source_bits, camera._source_bits_from = 12, None          # the 12-bit fallback
-    camera._info = SimpleNamespace(bit_depth=16, image_format=None)
-    assert camera.saturation_level() == 65520 and level_evidence(camera, np.uint16).source == "assumed"
-    camera._source_bits_from = "PixelFormat Mono12"
-    evidence = level_evidence(camera, np.uint16)
-    assert evidence.trusted and evidence.provenance == "PixelFormat Mono12: 12-bit values shifted << 4"
-    nodes = {"SensorPixelSize": "Bpp10"}
-    camera._read_node = nodes.get
-    assert camera._bits_origin("Mono16") == "SensorPixelSize 10"
-    assert camera._bits_origin("Mono12Packed") == "PixelFormat Mono12Packed"
-    nodes.clear()
-    assert camera._bits_origin(None) is None                          # what _bits_for turns into 12
+    from modules.camera.ximea_camera import XIMEACameraBackend
+    for backend in (AbstractCameraBackend, GenICamBackend, XIMEACameraBackend, type(_poa(12))):
+        assert not hasattr(backend, "saturation_level_source"), backend
+    tracker = SaturationTracker(_poa(12), shared_preprocessing=True, enabled=True)    # no level source
+    assert tracker.evidence(np.zeros((2, 2), np.uint16)).level is None
 
 
 def test_tracker_asks_again_when_the_configuration_changes_or_a_query_failed(monkeypatch, caplog):
     import modules.acquisition.saturation_tracking as tracking
     backend = StatedLevel()
-    tracker = SaturationTracker(backend, shared_preprocessing=True, enabled=True)
+    tracker = SaturationTracker(backend, shared_preprocessing=True, enabled=True, level_source=stated)
     frame = np.zeros(SHAPE, np.uint16)
     caplog.set_level("INFO", logger=tracking.__name__)
     for _ in range(3):
@@ -182,14 +136,16 @@ def test_tracker_asks_again_when_the_configuration_changes_or_a_query_failed(mon
     tracker.reset_level()                                            # bin / parameters applied, restart
     tracker.evidence(frame)
     tracker.evidence(frame.astype(np.uint8))                         # another dtype
-    assert backend.calls == 5
+    backend.gain = 50.0                                              # another gain (verified ranges)
+    tracker.evidence(frame)
+    assert backend.calls == 6
     assert sum("Saturation level" in r.getMessage() for r in caplog.records) == 1   # logged on change only
     backend.fail = 1                                                 # a transient SDK failure
     tracker.reset_level()
     assert tracker.evidence(frame).transient
-    assert tracker.evidence(frame).transient and backend.calls == 6   # not hammered every frame
+    assert tracker.evidence(frame).transient and backend.calls == 7   # not hammered every frame
     monkeypatch.setattr(tracking, "LEVEL_RETRY_S", 0.0)
-    assert tracker.evidence(frame).trusted and backend.calls == 7     # ... but asked again: recovered
+    assert tracker.evidence(frame).trusted and backend.calls == 8     # ... but asked again: recovered
 
 
 # ---------------------------------------------------------------- records
@@ -285,7 +241,7 @@ def test_tracker_checks_only_with_evidence_and_the_frames_own_snapshot():
     binner = LambdaBinner(m=0.5, c=399.791, step=1.5).fit(SHAPE[1])
     raw = _raw()
     prepared = _snapshot(raw, smile_model("cubic", keystone=True), inverted=True)
-    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True)
+    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, level_source=stated)
     assert tracker.track(raw, prepared, binner) is None and tracker.latest().status == "off"
     tracker.set_enabled(True)
     record = tracker.track(raw, prepared, binner, row_crop=(2, 1))
@@ -296,19 +252,19 @@ def test_tracker_checks_only_with_evidence_and_the_frames_own_snapshot():
     assert np.array_equal(got.near_affected_fraction, expected.near_affected_fraction)
     latest = tracker.latest()
     assert latest.status == STATUS_CHECKED and latest.level == LEVEL and latest.saturation is not None
-    assert latest.provenance == "test: 12-bit values shifted << 4"
+    assert latest.provenance == "test profile: saturated pixels read 65520"
     # not checked: another frame's snapshot, a backend correcting its own frames, a guessed level
     assert tracker.track(raw.copy(), prepared, binner) is None
     assert "snapshot" in tracker.latest().reason
-    legacy = SaturationTracker(StatedLevel(), shared_preprocessing=False, enabled=True)
+    legacy = SaturationTracker(StatedLevel(), shared_preprocessing=False, enabled=True, level_source=stated)
     assert legacy.track(raw, prepared, binner) is None and legacy.latest().status == STATUS_NOT_CHECKED
     guessed = SaturationTracker(BaseLevel(16), shared_preprocessing=True, enabled=True)
-    assert guessed.track(raw, prepared, binner) is None and "assumed" in guessed.latest().reason
+    assert guessed.track(raw, prepared, binner) is None and "not measured" in guessed.latest().reason
 
 
 def test_tracker_failure_is_not_checked_and_never_raises(caplog):
     raw = _raw()
-    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, enabled=True)
+    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, enabled=True, level_source=stated)
     wrong = LambdaBinner(m=0.5, c=399.791, step=1.5).fit(SHAPE[1] + 4)   # fitted for another width
     for _ in range(3):
         assert tracker.track(raw, _snapshot(raw), wrong) is None
@@ -318,7 +274,7 @@ def test_tracker_failure_is_not_checked_and_never_raises(caplog):
 
 def test_tracker_meters_live_and_per_scan_cost():
     binner = LambdaBinner(m=0.5, c=399.791, step=1.5).fit(SHAPE[1])
-    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, enabled=True)
+    tracker = SaturationTracker(StatedLevel(), shared_preprocessing=True, enabled=True, level_source=stated)
     tracker.start_scan()
     clean = np.full(SHAPE, 1000, np.uint16)
     for i in range(6):
@@ -333,7 +289,8 @@ def test_tracker_meters_live_and_per_scan_cost():
     assert live["sat_ms"] is not None and live["sat_max_ms"] >= live["sat_ms"]
     scan = tracker.scan_info(period_ms=10.0, period_source="reported")
     assert scan["frames"] == scan["checked"] == 5 and scan["near_frames"] == scan["clipped_frames"] == 2
-    assert scan["levels"] == [{"level": LEVEL, "provenance": "test: 12-bit values shifted << 4", "frames": 5}]
+    assert scan["levels"] == [{"level": LEVEL, "provenance": "test profile: saturated pixels read 65520",
+                               "profile_id": "test-profile@2026-11-27", "frames": 5}]
     assert scan["not_checked"] == {}
     assert scan["busy_max_ms"] == pytest.approx(4.0) and scan["period_ms"] == 10.0
     line = format_scan_info(scan, {"status": "checked", "checked": 5, "frames": 5, "near_frames": 2,
@@ -372,11 +329,7 @@ class ClipCamera(AbstractCameraBackend):
         frame[0, 0] = i % 60000 // 1                                  # frame number, for alignment
         return frame
 
-    def saturation_level(self):
-        return LEVEL
-
-    def saturation_level_source(self):
-        return "test camera: full scale 65520"
+    gain = 1.0
 
     def set_params(self, gain, exposure_ms): pass
     def frame_rate(self): return 400.0
@@ -406,8 +359,11 @@ def clip_engine(tmp_path):
     hot[3, 9] = hot[11, 25] = hot[(4, 4, 5), (14, 15, 14)] = 1
     camera.set_dark_reference(np.random.default_rng(5).integers(0, 60, (H, W), dtype=np.uint16), hot)
     camera.set_dark_enabled(True)
+    profile = CameraProfile.for_camera(tmp_path / "profiles", "test", None, None)
+    verified_profile(profile.saturation_folder, "test", camera)       # the level: a measured profile
     config = SimpleNamespace(smile_map_folder=str(tmp_path), preprocessing_backend="cpu", m=0.5, c=400.0,
-                             resolution=1.5, saturation_tracking=True)
+                             resolution=1.5, saturation_tracking=True, camera_backend="test",
+                             camera_profile=profile)
     sink = AcquisitionSink()
     frames_seen = []
     sink.frame = lambda frame, fps, timestamp: frames_seen.append(frame)
@@ -460,7 +416,8 @@ def test_engine_records_each_frames_own_saturation_and_unchanged_intensities(cli
     assert info["checked"] >= len(images) and info["sat_ms"] > 0 and info["busy_ms"] >= info["sat_ms"]
     live = engine.saturation_live_info()
     assert live["period_ms"] == pytest.approx(2.5) and live["period_source"] == "reported"   # 400 Hz camera
-    assert info["levels"][0]["provenance"] == "test camera: full scale 65520"
+    assert "measured saturation profile" in info["levels"][0]["provenance"]
+    assert info["levels"][0]["profile_id"] == "saturation_unknown_d16s16_bin1@2026-11-27T10:00:00"
 
 
 def test_a_ceiling_recomputed_on_the_frame_does_not_take_its_snapshot(clip_engine):

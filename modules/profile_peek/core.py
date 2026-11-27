@@ -205,6 +205,133 @@ def reference_peek(reference) -> PeekData:
                            y_label="factor", log_y=bool(positive.size and np.all(positive > 0))), "", "View ▸")
 
 
+#: Saturation profile state -> (peek colour, short word), matching the Saturation level row.
+SATURATION_STATES = {"verified": ("green", "verified"), "missing": ("red", "missing"),
+                     "inconclusive": ("orange", "inconclusive"), "failed": ("orange", "failed"),
+                     "incompatible": ("orange", "incompatible"), "invalid": ("orange", "unreadable"),
+                     "gain_outside": ("orange", "gain outside")}
+_BIN_MARKS = {"verified": "✓", "inconclusive": "?", "failed": "✗", "invalid": "✗", "missing": "—"}
+
+
+def _number(value) -> str:
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _near(level, ratio) -> Optional[int]:
+    import math
+    return None if level is None else int(math.ceil(float(ratio) * float(level)))
+
+
+def _gain_text(gain_range) -> str:
+    if not gain_range:
+        return ""
+    low, high = (float(v) for v in gain_range)
+    return f"gain {low:g}" if low == high else f"gain {low:g}–{high:g}"
+
+
+def _plateau_line(record) -> str:
+    """The clipping plateau's evidence, e.g. ``plateau 65504: absent at 62.5 ms, appears at 125 ms``."""
+    plateaus = list(getattr(record, "plateaus", ()) or ())
+    if not plateaus:
+        return ""
+    level = getattr(record, "level", None)
+    best = next((p for p in plateaus if p.value == level), None) or next(
+        (p for p in plateaus if p.role == "clipping"), plateaus[0])
+    reason = str(best.reason).replace("clipping plateau: ", "")
+    others = [f"{p.value} ({p.role})" for p in plateaus if p is not best]
+    return f"plateau {best.value}: {reason}" + (f"; also {', '.join(others)}" if others else "")
+
+
+def _top_histogram(record) -> Tuple[Optional["PeekCurve"], str]:
+    """The upper histogram the profile kept (``steps[].top_values``) of the step with the most
+    pixels on the plateau, and its caption; ``(None, '')`` without stored steps."""
+    steps = [s for s in (getattr(record, "steps", ()) or ()) if s.get("top_values")]
+    if not steps:
+        return None, ""
+    level = getattr(record, "level", None)
+
+    def plateau_pixels(step):
+        values = dict((int(v), float(c)) for v, c in step.get("plateaus") or [])
+        return values.get(level, max(values.values(), default=0.0)) if values else 0.0
+
+    step = max(steps, key=lambda s: (plateau_pixels(s), s.get("exposure_ms", 0)))
+    pairs = sorted((int(v), float(c)) for v, c in step["top_values"])
+    curve = _curve([v for v, _ in pairs], [c for _, c in pairs], x_label="raw value (top of histogram)",
+                   y_label="pixels", log_y=all(c > 0 for _, c in pairs))
+    return curve, f"histogram {float(step.get('exposure_ms', 0)):g} ms, gain {float(step.get('gain', 0)):g} " \
+                  f"(top {len(pairs)} values kept)"
+
+
+def saturation_peek(camera: dict, record=None, bins: Sequence[dict] = (), state: str = "missing",
+                    reason: str = "", near_ratio: float = 0.98) -> PeekData:
+    """Peek of the saturation level of the active camera setting, and of every bin measured.
+
+    Read-only: it shows what the profile files hold; it never talks to the camera or a file.
+
+    Args:
+        camera: The active setting: ``model``, ``serial``, ``pixel_format``, ``delivered_bits``,
+            ``sensor_bits``, ``bin``, ``gain``, ``nominal_full_scale``.
+        record: The active bin's saturation profile record (duck-typed
+            ``SaturationProfileRecord``: ``status``, ``level``, ``nominal_full_scale``,
+            ``gain_range``, ``gains_tested``, ``measured_at``, ``plateaus``, ``steps``, ``reasons``),
+            or ``None`` when there is none.
+        bins: Every bin's active profile of this camera and format: ``{'bin', 'status', 'level'}``.
+        state: The lookup state of the active setting (``verified``, ``missing``, ``inconclusive``,
+            ``failed``, ``incompatible``, ``invalid``, ``gain_outside``).
+        reason: Why, when not verified (one line).
+        near_ratio: Share of the level that counts as near saturation.
+
+    Returns:
+        PeekData: green for a verified level, red when missing, orange otherwise (with the reason
+        as its warning); the curve is the stored upper histogram when the record has one.
+    """
+    color, word = SATURATION_STATES.get(state, ("orange", state))
+    active_bin = camera.get("bin")
+    level = getattr(record, "level", None) if record is not None else None
+    nominal = (getattr(record, "nominal_full_scale", None) if record is not None else None) \
+        or camera.get("nominal_full_scale")
+    lines = [_join(camera.get("model") or "camera", camera.get("serial") or ""),
+             _join(camera.get("pixel_format") or "?",
+                   f"{camera.get('sensor_bits')}→{camera.get('delivered_bits')} bit",
+                   f"nominal {nominal}" if nominal else "")]
+    if level is not None:
+        lines.append(_join(f"bin {active_bin}: {level}", f"near ≥ {_near(level, near_ratio)}",
+                           _gain_text(getattr(record, "gain_range", None))))
+    else:
+        gains = sorted(float(g) for g in (getattr(record, "gains_tested", ()) or ())) if record is not None else []
+        tested = _gain_text((gains[0], gains[-1])) if gains else ""
+        lines.append(_join(f"bin {active_bin}: {word}", f"tested {tested}" if tested else ""))
+    measured = str(getattr(record, "measured_at", "") or "") if record is not None else ""
+    if measured:
+        lines.append(f"measured {measured.replace('T', ' ')[:16]}")
+    marks = []
+    for entry in sorted(bins, key=lambda e: int(e["bin"])):
+        b = int(entry["bin"])
+        value = entry.get("level")
+        text = f"{b} {_BIN_MARKS.get(entry.get('status'), '?')}{'' if value is None else value}"
+        marks.append(f"▶{text}" if b == active_bin else text)
+    if marks:
+        lines.append("bins " + "  ".join(marks))
+    curve, caption = _top_histogram(record) if record is not None else (None, "")
+    if record is not None:
+        lines.append(_plateau_line(record))
+        lines.append(caption)
+    warning = ""
+    if state != "verified":
+        if state == "missing":
+            warning = f"Bin {active_bin} not measured: raw clipping is not checked"
+        elif state == "gain_outside":
+            warning = (f"Gain {_number(camera.get('gain'))} outside the verified "
+                       f"{_gain_text(getattr(record, 'gain_range', None))}: not checked")
+        else:
+            cause = reason or "; ".join(list(getattr(record, "reasons", ()) or ())[:1])
+            warning = f"{word.capitalize()}: not checked" + (f" ({cause})" if cause else "")
+    return PeekData("Saturation level", color, tuple(l for l in lines if l), curve, warning, "Open ▸")
+
+
 def text_peek(title: str, value: str = "", details: Sequence[str] = (), color: str = "cyan",
               open_label: str = "Open ▸", actions: Sequence[Tuple[str, str]] = ()) -> PeekData:
     """A peek with no curve: the card's value and its tooltip lines (e.g. the wavelength calibration).

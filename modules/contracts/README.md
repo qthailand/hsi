@@ -80,7 +80,7 @@ standards = normalize_wavelength_config(json.load(open("profile.json")))
   model, serial)` is `<profiles_folder>/<backend>/<model>_<serial>/` (`profile_name`: characters
   outside `A-Z a-z 0-9 . _ -` become `_`; `<model>` or `SN<serial>` when only one is known;
   `unknown` when neither) with `dark_folder` (`dark/`), `smile_folder` (`smile/`),
-  `wavelength_folder` (`wavelength/`) and `info_path` (`profile.json`: `format_version`,
+  `wavelength_folder` (`wavelength/`), `saturation_folder` (`saturation/`) and `info_path` (`profile.json`: `format_version`,
   `backend`, `model`, `serial`, `created_at`, `last_opened_at`, plus what `write_info(**extra)`
   adds; the HSI app stores `frame_width`/`frame_height`/`camera_bin` at open). The HSI app saves every calibration of the open
   camera there and reads the older per-backend folders (`dark_frames/<backend>/`,
@@ -93,13 +93,24 @@ standards = normalize_wavelength_config(json.load(open("profile.json")))
   `pitch_warnings(sdk_pitch_um)` lists reasons to re-check it (profile shared by cameras without
   a serial, entered for another camera, SDK value more than 1 % off). `sdk_pixel_pitch_um(value)`
   turns a backend's `info.pixel_size` into a pitch, or `None` for the `1.0` placeholder.
+* **Saturation profile** (`saturation_profile.py`, format version 1): the raw value a clipped pixel
+  actually reads, measured on real frames, per camera (`saturation_folder` = `saturation/`),
+  pixel format, delivered / sensor bits and hardware bin: `SaturationIdentity`
+  (`file_stem()` = `saturation_<format>_d<delivered>s<sensor>_bin<N>`), `SaturationProfileRecord`
+  (`status` `verified` / `inconclusive` / `failed`; `level` only when verified, valid inside
+  `gain_range`; every `PlateauValue` found with role `clipping` / `unconfirmed` and its evidence;
+  `nominal_full_scale` for reference; `steps`, `reasons`, `measured_at`, `software`, `firmware`,
+  `limitations`). Quality data only: the measured level is never the nominal full scale
+  (`camera_bit_info().full_scale`, metadata and radiometric keys) and never enters the intensities.
 
 ## API summary
 
 `CubeData` (`validate()`), `default_reference_row`, `normalize_wavelength_config`,
 `WavelengthCalibration`, `CameraSetting`, `CalibrationStore`, `StoredWavelength`, `StoredResolution`,
-`CameraProfile`, `SensorInfo`, `profile_name`, `sdk_pixel_pitch_um`, `PIXEL_PITCH_RANGE_UM`.
-Implementation: `geometry.py`, `wavelength.py`, `calibration_set.py`, `camera_profile.py`, `__init__.py`.
+`CameraProfile`, `SensorInfo`, `profile_name`, `sdk_pixel_pitch_um`, `PIXEL_PITCH_RANGE_UM`,
+`SaturationIdentity`, `PlateauValue`, `SaturationProfileRecord`, `format_token`,
+`SATURATION_PROFILE_FORMAT_VERSION`.
+Implementation: `geometry.py`, `wavelength.py`, `calibration_set.py`, `camera_profile.py`, `saturation_profile.py`, `__init__.py`.
 
 ## Threading
 

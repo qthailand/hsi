@@ -11,6 +11,7 @@ kept together, one folder per camera::
         wavelength/         wavelength_bin<N>.json, resolution_bin<N>.json, history/
         radiometric/        ref_<date>_<time>/ (factors, ROI), active.json      (modules.radiometric)
         flatfield/          flat_<date>_<time>/ (profile, ROI)                  (modules.flatfield)
+        saturation/         saturation_<format>_d<bits>s<bits>_bin<N>.json, history/ (modules.saturation_profile)
 
 ``<model>`` and ``<serial>`` are what the camera SDK reports (characters outside
 ``A-Z a-z 0-9 . _ -`` become ``_``); a camera that reports neither gets ``unknown``. Files
@@ -204,6 +205,11 @@ class CameraProfile:
     def flatfield_folder(self) -> Path:
         """Flat-field profiles along the slit (``modules.flatfield.FlatFieldStore``)."""
         return self.root / "flatfield"
+
+    @property
+    def saturation_folder(self) -> Path:
+        """Measured saturation levels per pixel format, bit depth and bin (``modules.saturation_profile``)."""
+        return self.root / "saturation"
 
     @property
     def info_path(self) -> Path:

@@ -454,6 +454,8 @@ class MainWindow(QMainWindow):
             return None
         if key == "dark":
             return self._dark_peek_data(controller)
+        if key == "saturation":                  # read-only peek; Open ▸ opens the measurement window
+            return controller.saturation_peek_data()
         if key == "smile":
             return controller.smile_peek_data()
         if key == "wavelength":
@@ -502,6 +504,10 @@ class MainWindow(QMainWindow):
         if key == "dark":
             if self.scan_controller is not None:
                 self.scan_controller.view_dark()
+            return
+        if key == "saturation":
+            if self.scan_controller is not None:
+                self.scan_controller.open_saturation_measurement()
             return
         if key == "smile" and self.scan_controller is not None:
             # the loaded model's viewer, whose button opens the Smile page; no model: the page itself

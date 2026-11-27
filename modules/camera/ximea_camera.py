@@ -74,7 +74,6 @@ class XIMEACameraBackend(AbstractCameraBackend):
 
         self._camera = None
         self._image = None
-        self._bit_depth_read = False        # info.bit_depth read from xiAPI (not the 10-bit fallback)
         self._info = CameraBackendInfo(
             camera_id=self.camera_id,
             bit_depth=_LEGACY_BIT_DEPTH,
@@ -124,13 +123,6 @@ class XIMEACameraBackend(AbstractCameraBackend):
         """CameraBackendInfo: sensor bit depth, pixel size and current width/height."""
         return self._info
 
-    def saturation_level_source(self) -> str | None:
-        """Stated when ``image_data_bit_depth`` was read (values unscaled: ``2**bits - 1``);
-        ``None`` with the 10-bit fallback."""
-        if not getattr(self, "_bit_depth_read", False):
-            return None
-        return f"xiAPI image_data_bit_depth {int(self._info.bit_depth)}: values unscaled"
-
     def model_name(self) -> str | None:
         """xiAPI ``device_name`` read at ``open`` (``None`` before, or if unavailable)."""
         return self._model_name
@@ -155,10 +147,8 @@ class XIMEACameraBackend(AbstractCameraBackend):
             return
         try:
             bit_depth = _xi_bits(cam.get_image_data_bit_depth())    # bits in the XI_MONO16 buffer
-            self._bit_depth_read = True
         except Exception:
             bit_depth = self._info.bit_depth
-            self._bit_depth_read = False
         try:
             width, height = int(cam.get_width()), int(cam.get_height())
         except Exception:

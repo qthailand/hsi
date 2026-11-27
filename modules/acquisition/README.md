@@ -140,8 +140,24 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `line_rate_info` (the line rate the frames just taken reached: `line_rate_hz`, `line_rate_source`, `frames`, `frames_missing`, `camera_hz`; also logged as `Scan line rate:`), `take_recorded_raw`,
   `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
   `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
+* Saturation level: the **measured** level of a verified saturation profile
+  (`modules.saturation_profile.ProfileLevelSource` on `config.camera_profile.saturation_folder`,
+  for the active camera, pixel format, bits, bin and a gain inside the verified range). No
+  verified profile: every frame is *not checked*. The nominal full scale (`camera_bit_info`) is
+  never used for clipping. The profile is read when the configuration changes, not per frame;
+  `reload_saturation_profile()` reads it again after a save.
+* Saturation measurement through the engine (`saturation_measure.py`): `start_raw_tap(count, target,
+  skip)` / `stop_raw_tap()` hand copies of the next raw frames read with `target` `(bin, gain,
+  exposure_ms)` applied and nothing pending (after `skip` settling frames) to a `RawTap`; the frames
+  still go through the pipeline unchanged. `params_pending` / `bin_pending` say whether a request
+  is still queued. `EngineFrameSource` is the `modules.saturation_profile.FrameSource` on a
+  running engine: `apply` uses the engine's own requests and waits until they are applied, `grab`
+  waits on a tap, `snapshot()` / `restore(snapshot)` put bin, gain and exposure back and return
+  the problems (`[]`: restored). The Scan controller also checks the calibration state (dark
+  file, Smile / keystone model, wavelength profile, corrections in effect) and keeps scans and dark
+  captures locked until it is back.
 * Basic saturation detection (always on, no mask): every acquired raw frame is counted before any
-  correction against the stated level (`modules.saturation_mask.RawCounter`: clipped `raw >= level`
+  correction against that level (`modules.saturation_mask.RawCounter`: clipped `raw >= level`
   and near `raw >= 0.98 level` in one pass, profile span `sat_count`; kernels warmed up before the
   first frame). `latest_raw_saturation()` is its mailbox (`RawSaturationStats`: the newest frame's
   counts, level and provenance, and since the last reset the peak clipped / near share, the frames
@@ -149,6 +165,10 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   `not_checked`); `reset_saturation_peak()` resets it (Start scan does too). The Scan window's
   Clipped tile reads it at its refresh rate; nothing is queued per frame. `saturation_scan_info()`
   adds the same over the recorded frames (`raw_*`, `count_ms`), logged in `Scan saturation:`.
+  `take_recorded_raw_counts()` gives each kept frame's `RawCount` (clipped, near, level, pixels,
+  profile id; `None` = not checked) after the recorder's trim; `scan_saturation_metadata()` turns
+  them into the cube-header `saturation_*` keys (a level change during the scan is reported as
+  mixed).
   Full tracking reuses the count as its fast path (a frame counted clean is not read again).
 * Saturation tracking (`config.saturation_tracking`, off by default; the Camera panel's *Track
   Saturation* box): `set_saturation_tracking(on)`, `saturation_tracking`, `latest_saturation()` (newest
@@ -159,19 +179,20 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   checked; logged as `Scan saturation:`). A frame is checked with the dark-reference snapshot, switch,
   orientation and model its intensities used (`PreprocessingRuntime.last_prepared`), the same binner
   and keystone row crop; it is *not checked* when tracking is off, when the backend corrects its own
-  frames, or when the full scale is not stated (`modules.saturation_mask.level_evidence`). The level
-  is asked again when the frame dtype, bin, `info.bit_depth` / `info.image_format` change, after a bin
-  or parameter change or a restart, and one second after a failed SDK query; every scan keeps the
-  levels it was checked against with their provenance (`saturation_scan_info()['levels']`) and the
+  frames, or when there is no verified saturation profile for the configuration. The level
+  is asked again when the frame dtype, bin, gain, `info.bit_depth` / `info.image_format` change, after a
+  bin or parameter change, a restart or a saved profile, and one second after a failed lookup; every
+  scan keeps the levels it was checked against with their provenance and profile id
+  (`saturation_scan_info()['levels']`) and the
   reasons frames were not (`['not_checked']`). Live and scan info give the mask's *overhead* apart
   from the whole frame's *load*, and say whether the frame period was `reported` by the camera or
   `measured` (an estimate). Profile spans: `sat_total`, `sat_detect`, `sat_hot`, `sat_remap`,
   `sat_bin`, `sat_pack`. `latest_saturation()` is the newest *tracked* frame: a viewer that draws a
   mask over a displayed frame must pair the two by frame identity, never by reading the display
   mailbox and this one separately.
-* `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer(..., saturation=None)`,
-  `count`, `live_frames`, `take_frames`, `take_raw`, `take_saturation` (the kept frames' records, trimmed
-  with them), `factors`, `factor_error`. Armed with `factors` (`(slit, bins)` float32,
+* `ScanRecorder`: `set_recording(active, factors=None)`, `set_min_stamp`, `offer(..., saturation=None,
+  raw_count=None)`, `count`, `live_frames`, `take_frames`, `take_raw`, `take_saturation` / `take_raw_counts`
+  (the kept frames' records and counts, trimmed with them), `factors`, `factor_error`. Armed with `factors` (`(slit, bins)` float32,
   e.g. radiometric factors; `engine.set_recording(True, start_ns, factors=F)`), every recorded frame is
   stored as `float32(frame) * factors` (a new array, outside the lock); the offered frame (displayed,
   sharpness) is not changed. The factors are latched for the whole recording; a frame of another

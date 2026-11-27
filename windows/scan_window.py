@@ -50,7 +50,7 @@ from modules.acquisition.widget import CorrectionStatusDisplay
 from modules.status_card import StatusCard
 from modules.live_view.display_controls import DisplayControls
 from windows.image_viewer import ImageViewer
-from windows.scan_inspector import (ClippedTile, ReadyList, SharpnessTile, card_frame,
+from windows.scan_inspector import (ClippedTile, format_clipped_percent, ReadyList, SharpnessTile, card_frame,
                                     inspector_stylesheet, live_column_stylesheet, section_label)
 from modules.spectrogram_viewer.window import SpectrogramViewer
 
@@ -84,6 +84,24 @@ SAVE_FRAME_ICONS = {"raw": "fa5s.camera", "dark": "fa5s.adjust", "geometry": "fa
 #: scan's rate is too coarse: one frame of jitter is 1 / lines of it).
 LINE_RATE_WARN_FRACTION = 0.95
 LINE_RATE_WARN_MIN_FRAMES = 50
+
+
+def scan_clipping_text(meta) -> str:
+    """Status-bar text of a scan's raw clipping (the ``saturation_*`` header keys), ``""`` without."""
+    if not meta:
+        return ""
+    checked = int(meta.get("saturation_checked_frames") or 0)
+    unchecked = int(meta.get("saturation_unchecked_frames") or 0)
+    if checked == 0:
+        return "Scan clipping not checked"
+    clipped = int(meta.get("saturation_clipped_frames") or 0)
+    peak = meta.get("saturation_peak_clipped_percent")
+    text = f"Scan clipped {clipped:,}/{checked:,} lines"
+    if clipped:
+        text += f" (peak {format_clipped_percent(peak)})"
+    if unchecked:
+        text += f", {unchecked:,} not checked"
+    return text
 
 
 def _format_duration(seconds: float) -> str:
@@ -141,7 +159,7 @@ SCAN_BUTTON_HEIGHT = 44
 #: The Corrections rows of the settings column, in order: (status card key, name shown).
 CORRECTION_NAMES = (("wavelength", "Wavelength"), ("dark", "Dark + hot pixel"),
                     ("smile", "Smile + keystone"), ("flatfield", "Flat-field"),
-                    ("radiometric", "Radiometric (reflectance)"))
+                    ("radiometric", "Radiometric (reflectance)"), ("saturation", "Saturation level"))
 #: How often (ms) the settings column re-reads Ready to scan? and the scan progress.
 INSPECTOR_REFRESH_MS = 250
 #: Width (px) of the live column (left) and the height of its image.
@@ -321,9 +339,13 @@ class ScanWindow(QWidget):
         self.flatfield_card.set_content('Waiting', 'Waiting for camera')
         self.radiometric_card = StatusCard('Radiometric', self)
         self.radiometric_card.set_content('Waiting', 'Waiting for camera')
+        # the measured level raw clipping is counted against (quality only, never a correction)
+        self.saturation_card = StatusCard('Saturation', self)
+        self.saturation_card.set_content('Waiting', 'Waiting for camera')
         # Wavelength first (always on: the band grid needs it), then the ones that switch on / off
         self.status_cards = (self.correction_status.wavelength, self.correction_status.dark,
-                             self.correction_status.smile, self.flatfield_card, self.radiometric_card)
+                             self.correction_status.smile, self.flatfield_card, self.radiometric_card,
+                             self.saturation_card)
         self._geometry = dict(model=False, keystone_available=False, smile=True, keystone=True)
         self.correction_status.dark.value_clicked.connect(self._on_dark_card_switch)
         self.correction_status.smile.value_clicked.connect(self._on_smile_card_switch)
@@ -337,11 +359,13 @@ class ScanWindow(QWidget):
         # window to open, Flat-field and Radiometric only while there is a profile to show
         self._card_keys = {"smile": self.correction_status.smile, "wavelength": self.correction_status.wavelength,
                            "dark": self.correction_status.dark,
-                           "flatfield": self.flatfield_card, "radiometric": self.radiometric_card}
+                           "flatfield": self.flatfield_card, "radiometric": self.radiometric_card,
+                           "saturation": self.saturation_card}
         for key, card in self._card_keys.items():
             card.clicked.connect(lambda key=key: self.status_card_clicked.emit(key))
         self.correction_status.smile.set_clickable(True, "View ▸")   # the loaded model, else the Smile page
         self.correction_status.wavelength.set_clickable(True, "Open ▸")
+        self.saturation_card.set_clickable(True, "Measure ▸")
         # the Dark row always opens its peek: the dark's details, Capture and Reload (no dark: just those)
         self._dark_viewable = False
         self._dark_warning = ""
@@ -497,6 +521,7 @@ class ScanWindow(QWidget):
             "temp": -999.0,
             "camera_fps": None,
             "line_rate": None,           # line_rate_info() of the last scan (set_line_rate)
+            "scan_clipping": None,       # raw clipping of the last scan's kept lines (set_scan_clipping)
             "calibration_warning": "",   # set for a scan started with calibration warnings
         }
 
@@ -867,6 +892,8 @@ class ScanWindow(QWidget):
         warning = s.get("calibration_warning") or ""
         line_rate = s.get("line_rate")
         line = "" if not line_rate else f"Line rate {line_rate['line_rate_hz']:.1f} Hz  ·  "
+        clipping = scan_clipping_text(s.get("scan_clipping"))
+        line += f"{clipping}  ·  " if clipping else ""
         return (                     # the scan time before the (long) warnings, so it stays in view
             f"{s['state']}  ·  "
             + f"{scan_time}"
@@ -1215,6 +1242,24 @@ class ScanWindow(QWidget):
         self.flatfield_card.set_clickable(has_profile)
         self.flatfield_card.setToolTip(f"FLAT-FIELD: {value}\n{detail}" + (f"\n\n{tooltip}" if tooltip else "")
                                        + ("\n\nClick to view the profile." if has_profile else ""))
+
+    #: Saturation row: state -> (value, colour).
+    SATURATION_STATES = {"verified": ("Measured", "green"), "missing": ("Missing", "red"),
+                         "incompatible": ("Incompatible", "orange"), "invalid": ("Incompatible", "orange"),
+                         "inconclusive": ("Inconclusive", "orange"), "failed": ("Inconclusive", "orange"),
+                         "gain_outside": ("Gain outside", "orange"), "measuring": ("Measuring", "cyan"),
+                         "restore_failed": ("Not restored", "red")}
+
+    def set_saturation_profile_status(self, state: str, detail: str, tooltip: str = ""):
+        """The Saturation level row: is the level clipping is counted against measured for the
+        active camera setting (``state``: a ``ProfileLookup`` state, ``measuring`` or
+        ``restore_failed``); the row opens the measurement window."""
+        value, color = self.SATURATION_STATES.get(state, ("Missing", "red"))
+        self.saturation_card.set_content(value, detail, color)
+        checked = "" if state == "verified" else "\nUntil it is measured, raw clipping is not checked."
+        self.saturation_card.setToolTip(f"SATURATION LEVEL: {value}\n{detail}{checked}"
+                                        + (f"\n\n{tooltip}" if tooltip else "")
+                                        + "\n\nClick to measure (camera at a bright, steady light).")
 
     def _on_save_flatfield(self):
         cube = self.counts_cube()                  # a flat-field profile is fitted on counts
@@ -1753,6 +1798,11 @@ class ScanWindow(QWidget):
         ``line_rate_info()``), shown after the recorded count; ``None`` / ``{}`` clears it
         (a new scan, or a scan too short to measure)."""
         self._status["line_rate"] = dict(info) if info and info.get("line_rate_hz") else None
+
+    def set_scan_clipping(self, metadata):
+        """Raw clipping of the scan that just ended (its kept lines: the ``saturation_*`` cube-header
+        keys), shown after the line rate, apart from the live Clipped card; ``None`` clears it."""
+        self._status["scan_clipping"] = dict(metadata) if metadata else None
 
     def set_selected_y_label(self, y: int):
         self._status["y"] = y

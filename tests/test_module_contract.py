@@ -57,6 +57,21 @@ def test_the_template_itself_follows_the_contract():
     assert not audit.imports_qt("_template")
 
 
+def test_profile_peek_stays_duck_typed_with_the_saturation_peek():
+    """The saturation level peek follows the other peeks: a Qt-free builder in profile_peek that
+    imports no other module (it takes the saturation profile record by duck typing)."""
+    import subprocess
+    report = REPORTS["profile_peek"]
+    assert report.requires == () and not report.actual_requires, report.actual_requires
+    package = importlib.import_module("modules.profile_peek")
+    assert "saturation_peek" in package.__all__ and callable(package.saturation_peek)
+    code = ("import sys; import modules.profile_peek as p; p.saturation_peek({'bin': 1}); "
+            "bad = [m for m in sys.modules if m.startswith(('PyQt5', 'modules.saturation_profile', "
+            "'modules.saturation_mask', 'modules.acquisition'))]; print(bad); sys.exit(1 if bad else 0)")
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(ROOT), capture_output=True, text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+
+
 def test_module_index_is_current():
     """docs/MODULES.md is generated; run `python tools/module_index.py` after changing a module."""
     import module_index

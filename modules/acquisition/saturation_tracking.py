@@ -16,15 +16,19 @@ recorder with the frame and the newest one into a mailbox the GUI reads when it 
 (:meth:`SaturationTracker.latest`) - nothing is queued per frame.
 
 A frame is *checked* only when tracking is on, the backend's frames go through the shared
-preprocessing (a backend that corrects its own frames hides the raw values) and the camera
-states its full scale (:func:`modules.saturation_mask.level_evidence`); otherwise its record is
-``None`` (*not checked*), never an empty mask.
+preprocessing (a backend that corrects its own frames hides the raw values) and the camera's
+active configuration has a **verified saturation profile** (the ``level_source``, in the
+application ``modules.saturation_profile.ProfileLevelSource``: the value a clipped pixel was
+measured to read, for this camera, pixel format, bits, bin and gain range); otherwise its
+record is ``None`` (*not checked*), never an empty mask. Basic detection and full tracking use
+that one level. The nominal full scale of the bit depth is never used for it.
 
-Level provenance: the evidence is asked again whenever the camera configuration it depends on
-changes (frame dtype, bin, ``info.bit_depth`` / ``info.image_format``, or :meth:`reset_level`
-after a bin / parameter change or a restart), and after :data:`LEVEL_RETRY_S` when an SDK
-query failed (a transient failure does not leave the rest of the session unchecked). Each scan
-keeps the levels it was checked against with their provenance (:meth:`SaturationTracker.scan_info`).
+Level provenance: the level is asked again whenever the camera configuration it depends on
+changes (frame dtype, bin, gain, ``info.bit_depth`` / ``info.image_format``, or
+:meth:`reset_level` after a bin / parameter change, a restart or a saved profile), and after
+:data:`LEVEL_RETRY_S` when a lookup failed (a transient failure does not leave the rest of the
+session unchecked); never per frame. Each scan keeps the levels it was checked against with
+their provenance and profile id (:meth:`SaturationTracker.scan_info`).
 
 Mailbox: :meth:`SaturationTracker.latest` is the newest *tracked* frame, not necessarily the
 frame on screen. A consumer that shows a mask over a displayed frame (Phase 4) must pair them
@@ -46,13 +50,13 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, NamedTuple, Optional
 
 import numpy as np
 
 from modules.saturation_mask import (STATUS_CHECKED, STATUS_NOT_CHECKED, STATUS_PARTIAL, FrameSaturation,
                                      LevelEvidence, RawCounter, SaturationPropagator, SaturationRecord,
-                                     level_evidence, near_threshold)
+                                     near_threshold)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,7 @@ class RawSaturationStats:
         near_frames: Checked frames with at least one near-saturated pixel.
         peak_clipped_percent, peak_near_percent: Highest shares (%) over the checked frames
             since the reset (``None`` before one).
+        profile_id: The saturation profile the level comes from (``None`` unless checked).
     """
 
     sequence: int
@@ -128,6 +133,7 @@ class RawSaturationStats:
     near_frames: int = 0
     peak_clipped_percent: Optional[float] = None
     peak_near_percent: Optional[float] = None
+    profile_id: Optional[str] = None
 
     @property
     def checked(self) -> bool:
@@ -179,6 +185,22 @@ class _Since:
         return STATUS_CHECKED if self.checked == self.frames else STATUS_PARTIAL
 
 
+class RawCount(NamedTuple):
+    """Basic detection of one frame: ``clipped`` / ``near`` pixels of ``pixels`` against ``level``
+    (from the saturation profile ``profile_id``). Indexes as ``(clipped, near, level)`` first."""
+
+    clipped: int
+    near: int
+    level: int
+    pixels: int
+    profile_id: Optional[str] = None
+
+
+def _no_level(backend, dtype) -> LevelEvidence:
+    """Default level source: none (frames are not checked)."""
+    return LevelEvidence(None, "missing", "no saturation profile source: the saturation level is not measured")
+
+
 class _Totals:
     """Sum / max / count of one quantity."""
 
@@ -202,13 +224,18 @@ class SaturationTracker:
     """Per-frame saturation of the acquisition loop (see the module docstring).
 
     Args:
-        backend: The camera backend (its ``saturation_level`` and bit depths).
+        backend: The camera backend (its configuration: bin, gain, bit depths, pixel format).
         shared_preprocessing: Whether its frames go raw through ``modules.preprocessing``.
         enabled: Track from the start.
+        level_source: ``(backend, dtype) -> LevelEvidence``: the level for the active
+            configuration (``modules.saturation_profile.ProfileLevelSource``); ``None``: none,
+            every frame is not checked.
     """
 
-    def __init__(self, backend, shared_preprocessing: bool, enabled: bool = False):
+    def __init__(self, backend, shared_preprocessing: bool, enabled: bool = False,
+                 level_source: Optional[Callable] = None):
         self.backend = backend
+        self.level_source = level_source if level_source is not None else _no_level
         self.shared_preprocessing = bool(shared_preprocessing)
         self._enabled = bool(enabled)
         self._propagator = SaturationPropagator()
@@ -219,7 +246,7 @@ class SaturationTracker:
         self._logged_evidence = None                 # the last evidence logged (log on change only)
         self._frame_outcome = None                   # (level, provenance) or the not-checked reason
         self._counter = RawCounter(self._propagator.near_ratio)
-        self._frame_count = None                     # (clipped, near, level) of the frame counted last
+        self._frame_count: Optional[RawCount] = None   # of the frame counted last
         self._frame_pixels = 0
         self._count_ms: Optional[float] = None
         self._count_error_logged = False
@@ -266,7 +293,8 @@ class SaturationTracker:
                 self._raw_sequence += 1
                 self._raw_latest = RawSaturationStats(
                     self._raw_sequence, latest.status, latest.reason, latest.pixels, latest.clipped, latest.near,
-                    latest.level, latest.near_level, latest.provenance, latest.count_ms)
+                    latest.level, latest.near_level, latest.provenance, latest.count_ms,
+                    profile_id=latest.profile_id)
 
     # ── worker ──────────────────────────────────────────────
 
@@ -307,7 +335,7 @@ class SaturationTracker:
             return None
         self._count_error_logged = False
         self._count_ms = (time.perf_counter() - t0) * 1000.0
-        self._frame_count = (clipped, near, evidence.level)
+        self._frame_count = RawCount(int(clipped), int(near), int(evidence.level), pixels, evidence.profile_id)
         self._post_raw(STATUS_CHECKED, evidence.provenance or evidence.reason, pixels, clipped, near, evidence)
         return self._frame_count
 
@@ -324,7 +352,8 @@ class SaturationTracker:
                 self._raw_sequence, STATUS_CHECKED if checked else STATUS_NOT_CHECKED, reason, pixels, clipped, near,
                 level, near_threshold(level, self._counter.near_ratio) if checked else None,
                 evidence.provenance if checked else None, self._count_ms if checked else None,
-                since.frames, since.checked, since.saturated, since.near, since.peak_clipped, since.peak_near)
+                since.frames, since.checked, since.saturated, since.near, since.peak_clipped, since.peak_near,
+                profile_id=evidence.profile_id if checked else None)
 
     def _configuration_key(self, frame):
         """What the level depends on: frame dtype, bin, delivered bits / pixel format, resets."""
@@ -334,7 +363,11 @@ class SaturationTracker:
             bits, image_format = getattr(info, "bit_depth", None), getattr(info, "image_format", None)
         except Exception:                            # noqa: BLE001 - info unreadable: ask every time
             bits = image_format = object()
-        return (np.asarray(frame).dtype.str, getattr(backend, "current_bin", None), bits, image_format,
+        try:
+            gain = getattr(backend, "gain", None)
+        except Exception:                            # noqa: BLE001 - unreadable: ask every time
+            gain = object()
+        return (np.asarray(frame).dtype.str, getattr(backend, "current_bin", None), bits, image_format, gain,
                 self._evidence_generation)
 
     def evidence(self, frame) -> LevelEvidence:
@@ -345,7 +378,10 @@ class SaturationTracker:
         stale = (key != self._evidence_key or self._evidence is None
                  or (self._evidence.transient and now - self._evidence_time >= LEVEL_RETRY_S))
         if stale:
-            self._evidence = level_evidence(self.backend, np.asarray(frame).dtype)
+            try:
+                self._evidence = self.level_source(self.backend, np.asarray(frame).dtype)
+            except Exception as exc:                 # noqa: BLE001 - a broken source: not checked, retry
+                self._evidence = LevelEvidence(None, "error", f"saturation level lookup failed: {exc}")
             self._evidence_key, self._evidence_time = key, now
             shown = (self._evidence.level, self._evidence.source, self._evidence.reason)
             if shown != self._logged_evidence:
@@ -407,7 +443,7 @@ class SaturationTracker:
         self._error_logged = False
         self._frame_ms = (time.perf_counter() - t0) * 1000.0
         self._frame_record = record
-        self._frame_outcome = (evidence.level, evidence.provenance)
+        self._frame_outcome = (evidence.level, evidence.provenance, evidence.profile_id)
         self._post(STATUS_CHECKED, f"level {evidence.level}: {evidence.provenance}", result, evidence.level,
                    evidence.provenance)
         return record
@@ -517,8 +553,8 @@ class SaturationTracker:
             info = {k: scan[k] for k in ("tracking", "frames", "checked", "near_frames", "clipped_frames")}
             info.update(sat_ms=scan["sat"].mean(), sat_max_ms=scan["sat"].peak if scan["sat"].n else None,
                         busy_ms=scan["busy"].mean(), busy_max_ms=scan["busy"].peak if scan["busy"].n else None,
-                        levels=[{"level": level, "provenance": provenance, "frames": n}
-                                for (level, provenance), n in scan["levels"].items()],
+                        levels=[{"level": level, "provenance": provenance, "profile_id": profile_id, "frames": n}
+                                for (level, provenance, profile_id), n in scan["levels"].items()],
                         not_checked=dict(scan["not_checked"]))
             raw, counted = scan["raw"], scan["count"]
             info.update(raw_status=raw.status(), raw_checked=raw.checked, raw_saturated_frames=raw.saturated,
@@ -529,6 +565,48 @@ class SaturationTracker:
             info["period_ms"] = float(period_ms)
             info["period_source"] = period_source or "measured"
         return info
+
+
+def scan_saturation_metadata(raw_counts, frames: Optional[int] = None) -> dict:
+    """Cube-header keys of a scan's basic detection, from the kept frames' :class:`RawCount`
+    (``None`` = not checked), index for index with the cube's lines (after the recorder's trim).
+
+    The level, its profile id and status are the ones the frames were *counted with* (kept with
+    each frame), not the profile active at export. A scan counted against more than one level
+    reports no single ``saturation_level``: its source lists each level and profile with their
+    frame counts. With ``frames`` given and a different number of entries, nothing is paired:
+    every line counts as not checked.
+
+    Returns:
+        dict: ``saturation_level``, ``saturation_level_source``, ``saturation_profile_status``,
+        ``saturation_profile_id``, ``saturation_checked_frames``, ``saturation_unchecked_frames``,
+        ``saturation_clipped_frames``, ``saturation_peak_clipped_percent`` (only those that apply).
+    """
+    counts = list(raw_counts or [])
+    if frames is not None and len(counts) != int(frames):
+        logger.error("Saturation counts (%d) do not match the frames (%d); scan not checked", len(counts), frames)
+        counts = [None] * int(frames)
+    checked = [c for c in counts if c is not None]
+    meta = {"saturation_checked_frames": len(checked), "saturation_unchecked_frames": len(counts) - len(checked)}
+    if not checked:
+        meta.update(saturation_level_source="not checked (no verified saturation profile for the camera setting)",
+                    saturation_profile_status="none")
+        return meta
+    meta["saturation_clipped_frames"] = sum(1 for c in checked if c.clipped > 0)
+    meta["saturation_peak_clipped_percent"] = max(100.0 * c.clipped / c.pixels if c.pixels else 0.0 for c in checked)
+    groups: dict = {}
+    for c in checked:
+        groups[(c.level, c.profile_id)] = groups.get((c.level, c.profile_id), 0) + 1
+    if len(groups) == 1:
+        (level, profile_id), = groups
+        meta.update(saturation_level=int(level), saturation_profile_id=profile_id or "unknown",
+                    saturation_profile_status="verified",
+                    saturation_level_source=f"measured saturation profile {profile_id or 'unknown'}")
+    else:
+        meta.update(saturation_profile_status="verified", saturation_profile_id="mixed",
+                    saturation_level_source="mixed: " + "; ".join(
+                        f"{level} ({profile_id}) x{n}" for (level, profile_id), n in groups.items()))
+    return meta
 
 
 def format_scan_info(info: dict, summary: dict) -> str:

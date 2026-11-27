@@ -72,8 +72,12 @@ from .geometry import default_reference_row
 from .wavelength import WavelengthCalibration, normalize_wavelength_config
 from .calibration_set import CalibrationStore, CameraSetting, StoredResolution, StoredWavelength
 from .camera_profile import PIXEL_PITCH_RANGE_UM, CameraProfile, SensorInfo, profile_name, sdk_pixel_pitch_um
+from .saturation_profile import (SATURATION_PROFILE_FORMAT_VERSION, PlateauValue, SaturationIdentity,
+                                 SaturationProfileRecord, format_token)
 
 __all__ = ["CubeData", "default_reference_row", "normalize_wavelength_config", "WavelengthCalibration",
            "CameraSetting", "CalibrationStore", "StoredWavelength", "StoredResolution",
-           "CameraProfile", "SensorInfo", "profile_name", "sdk_pixel_pitch_um", "PIXEL_PITCH_RANGE_UM"]
+           "CameraProfile", "SensorInfo", "profile_name", "sdk_pixel_pitch_um", "PIXEL_PITCH_RANGE_UM",
+           "SATURATION_PROFILE_FORMAT_VERSION", "SaturationIdentity", "PlateauValue",
+           "SaturationProfileRecord", "format_token"]
 __requires__ = ()

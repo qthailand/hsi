@@ -132,9 +132,11 @@ class LiveLineSpectrumWidget(QWidget):
     data stays below 10 % of the current maximum.  Takes no constructor arguments.
 
     With a saturation ``ceiling`` (see :meth:`update_spectrum`) the level a clipped
-    pixel can reach is drawn as a dashed red line, saturated points are drawn red and
-    the number of saturated bands is shown, because after dark subtraction a clipped
-    pixel sits at ``full scale - dark``, well below the top of the axis.
+    pixel can reach is drawn as a dashed red line, points at the ceiling are drawn amber
+    and their number is shown (``NEAR CEILING n bands``), because after dark subtraction a
+    clipped pixel sits at ``full scale - dark``, well below the top of the axis. The ceiling
+    comes through dark subtraction, the remap and binning, so a band at it is *near* full
+    scale, not confirmed raw clipping: that is counted on the raw frames (the Clipped card).
 
     With wavelengths the line and a soft fill under it take the colour of light at each
     wavelength (:func:`wavelength_color`), the peak's wavelength is shown at the top right
@@ -445,7 +447,7 @@ class LiveLineSpectrumWidget(QWidget):
 
         # saturated points: red over the spectrum
         if self._sat_runs and self._polygon.size() == self._n_points:
-            p.setPen(QPen(QColor(255, 82, 82), 2.6))
+            p.setPen(QPen(QColor(227, 179, 65), 2.6))   # amber: near the ceiling, not confirmed
             for start, stop in self._sat_runs:
                 if stop - start > 1:
                     p.drawPolyline(self._polygon.mid(start, stop - start))
@@ -462,8 +464,8 @@ class LiveLineSpectrumWidget(QWidget):
             p.drawText(right - p.fontMetrics().horizontalAdvance(peak), top - 7, peak)
             p.setFont(small)
         if self._n_saturated:
-            text = f"SATURATED {self._n_saturated} band" + ("s" if self._n_saturated != 1 else "")
-            p.setPen(QPen(QColor(255, 82, 82)))
+            text = f"NEAR CEILING {self._n_saturated} band" + ("s" if self._n_saturated != 1 else "")
+            p.setPen(QPen(QColor(227, 179, 65)))
             p.drawText(left, top - 7, text)
 
         p.end()

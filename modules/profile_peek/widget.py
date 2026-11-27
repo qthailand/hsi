@@ -192,7 +192,18 @@ class ProfilePeek(QFrame):
             item.setLabel("bottom", curve.x_label)
             item.setLabel("left", curve.y_label)
             item.enableAutoRange()
+        self._fit_text()
         self.adjustSize()
+
+    def _fit_text(self):
+        """Give the word-wrapped labels the height their text needs at the popup's fixed width.
+
+        A top-level widget's layout does not ask a word-wrapped QLabel for its height at the
+        actual width, so a long text (several lines) was cut off at the bottom."""
+        margins = self.layout().contentsMargins()
+        width = PEEK_WIDTH - margins.left() - margins.right()
+        for label in (self.lines_label, self.warning_label):
+            label.setMinimumHeight(label.heightForWidth(width) if label.text() else 0)
 
     # ---------------------------------------------------------------- placement
     def popup(self, anchor: QWidget = None):

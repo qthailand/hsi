@@ -105,6 +105,8 @@ class ScanRecorder:
         self._host_stamps: list = []    # host perf_counter_ns when each binned frame was offered
         self._raw_stamps: list = []     # ... and of each raw frame
         self._saturation: list = []     # SaturationRecord (None = not checked) of each binned frame
+        self._raw_counts: list = []     # basic detection (RawCount, None = not checked) of each frame
+        self._taken_raw_counts: list = []
         self._taken_saturation: list = []   # ... of the frames the last take_frames kept
         self._min_stamp = None          # frames stamped earlier are not recorded (set_min_stamp)
         self._live_dropped = 0          # ... and how many were refused so far
@@ -145,6 +147,8 @@ class ScanRecorder:
                 self._raw_stamps = []
                 self._saturation = []
                 self._taken_saturation = []
+                self._raw_counts = []
+                self._taken_raw_counts = []
                 self._min_stamp = None
                 self._live_dropped = 0
                 self._factors = factors
@@ -203,6 +207,8 @@ class ScanRecorder:
             host, self._host_stamps = self._host_stamps, []
             saturation, self._saturation = self._saturation, []
             self._taken_saturation = saturation
+            raw_counts, self._raw_counts = self._raw_counts, []
+            self._taken_raw_counts = raw_counts
             self.last_line_rate = line_rate_stats(stamps, host)     # of all frames, unless trimmed
             self.last_trim = (0, 0)
             self.last_live_dropped, self._live_dropped = self._live_dropped, 0
@@ -221,6 +227,7 @@ class ScanRecorder:
             self.last_line_rate = line_rate_stats([s for s, k in zip(stamps, keep) if k == 0],
                                                   [h for h, k in zip(host, keep) if k == 0])
             self._taken_saturation = [r for r, k in zip(saturation, keep) if k == 0]
+            self._taken_raw_counts = [r for r, k in zip(raw_counts, keep) if k == 0]
             return [f for f, k in zip(frames, keep) if k == 0]
 
     def take_saturation(self) -> list:
@@ -231,6 +238,13 @@ class ScanRecorder:
             taken, self._taken_saturation = self._taken_saturation, []
             return taken
 
+    def take_raw_counts(self) -> list:
+        """Hand over (and empty) the basic detection of the frames the last :meth:`take_frames`
+        kept: one entry per kept frame, in order (``None`` = not checked). Call after it."""
+        with self._lock:
+            taken, self._taken_raw_counts = self._taken_raw_counts, []
+            return taken
+
     def take_raw(self) -> list:
         """Hand over (and empty) the raw sensor frames kept alongside the binned ones."""
         with self._lock:
@@ -238,7 +252,7 @@ class ScanRecorder:
             return raw
 
     def offer(self, binned: np.ndarray, raw_frame: np.ndarray, keep_raw: bool, stamp=None,
-              saturation=None) -> bool:
+              saturation=None, raw_count=None) -> bool:
         """Record one processed frame if armed (worker thread).
 
         Args:
@@ -251,6 +265,8 @@ class ScanRecorder:
                 ``take_frames(window)`` and the :meth:`set_min_stamp` bound.
             saturation: The frame's ``SaturationRecord``, or ``None`` when it was not checked;
                 kept with the frame (and trimmed with it).
+            raw_count: The frame's basic detection (clipped / near counts with their level and
+                profile id), or ``None`` when it was not checked; kept and trimmed the same way.
 
         Returns:
             True if the frame was recorded (not when disarmed, or stamped before the
@@ -285,6 +301,7 @@ class ScanRecorder:
             self._stamps.append(stamp)
             self._host_stamps.append(offered_ns)
             self._saturation.append(saturation)
+            self._raw_counts.append(raw_count)
             if keep_raw:
                 self._raw.append(raw_frame.copy())
                 self._raw_stamps.append(stamp)

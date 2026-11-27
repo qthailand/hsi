@@ -123,6 +123,17 @@ SCAN_HEADER_FIELDS = (
     ('flatfield_profile', 'flat-field profile', str),
     ('flatfield_mode', 'flat-field mode', str),
     ('calibration_warnings', 'calibration warnings', str),
+    # raw clipping (modules.saturation_profile / basic detection): the measured level the frames were
+    # counted against (not 'data full scale', the nominal value), its profile, and the kept frames'
+    # counts; absent in cubes from before saturation profiles
+    ('saturation_level', 'saturation level', int),
+    ('saturation_level_source', 'saturation level source', str),
+    ('saturation_profile_status', 'saturation profile status', str),
+    ('saturation_profile_id', 'saturation profile id', str),
+    ('saturation_checked_frames', 'saturation checked frames', int),
+    ('saturation_unchecked_frames', 'saturation unchecked frames', int),
+    ('saturation_clipped_frames', 'saturation clipped frames', int),
+    ('saturation_peak_clipped_percent', 'saturation peak clipped percent', float),
     ('stage_type', 'stage type', str),
     ('speed_um_s', 'linear speed (um/s)', float),
     ('speed_um_s_achieved', 'linear speed achieved (um/s)', float),
