@@ -3,6 +3,7 @@
 Pipeline per frame (worker thread)::
 
     backend.read_frame_raw()                      (raw sensor frame)
+      -> clipped / near count, every frame       (modules.saturation_mask.count: basic detection)
       -> dark subtraction, hot-pixel repair      \\
       -> orientation (raw_inverted)               |  modules.preprocessing
       -> Smile correction (if a model is loaded) /
@@ -422,6 +423,19 @@ class AcquisitionEngine:
         """The newest frame's :class:`~modules.acquisition.saturation_tracking.SaturationLatest`
         (a mailbox: read it when convenient; ``None`` before the first frame)."""
         return self._saturation_tracker.latest() if self._saturation_tracker is not None else None
+
+    def latest_raw_saturation(self):
+        """Basic detection mailbox: the newest acquired frame's clipped / near counts and the peak
+        and saturated frames since the last reset
+        (:class:`~modules.acquisition.saturation_tracking.RawSaturationStats`; ``None`` before
+        the first frame). Any thread; read it at the display's own rate."""
+        return self._saturation_tracker.latest_raw() if self._saturation_tracker is not None else None
+
+    def reset_saturation_peak(self):
+        """Start the peak clipped share and the saturated-frame count again (the Clipped tile's
+        reset; Start scan does it too). Any thread."""
+        if self._saturation_tracker is not None:
+            self._saturation_tracker.reset_peak()
 
     def saturation_live_info(self) -> dict:
         """Cost of the last seconds (``SaturationTracker.live_info``), against the frame period."""
@@ -1585,6 +1599,10 @@ class AcquisitionEngine:
         frame_idx = 0
         prof = self._profiler
 
+        tracker = self._saturation_tracker
+        if tracker is not None:
+            tracker.warm_up()       # the count's kernels compiled and its threads started before frame 1
+
         try:
             self.backend.open()
             self.backend.start_stream()
@@ -1629,6 +1647,8 @@ class AcquisitionEngine:
                     continue
                 read_done = time.perf_counter()
                 self._frame_shape = frame.shape
+                # basic detection: every acquired raw frame, before any correction (counts only)
+                raw_count = tracker.count(frame, prof) if tracker is not None else None
                 stamp = self._note_frame_info(prof) if not dark_capture else None
 
                 if dark_capture:
@@ -1668,12 +1688,13 @@ class AcquisitionEngine:
                         except Exception:              # a saved frame is a convenience: keep running
                             logger.exception("Could not copy the frame stages %s", sorted(wanted))
                     self._update_saturation_ceiling(frame, correction, dark_capture=False)
-                    tracker = self._saturation_tracker
                     saturation = None
                     if tracker is not None:
-                        # the dark snapshot, switch, orientation and model this frame was corrected with
+                        # the dark snapshot, switch, orientation and model this frame was corrected
+                        # with; the basic count is the mask's fast path (the frame is not read again)
                         saturation = tracker.track(frame, prepared, binner,
-                                                   keystone_row_margin(calibration, frame.shape[0]), prof)
+                                                   keystone_row_margin(calibration, frame.shape[0]), prof,
+                                                   counts=raw_count)
                     # transform() allocates a new array per call, so it is safe to keep
                     recorded = self.recorder.offer(emit_frame, frame, self._keep_spectrogram, stamp,
                                                    saturation=saturation)

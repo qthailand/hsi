@@ -13,7 +13,7 @@ session are Qt-free.
 | `AcquisitionSink` | no | base class with no-op callbacks (`frame`, `correction_status`, `sharpness`, `snapshot`, `processed_frame`, `error`, `bin_applied`, `bin_failed`, `params_applied`, `params_failed`, `wavelength_applied`, `wavelength_failed`, `wavelength_range_applied`, `wavelength_range_failed`) |
 | `CameraPreviewThread` | yes | the engine on a `QThread`; sink callbacks become signals |
 | `ScanRecorder` | no | thread-safe "record every frame" buffers (owned by the engine) |
-| `SaturationTracker` | no | per-frame raw saturation mask: on/off, level evidence, mailbox, cost meter (owned by the engine) |
+| `SaturationTracker` | no | per-frame raw saturation: basic detection (counts, peak, mailbox) on every frame, the full mask on/off, level evidence, cost meter (owned by the engine) |
 | `ScanSession` / `ScanOutcome` | no | GUI-independent scan state machine |
 | `StageProfiler` | no | running per-stage timing |
 | `CorrectionStatusDisplay` | yes | two `StatusCard`s (Dark, Smile) fed by the status dict |
@@ -140,6 +140,16 @@ if outcome.kind == "cube":                   # also "empty", "reference", "refer
   `set_dark_capture_mode`, `recorded_count`, `live_recorded_frames`, `take_recorded_frames`, `line_rate_info` (the line rate the frames just taken reached: `line_rate_hz`, `line_rate_source`, `frames`, `frames_missing`, `camera_hz`; also logged as `Scan line rate:`), `take_recorded_raw`,
   `binner_n_bins`, `binner_lambda_out`, `set_wavelength_range(range)`, `request_wavelength_range(range)`,
   `wavelength_range`, `wavelength_range_pending`, `wavelength_range_metadata()`.
+* Basic saturation detection (always on, no mask): every acquired raw frame is counted before any
+  correction against the stated level (`modules.saturation_mask.RawCounter`: clipped `raw >= level`
+  and near `raw >= 0.98 level` in one pass, profile span `sat_count`; kernels warmed up before the
+  first frame). `latest_raw_saturation()` is its mailbox (`RawSaturationStats`: the newest frame's
+  counts, level and provenance, and since the last reset the peak clipped / near share, the frames
+  that clipped, checked / not-checked frames: `window_status` `checked` / `partial` /
+  `not_checked`); `reset_saturation_peak()` resets it (Start scan does too). The Scan window's
+  Clipped tile reads it at its refresh rate; nothing is queued per frame. `saturation_scan_info()`
+  adds the same over the recorded frames (`raw_*`, `count_ms`), logged in `Scan saturation:`.
+  Full tracking reuses the count as its fast path (a frame counted clean is not read again).
 * Saturation tracking (`config.saturation_tracking`, off by default; the Camera panel's *Track
   Saturation* box): `set_saturation_tracking(on)`, `saturation_tracking`, `latest_saturation()` (newest
   frame's `SaturationLatest`: a mailbox the GUI reads when it wants, nothing queued per frame),

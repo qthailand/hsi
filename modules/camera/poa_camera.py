@@ -96,25 +96,45 @@ class POACameraBackend(AbstractCameraBackend):
         """Bit depth the SDK reports for the sensor (e.g. 12), before RAW16 scales it to 16 bits."""
         return int(getattr(self, "_sensor_bits", self.bit_depth))
 
+    #: What a saturated pixel reads in RAW16, measured on real saturated frames:
+    #: ``{(model, sensor bits): {hardware bin: value}}``. Apollo-M MAX (SN CAMP7161A470A1209000,
+    #: gains 1 and 200, 2026-11-27): the 12-bit values are shifted << 4 but the ADC tops out at
+    #: 4094, so a clipped pixel reads 65504, not 4095 << 4 = 65520; hardware bins average
+    #: (bin 2: multiples of 4, bin 3 / 4: any value) and keep 65504, except bin 3, whose average
+    #: is scaled up: clipped blocks read 65535 (clamped) or 65520 (a second peak, ~2 % of them),
+    #: so its level is 65520. A binned pixel reads this only when every sensor pixel of its
+    #: block clipped; a partly clipped block reads less (the near count catches it).
+    MEASURED_SATURATION = {("Apollo-M MAX", 12): {1: 65504, 2: 65504, 3: 65520, 4: 65504}}
+    #: When the values were measured (provenance text).
+    MEASURED_ON = "2026-11-27"
+
+    def _measured_saturation(self):
+        """The measured saturated value at the current bin, or ``None`` (model, bits or bin not measured)."""
+        if int(self.bit_depth) != 16:
+            return None
+        table = self.MEASURED_SATURATION.get((getattr(self, "_model_name", None), self.sensor_bit_depth()))
+        return None if table is None else table.get(int(getattr(self, "_current_bin", 1)))
+
     def saturation_level(self) -> int:
-        """Full scale of the RAW16 frames: the SDK shifts a 10/12-bit sensor's values to the top of
-        16 bits (every value a multiple of ``2**(16 - bits)``), so a clipped pixel reads
-        ``(2**bits - 1) << (16 - bits)`` (12-bit: 65520), never the 65535 of ``2**16 - 1``."""
+        """Value of a saturated pixel: the measured one (:data:`MEASURED_SATURATION`) when this
+        model, bit depth and bin were measured; otherwise the nominal RAW16 full scale
+        ``(2**bits - 1) << (16 - bits)`` (the SDK shifts a 10/12-bit sensor's values to the top of
+        16 bits), kept for display only (not stated, see :meth:`saturation_level_source`)."""
+        measured = self._measured_saturation()
+        if measured is not None:
+            return measured
         bits = self.sensor_bit_depth()
         if int(self.bit_depth) == 16 and 8 < bits < 16:
             return ((1 << bits) - 1) << (16 - bits)
         return super().saturation_level()
 
-    #: Sensor bit depths whose RAW16 scaling was confirmed on real frames (Apollo-M MAX: every
-    #: value a multiple of 16, ``poa_sat.npy``). Others keep their level for display only.
-    CONFIRMED_SHIFT_BITS = (12,)
-
     def saturation_level_source(self) -> str | None:
-        """Stated only for a confirmed scaling (:data:`CONFIRMED_SHIFT_BITS`), else ``None``."""
-        bits = self.sensor_bit_depth()
-        if int(self.bit_depth) == 16 and bits in self.CONFIRMED_SHIFT_BITS:
-            return f"POA RAW16: {bits}-bit sensor values shifted << {16 - bits} (confirmed on real frames)"
-        return None
+        """Stated only for a measured model / bit depth / bin, else ``None`` (frames not checked)."""
+        measured = self._measured_saturation()
+        if measured is None:
+            return None
+        return (f"POA {self._model_name} RAW16 bin {self._current_bin}: a saturated pixel reads {measured} "
+                f"(measured on real frames {self.MEASURED_ON})")
 
     def model_name(self) -> str | None:
         """``cameraModelName`` from the camera properties (``None`` before ``open``)."""

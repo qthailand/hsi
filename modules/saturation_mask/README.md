@@ -6,6 +6,16 @@ Finds raw pixels that clipped (or came near full scale) **before** dark subtract
 them through the same stages the intensities go through, so a recorded band that averaged in a
 clipped pixel is flagged even when its value stays below full scale.
 
+Two levels:
+
+* **Basic detection** (`count.py`, every acquired frame): `count_saturated` / `RawCounter` count
+  clipped and near-saturated raw pixels in one pass (Numba, rows in parallel; no mask, no
+  temporary, the frame not modified). Thread count by frame size (`THREADS_BY_PIXELS`);
+  `numba.set_num_threads` is thread-local and restored after each call, so the lambda binning's
+  setting is untouched. `near` uses `ceil(0.98 * level)`: the same pixels as `detect_raw`.
+* **Full mask** (`core.py`, optional): the stages below; `detect_raw(..., counts=)` and
+  `SaturationPropagator.frame(..., counts=)` take the basic counts as their fast path.
+
 | Stage | Intensity pipeline | Mask (this module) |
 |---|---|---|
 | Raw detection | – | `clipped = raw >= level`, `near = raw >= near_ratio * level` (clipped included) |
@@ -65,6 +75,7 @@ result.clipped_mask            # (rows, bands), the recorded line's layout
 
 ## Status
 
-Phase 2: run by `modules.acquisition` (`SaturationTracker`) on every frame when *Track Saturation*
-is on, and kept by the recorder with each frame. Not yet written to files (sidecar: Phase 3) or used
+Phase 2B: basic detection runs on every acquired frame and feeds the Scan window's Clipped tile.
+Phase 2: the full mask is run by `modules.acquisition` (`SaturationTracker`) on every frame when
+*Track Saturation* is on, and kept by the recorder with each frame. Not yet written to files (sidecar: Phase 3) or used
 by the viewers (Phase 4).

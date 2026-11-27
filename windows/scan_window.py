@@ -1463,11 +1463,17 @@ class ScanWindow(QWidget):
                           lambda: self.status_card_clicked.emit("dark")))
         else:
             passed.append("Dark frame")
+        # raw clipping counted by the engine (confirmed), near full scale = the exposure warning
         percent = self.histogram.saturated_percent()
+        near = self.histogram.near_percent()
         if percent is not None and percent > CLIPPED_WARN_PERCENT:
             items.append(("warning", f"{percent:.2f} % clipped", "", None))
+        elif near is not None and near > CLIPPED_WARN_PERCENT:
+            items.append(("warning", f"{near:.2f} % near full scale", "", None))
         elif percent is not None:
             passed.append("No clipped pixels")
+        elif self.histogram.check_status() == "not_checked":
+            items.append(("info", "Clipping not checked", "", None))
         if self._geometry.get("model"):
             passed.append("Smile model")
         else:

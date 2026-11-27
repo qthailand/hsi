@@ -466,6 +466,9 @@ class ScanController:
         tracking_changed = getattr(self.win.camera_controls, "saturation_tracking_changed", None)
         if tracking_changed is not None:
             tracking_changed.connect(self.set_saturation_tracking)
+        peak_reset = getattr(getattr(self.win, "histogram", None), "peak_reset", None)
+        if peak_reset is not None:
+            peak_reset.connect(self._reset_saturation_peak)
         # Only the settings the user edits are saved, each on its own: start-up values (possibly
         # clamped to the camera) are not, and another open copy of the app cannot overwrite them.
         controls = self.win.camera_controls
@@ -1427,18 +1430,36 @@ class ScanController:
         self.win.set_sharpness_score(score)
 
     def _update_live_histogram(self, frame_data: np.ndarray, now: float):
-        if (
-            frame_data is None
-            or frame_data.ndim != 2
-            or not self.enable_histogram
-            or now - self.last_histogram_update < HISTOGRAM_UPDATE_INTERVAL_SEC
-        ):
+        """At most every ``HISTOGRAM_UPDATE_INTERVAL_SEC``: the Clipped numbers from the engine's
+        basic detection (its mailbox: every raw frame, peak kept in the engine) and the
+        histogram bars of the displayed frame."""
+        if now - self.last_histogram_update < HISTOGRAM_UPDATE_INTERVAL_SEC:
             return
         self.last_histogram_update = now
+        self._show_raw_saturation()
+        if frame_data is None or frame_data.ndim != 2 or not self.enable_histogram:
+            return
         try:
             self.win.histogram.update_histogram(frame_data, ceiling=self._ceiling_for(frame_data))
         except Exception as e:
             logger.warning("Histogram update failed: %s", e)
+
+    def _show_raw_saturation(self):
+        """Hand the newest basic-detection stats to the Clipped tile."""
+        latest = getattr(self.preview_thread, "latest_raw_saturation", None)
+        show = getattr(self.win.histogram, "set_raw_saturation", None)
+        if latest is None or show is None:
+            return
+        try:
+            show(latest())
+        except Exception as e:
+            logger.warning("Clipped update failed: %s", e)
+
+    def _reset_saturation_peak(self):
+        """The Clipped tile's max was reset (its button, Start scan): the engine's peak too."""
+        reset = getattr(self.preview_thread, "reset_saturation_peak", None)
+        if reset is not None:
+            reset()
 
     def on_preview_error(self, msg: str):
         """A failure reported by the acquisition worker.

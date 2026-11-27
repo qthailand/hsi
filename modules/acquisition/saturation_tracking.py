@@ -1,6 +1,16 @@
-"""Saturation tracking in the acquisition loop: on/off, level evidence, mailbox and cost meter.
+"""Saturation in the acquisition loop: basic detection, tracking on/off, level evidence, mailboxes, cost.
 
-The worker calls :meth:`SaturationTracker.track` once per corrected frame with the frame's own
+Basic detection (always on): the worker calls :meth:`SaturationTracker.count` with every acquired
+raw frame, before any correction. It counts clipped (``raw >= level``) and near-saturated
+(``raw >= NEAR_RATIO * level``) pixels in one pass (:class:`modules.saturation_mask.RawCounter`)
+and keeps, since the last :meth:`SaturationTracker.reset_peak` (every Start scan, and the Clipped
+tile's reset button), the peak clipped / near share and the frames that clipped. The GUI reads
+the newest :class:`RawSaturationStats` from a mailbox (:meth:`SaturationTracker.latest_raw`) at
+its own refresh rate; nothing is queued per frame and no mask is built. A frame without a
+stated level is *not checked* (never "0 % clipped"); a window with some frames not checked is
+*partial*.
+
+Full tracking (optional, off by default): the worker calls :meth:`SaturationTracker.track` once per corrected frame with the frame's own
 correction snapshot (``PreprocessingRuntime.last_prepared``) and binner; the result goes to the
 recorder with the frame and the newest one into a mailbox the GUI reads when it wants
 (:meth:`SaturationTracker.latest`) - nothing is queued per frame.
@@ -40,8 +50,9 @@ from typing import Optional
 
 import numpy as np
 
-from modules.saturation_mask import (STATUS_CHECKED, STATUS_NOT_CHECKED, FrameSaturation, LevelEvidence,
-                                     SaturationPropagator, SaturationRecord, level_evidence)
+from modules.saturation_mask import (STATUS_CHECKED, STATUS_NOT_CHECKED, STATUS_PARTIAL, FrameSaturation,
+                                     LevelEvidence, RawCounter, SaturationPropagator, SaturationRecord,
+                                     level_evidence, near_threshold)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +90,93 @@ class SaturationLatest:
     saturation: Optional[FrameSaturation] = None
     level: Optional[int] = None
     provenance: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RawSaturationStats:
+    """Basic detection mailbox: the newest acquired frame and the totals since the last reset.
+
+    Attributes:
+        sequence: Increases by one per acquired frame (checked or not) and per reset.
+        status: ``'checked'`` or ``'not_checked'`` (this frame).
+        reason: Why it is not checked, or the level's provenance when it is.
+        pixels: Raw pixels of the frame.
+        clipped, near: Its pixels ``>= level`` and ``>= near_level`` (``near`` includes clipped).
+        level, near_level, provenance: Thresholds used and where the level comes from
+            (``None`` unless checked).
+        count_ms: Wall-clock time of the count (``None`` unless checked).
+        frames, checked_frames: Frames since the reset, and those checked.
+        saturated_frames: Checked frames with at least one clipped pixel.
+        near_frames: Checked frames with at least one near-saturated pixel.
+        peak_clipped_percent, peak_near_percent: Highest shares (%) over the checked frames
+            since the reset (``None`` before one).
+    """
+
+    sequence: int
+    status: str
+    reason: str
+    pixels: int = 0
+    clipped: int = 0
+    near: int = 0
+    level: Optional[int] = None
+    near_level: Optional[int] = None
+    provenance: Optional[str] = None
+    count_ms: Optional[float] = None
+    frames: int = 0
+    checked_frames: int = 0
+    saturated_frames: int = 0
+    near_frames: int = 0
+    peak_clipped_percent: Optional[float] = None
+    peak_near_percent: Optional[float] = None
+
+    @property
+    def checked(self) -> bool:
+        """Whether this frame was checked."""
+        return self.status == STATUS_CHECKED
+
+    @property
+    def clipped_percent(self) -> Optional[float]:
+        """Clipped share of this frame (%), ``None`` unless checked."""
+        return 100.0 * self.clipped / self.pixels if self.checked and self.pixels else None
+
+    @property
+    def near_percent(self) -> Optional[float]:
+        """Near-saturated share of this frame (%, clipped included), ``None`` unless checked."""
+        return 100.0 * self.near / self.pixels if self.checked and self.pixels else None
+
+    @property
+    def window_status(self) -> str:
+        """Since the reset: ``'checked'`` (every frame), ``'partial'`` or ``'not_checked'`` (none)."""
+        if self.checked_frames == 0:
+            return STATUS_NOT_CHECKED
+        return STATUS_CHECKED if self.checked_frames == self.frames else STATUS_PARTIAL
+
+
+class _Since:
+    """Basic-detection totals since a reset."""
+
+    __slots__ = ("frames", "checked", "saturated", "near", "peak_clipped", "peak_near")
+
+    def __init__(self):
+        self.frames = self.checked = self.saturated = self.near = 0
+        self.peak_clipped = self.peak_near = None
+
+    def add(self, clipped_percent, near_percent):
+        """Count one frame; ``None`` percentages: not checked."""
+        self.frames += 1
+        if clipped_percent is None:
+            return
+        self.checked += 1
+        self.saturated += clipped_percent > 0
+        self.near += near_percent > 0
+        self.peak_clipped = clipped_percent if self.peak_clipped is None else max(self.peak_clipped, clipped_percent)
+        self.peak_near = near_percent if self.peak_near is None else max(self.peak_near, near_percent)
+
+    def status(self) -> str:
+        """``'checked'`` (every frame), ``'partial'`` or ``'not_checked'`` (none)."""
+        if self.checked == 0:
+            return STATUS_NOT_CHECKED
+        return STATUS_CHECKED if self.checked == self.frames else STATUS_PARTIAL
 
 
 class _Totals:
@@ -120,6 +218,14 @@ class SaturationTracker:
         self._evidence_generation = 0                # bumped by reset_level
         self._logged_evidence = None                 # the last evidence logged (log on change only)
         self._frame_outcome = None                   # (level, provenance) or the not-checked reason
+        self._counter = RawCounter(self._propagator.near_ratio)
+        self._frame_count = None                     # (clipped, near, level) of the frame counted last
+        self._frame_pixels = 0
+        self._count_ms: Optional[float] = None
+        self._count_error_logged = False
+        self._since = _Since()
+        self._raw_sequence = 0
+        self._raw_latest: Optional[RawSaturationStats] = None
         self._lock = threading.Lock()
         self._sequence = 0
         self._latest: Optional[SaturationLatest] = None
@@ -150,7 +256,75 @@ class SaturationTracker:
         acquisition restarted)."""
         self._evidence_generation += 1
 
+    def reset_peak(self) -> None:
+        """Start the basic-detection totals again (peak, saturated frames) from the next frame:
+        every Start scan, and the Clipped tile's reset button. The mailbox shows it at once."""
+        with self._lock:
+            self._since = _Since()
+            latest = self._raw_latest
+            if latest is not None:
+                self._raw_sequence += 1
+                self._raw_latest = RawSaturationStats(
+                    self._raw_sequence, latest.status, latest.reason, latest.pixels, latest.clipped, latest.near,
+                    latest.level, latest.near_level, latest.provenance, latest.count_ms)
+
     # ── worker ──────────────────────────────────────────────
+
+    def warm_up(self) -> None:
+        """Compile / load the count kernels and start their threads before the first frame
+        (on the worker, before acquisition starts). Never raises."""
+        t0 = time.perf_counter()
+        try:
+            self._counter.warm_up()
+        except Exception:                            # noqa: BLE001 - the first frame then compiles
+            logger.exception("Saturation count warm-up failed")
+            return
+        logger.info("Saturation count ready in %.0f ms", (time.perf_counter() - t0) * 1000.0)
+
+    def count(self, frame, profiler=None):
+        """Basic detection of one acquired raw frame: ``(clipped, near, level)``, or ``None`` when
+        it is not checked (no raw values, no stated level, the count failed). Updates the
+        totals and the mailbox. Never raises; the frame is not modified."""
+        self._frame_count, self._count_ms = None, None
+        pixels = self._frame_pixels = int(np.size(frame))
+        if not self.shared_preprocessing:
+            self._post_raw(STATUS_NOT_CHECKED, "the camera backend corrects its frames itself (no raw values)", pixels)
+            return None
+        evidence = self.evidence(frame)
+        if not evidence.trusted:
+            self._post_raw(STATUS_NOT_CHECKED, evidence.reason, pixels)
+            return None
+        profiler = profiler if profiler is not None else _NO_PROFILER
+        t0 = time.perf_counter()
+        try:
+            with profiler.time("sat_count"):
+                clipped, near = self._counter.count(frame, evidence.level)
+        except Exception as exc:                     # noqa: BLE001 - detection must never stop acquisition
+            if not self._count_error_logged:
+                logger.exception("Saturation count failed; frames are not checked until it works")
+                self._count_error_logged = True
+            self._post_raw(STATUS_NOT_CHECKED, f"saturation count failed: {exc}", pixels)
+            return None
+        self._count_error_logged = False
+        self._count_ms = (time.perf_counter() - t0) * 1000.0
+        self._frame_count = (clipped, near, evidence.level)
+        self._post_raw(STATUS_CHECKED, evidence.provenance or evidence.reason, pixels, clipped, near, evidence)
+        return self._frame_count
+
+    def _post_raw(self, status, reason, pixels, clipped=0, near=0, evidence=None):
+        checked = status == STATUS_CHECKED and pixels > 0
+        clipped_percent = 100.0 * clipped / pixels if checked else None
+        near_percent = 100.0 * near / pixels if checked else None
+        level = evidence.level if checked else None
+        with self._lock:
+            since = self._since
+            since.add(clipped_percent, near_percent)
+            self._raw_sequence += 1
+            self._raw_latest = RawSaturationStats(
+                self._raw_sequence, STATUS_CHECKED if checked else STATUS_NOT_CHECKED, reason, pixels, clipped, near,
+                level, near_threshold(level, self._counter.near_ratio) if checked else None,
+                evidence.provenance if checked else None, self._count_ms if checked else None,
+                since.frames, since.checked, since.saturated, since.near, since.peak_clipped, since.peak_near)
 
     def _configuration_key(self, frame):
         """What the level depends on: frame dtype, bin, delivered bits / pixel format, resets."""
@@ -182,7 +356,8 @@ class SaturationTracker:
                     logger.warning("Saturation not checked: %s", self._evidence.reason)
         return self._evidence
 
-    def track(self, frame, prepared, binner, row_crop=(0, 0), profiler=None) -> Optional[SaturationRecord]:
+    def track(self, frame, prepared, binner, row_crop=(0, 0), profiler=None,
+              counts=None) -> Optional[SaturationRecord]:
         """Saturation of one corrected frame, or ``None`` when it is not checked.
 
         Args:
@@ -193,6 +368,9 @@ class SaturationTracker:
             row_crop: Keystone rows its binned line loses (``keystone_row_margin``).
             profiler: The loop's profiler (spans ``sat_total``, ``sat_pack`` and those of
                 :meth:`SaturationPropagator.frame`).
+            counts: This frame's :meth:`count` result: used as the mask's fast path (a frame
+                with nothing near saturation is not read again) when it was counted against
+                the same level.
 
         Never raises: a failure is logged once and the frame is not checked.
         """
@@ -211,12 +389,13 @@ class SaturationTracker:
             self._post(STATUS_NOT_CHECKED, "no correction snapshot for this frame")
             return None
         profiler = profiler if profiler is not None else _NO_PROFILER
+        known = counts[:2] if counts is not None and counts[2] == evidence.level else None
         t0 = time.perf_counter()
         try:
             with profiler.time("sat_total"):
                 result = self._propagator.frame(frame, evidence.level, prepared.hot, prepared.enabled,
                                                 prepared.calibration, prepared.inverted, binner,
-                                                row_crop=row_crop, profiler=profiler)
+                                                row_crop=row_crop, profiler=profiler, counts=known)
                 with profiler.time("sat_pack"):
                     record = SaturationRecord.from_frame(result, binner.w)
         except Exception as exc:                     # noqa: BLE001 - the mask must never stop acquisition
@@ -239,15 +418,21 @@ class SaturationTracker:
         sat_ms, record = self._frame_ms, self._frame_record
         near = bool(record is not None and record.any_near())
         clipped = bool(record is not None and record.any_clipped())
+        count, count_ms, pixels = self._frame_count, self._count_ms, self._frame_pixels
         now = time.monotonic()
         with self._lock:
-            self._live.append((now, sat_ms, float(busy_ms), near, clipped))
+            self._live.append((now, sat_ms, float(busy_ms), near, clipped, count_ms))
             while self._live and now - self._live[0][0] > LIVE_WINDOW_S:
                 self._live.popleft()
             scan = self._scan
             if scan is not None and recorded:
                 scan["frames"] += 1
                 scan["busy"].add(float(busy_ms))
+                if count is not None and pixels:
+                    scan["raw"].add(100.0 * count[0] / pixels, 100.0 * count[1] / pixels)
+                    scan["count"].add(count_ms)
+                else:
+                    scan["raw"].add(None, None)
                 if sat_ms is not None:
                     scan["checked"] += 1
                     scan["sat"].add(sat_ms)
@@ -266,6 +451,12 @@ class SaturationTracker:
 
     # ── readers (any thread) ────────────────────────────────
 
+    def latest_raw(self) -> Optional[RawSaturationStats]:
+        """The basic-detection mailbox: newest frame and totals since the reset (``None`` before
+        the first frame)."""
+        with self._lock:
+            return self._raw_latest
+
     def latest(self) -> Optional[SaturationLatest]:
         """The newest frame's saturation (``None`` before the first frame)."""
         with self._lock:
@@ -282,15 +473,18 @@ class SaturationTracker:
         with self._lock:
             live = list(self._live)
             latest = self._latest
-        sat = [s for _, s, _, _, _ in live if s is not None]
-        busy = [b for _, _, b, _, _ in live]
+        sat = [e[1] for e in live if e[1] is not None]
+        busy = [e[2] for e in live]
+        counted = [e[5] for e in live if e[5] is not None]
         info = {"tracking": self._enabled, "frames": len(live),
                 "status": latest.status if latest else None, "reason": latest.reason if latest else "",
                 "sat_ms": float(np.mean(sat)) if sat else None,
                 "sat_max_ms": float(np.max(sat)) if sat else None,
+                "count_ms": float(np.mean(counted)) if counted else None,
+                "count_max_ms": float(np.max(counted)) if counted else None,
                 "busy_ms": float(np.mean(busy)) if busy else None,
-                "near_frames": sum(1 for *_, n, _ in live if n),
-                "clipped_frames": sum(1 for *_, c in live if c)}
+                "near_frames": sum(1 for e in live if e[3]),
+                "clipped_frames": sum(1 for e in live if e[4])}
         if period_ms and info["busy_ms"] is not None:
             info["period_ms"] = float(period_ms)
             info["period_source"] = period_source or "measured"
@@ -299,11 +493,12 @@ class SaturationTracker:
         return info
 
     def start_scan(self) -> None:
-        """Start the per-recording totals (recording armed)."""
+        """Start the per-recording totals (recording armed) and :meth:`reset_peak`."""
         with self._lock:
             self._scan = {"tracking": self._enabled, "frames": 0, "checked": 0, "near_frames": 0,
                           "clipped_frames": 0, "sat": _Totals(), "busy": _Totals(), "levels": {},
-                          "not_checked": {}}
+                          "not_checked": {}, "raw": _Since(), "count": _Totals()}
+        self.reset_peak()
 
     def scan_info(self, period_ms: Optional[float] = None, period_source: Optional[str] = None) -> dict:
         """Totals since :meth:`start_scan` over the recorded frames (before any trim):
@@ -312,7 +507,9 @@ class SaturationTracker:
         ``levels`` (``[{'level', 'provenance', 'frames'}]``: every level frames were checked
         against), ``not_checked`` (``{reason: frames}``), ``period_ms`` / ``period_source`` (as
         in :meth:`live_info`; ``busy_max_ms > period_ms`` means some frame took longer than the
-        camera's period). ``{}`` before."""
+        camera's period). Basic detection of the same frames: ``raw_status``, ``raw_checked``,
+        ``raw_saturated_frames``, ``raw_near_frames``, ``raw_peak_clipped_percent``,
+        ``raw_peak_near_percent`` and ``count_ms`` / ``count_max_ms``. ``{}`` before."""
         with self._lock:
             scan = self._scan
             if scan is None:
@@ -323,6 +520,11 @@ class SaturationTracker:
                         levels=[{"level": level, "provenance": provenance, "frames": n}
                                 for (level, provenance), n in scan["levels"].items()],
                         not_checked=dict(scan["not_checked"]))
+            raw, counted = scan["raw"], scan["count"]
+            info.update(raw_status=raw.status(), raw_checked=raw.checked, raw_saturated_frames=raw.saturated,
+                        raw_near_frames=raw.near, raw_peak_clipped_percent=raw.peak_clipped,
+                        raw_peak_near_percent=raw.peak_near,
+                        count_ms=counted.mean(), count_max_ms=counted.peak if counted.n else None)
         if period_ms:
             info["period_ms"] = float(period_ms)
             info["period_source"] = period_source or "measured"
@@ -338,9 +540,15 @@ def format_scan_info(info: dict, summary: dict) -> str:
             f"frame {ms(info.get('busy_ms'))} ms mean / {ms(info.get('busy_max_ms'))} ms max")
     if period:
         cost += f" of a {period:.2f} ms frame period ({info.get('period_source', 'measured')})"
+    peak = info.get("raw_peak_clipped_percent")
+    raw = (f"raw {info.get('raw_status', '?')}: {info.get('raw_checked', 0)}/{info.get('frames', 0)} frames counted, "
+           f"{info.get('raw_saturated_frames', 0)} clipped (peak {'?' if peak is None else f'{peak:.3f}'} %), "
+           f"{info.get('raw_near_frames', 0)} near, count {ms(info.get('count_ms'))} ms mean / "
+           f"{ms(info.get('count_max_ms'))} ms max; ")
     levels = "; ".join(f"level {e['level']} ({e['provenance']}) x{e['frames']}" for e in info.get("levels") or [])
     skipped = "; ".join(f"{n} not checked: {reason}" for reason, n in (info.get("not_checked") or {}).items())
-    return (f"{summary.get('status')}: {summary.get('checked', 0)}/{summary.get('frames', 0)} frames checked, "
+    return (raw + f"mask {summary.get('status')}: {summary.get('checked', 0)}/{summary.get('frames', 0)} "
+            f"frames checked, "
             f"{summary.get('near_frames', 0)} near, {summary.get('clipped_frames', 0)} clipped, "
             f"{summary.get('bytes', 0) / 1024:.0f} KiB; {cost}"
             + (f"; {levels}" if levels else "") + (f"; {skipped}" if skipped else ""))

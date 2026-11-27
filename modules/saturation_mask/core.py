@@ -74,13 +74,17 @@ class RawSaturation:
         return self.raw_near_fraction > 0
 
 
-def detect_raw(raw, level, near_ratio: float = NEAR_RATIO) -> RawSaturation:
+def detect_raw(raw, level, near_ratio: float = NEAR_RATIO, counts=None) -> RawSaturation:
     """Clipped and near-saturated pixels of a raw sensor frame.
 
     Args:
         raw: 2-D raw frame (any numeric dtype); not modified.
         level: The camera's full scale (``backend.saturation_level()``), > 0.
         near_ratio: Share of ``level`` that counts as near saturation, in ``(0, 1]``.
+        counts: ``(clipped, near)`` of this frame against the same ``level`` and ``near_ratio``
+            when already counted (:func:`.count.count_saturated`, the basic detection): no
+            frame is read for a frame with nothing near saturation, and the masks of the others
+            are built without counting them again.
 
     Returns:
         RawSaturation: read-only masks; with nothing near saturation both masks are the same
@@ -99,15 +103,24 @@ def detect_raw(raw, level, near_ratio: float = NEAR_RATIO) -> RawSaturation:
     if not 0.0 < near_ratio <= 1.0:
         raise ValueError(f"near_ratio must be in (0, 1], got {near_ratio}")
     threshold = near_ratio * level
-    if raw.size == 0 or raw.max() < threshold:          # fast path: one reduction, no mask built
-        empty = _zeros(raw.shape, np.bool_)
+    if counts is not None:
+        n_clipped, n_near = (int(v) for v in counts)
+        if not 0 <= n_clipped <= n_near <= raw.size:
+            raise ValueError(f"counts {counts} do not fit a frame of {raw.size} pixels")
+    if raw.size == 0 or (n_near == 0 if counts is not None else raw.max() < threshold):
+        empty = _zeros(raw.shape, np.bool_)             # fast path: no mask built
         return RawSaturation(empty, empty, level, near_ratio, 0.0, 0.0)
     near = raw >= threshold
-    n_near = int(np.count_nonzero(near))
-    clipped = raw >= level
-    n_clipped = int(np.count_nonzero(clipped))
-    if n_clipped == n_near:                             # every near pixel clipped: one mask
-        clipped = near
+    if counts is None:
+        n_near = int(np.count_nonzero(near))
+    if counts is not None and n_clipped == n_near:
+        clipped = near                                  # every near pixel clipped: one mask
+    else:
+        clipped = raw >= level
+        if counts is None:
+            n_clipped = int(np.count_nonzero(clipped))
+        if n_clipped == n_near:
+            clipped = near
     clipped.setflags(write=False)
     near.setflags(write=False)
     size = float(raw.size)
@@ -480,7 +493,7 @@ class SaturationPropagator:
         return clipped, near
 
     def frame(self, raw, level, hot, enabled, calibration, inverted, binner,
-              row_crop: Tuple[int, int] = (0, 0), profiler=None) -> FrameSaturation:
+              row_crop: Tuple[int, int] = (0, 0), profiler=None, counts=None) -> FrameSaturation:
         """Saturation of one raw frame in the layout of its recorded, binned line.
 
         Args:
@@ -491,13 +504,16 @@ class SaturationPropagator:
             binner: The binner the frame is binned with (a subset: its bands only).
             row_crop: ``(top, bottom)`` keystone rows the binned frames lose.
             profiler: Optional object with ``time(name)``.
+            counts: ``(clipped, near)`` of ``raw`` already counted against ``level`` (the basic
+                detection): passed to :func:`detect_raw`, which then does not read the frame
+                again when nothing is near saturation.
 
         Returns:
             FrameSaturation: masks and fractions of shape ``(rows - top - bottom, n_bins)``.
         """
         profiler = profiler or _NoProfiler()
         with profiler.time("sat_detect"):
-            raw_saturation = detect_raw(raw, level, self.near_ratio)
+            raw_saturation = detect_raw(raw, level, self.near_ratio, counts=counts)
         rows = raw_saturation.near.shape[0]
         top, bottom = (max(0, int(v)) for v in row_crop)
         if top + bottom >= rows:

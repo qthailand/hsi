@@ -6,6 +6,8 @@ logical OR (any source tap with a non-zero weight), so a band that averaged in o
 is flagged even though its value is below full scale. CPU reference; the intensities are never
 touched.
 
+* :func:`count_saturated` / :class:`RawCounter` - basic detection: clipped and near-saturated raw
+  pixels counted in one pass, no mask (every acquired frame);
 * :func:`detect_raw` - clipped / near-saturated raw pixels (:class:`RawSaturation`);
 * :func:`hot_pixel_mask`, :class:`GeometryMask`, :func:`bin_masks`, :func:`crop_rows` - the stages;
 * :class:`SaturationPropagator` - a raw frame to :class:`FrameSaturation` (the binned layout);
@@ -33,10 +35,12 @@ Example:
 from .core import (NEAR_RATIO, POLICY, TAPS, FrameSaturation, GeometryMask, RawSaturation,
                    SaturationPropagator, bin_masks, crop_rows, detect_raw, hot_pixel_mask, pack_mask,
                    tap_support, tap_weights, unpack_mask)
+from .count import RawCounter, count_saturated, near_threshold
 from .record import (STATUS_CHECKED, STATUS_NOT_CHECKED, STATUS_PARTIAL, LevelEvidence, SaturationRecord,
                      level_evidence, scan_status, scan_summary)
 
 __all__ = ["NEAR_RATIO", "POLICY", "TAPS", "RawSaturation", "FrameSaturation", "GeometryMask",
+           "RawCounter", "count_saturated", "near_threshold",
            "SaturationPropagator", "detect_raw", "hot_pixel_mask", "bin_masks", "crop_rows",
            "tap_weights", "tap_support", "pack_mask", "unpack_mask",
            "STATUS_CHECKED", "STATUS_PARTIAL", "STATUS_NOT_CHECKED", "LevelEvidence", "level_evidence",

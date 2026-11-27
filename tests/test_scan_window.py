@@ -613,13 +613,11 @@ def test_ready_to_scan_lists_only_what_needs_attention():
     assert [text for _s, text, _a, _c in items][:2] == ["No dark frame", "No smile model"]
     items[0][3]()                                               # its Capture fix
     assert captured == [True]
-    import numpy as np
-    clipped = np.zeros((10, 100), np.uint16); clipped[0, :21] = 65535      # 2.1 % at full scale
-    win.histogram.update_histogram(clipped)
+    win.histogram.set_raw_saturation(_raw_stats(clipped=21))                  # 2.1 % of the raw frame
     win.set_ready_issue("pixel_pitch", "Pixel pitch not set", "Set", lambda: None)
     assert "2.10 % clipped" in win.ready_list.texts() and "Pixel pitch not set" in win.ready_list.texts()
     win.set_ready_issue("pixel_pitch", "")
-    win.histogram.update_histogram(np.zeros((10, 100), np.uint16))
+    win.histogram.set_raw_saturation(_raw_stats())
     win._refresh_inspector()
     assert "Pixel pitch not set" not in win.ready_list.texts() and "No clipped pixels" in win.ready_items()[1]
     win.close()
@@ -733,7 +731,8 @@ def test_live_column_cards_follow_sharpness_and_clipping():
     assert win.sharpness_tile.value_label.text() == "\u2014" and win.sharpness_tile.best() is None
     frame = np.full((40, 60), 100, np.uint16)
     frame[:, :3] = 65535
-    win.histogram.update_histogram(frame)
+    win.histogram.update_histogram(frame)                      # the bars: the displayed frame
+    win.histogram.set_raw_saturation(_raw_stats(clipped=50))   # the number: the engine's raw count
     win._refresh_inspector()
     assert win.clipped_tile.value_label.text() == "5.00 %"
     assert win.clipped_tile.bars.saturated[-1] > 0                # the clipped bar is red
@@ -743,30 +742,44 @@ def test_live_column_cards_follow_sharpness_and_clipping():
     win.close()
 
 
+def _raw_stats(**kw):
+    """The engine's basic-detection mailbox for 1000 raw pixels (``clipped`` of them)."""
+    from modules.acquisition.saturation_tracking import RawSaturationStats
+    base = dict(sequence=1, status="checked", reason="test", pixels=1000, clipped=0, near=0, level=65520,
+                near_level=64210, provenance="test camera", count_ms=0.1, frames=1, checked_frames=1,
+                saturated_frames=0, near_frames=0, peak_clipped_percent=0.0, peak_near_percent=0.0)
+    base.update(kw)
+    base.setdefault("near", base["clipped"])
+    if base["near"] < base["clipped"]:
+        base["near"] = base["clipped"]
+    return RawSaturationStats(**base)
+
+
 def test_clipped_keeps_the_max_since_reset_and_a_scan_resets_it():
-    """Now (this frame) and on the way (max since reset): Start scan resets the max."""
+    """Now (this frame) and on the way (the engine's max since reset): the button and Start scan
+    reset it, and ask the engine to (``peak_reset``)."""
     import config as app_config
-    import numpy as np
     from windows.scan_window import ScanWindow
     app = QApplication.instance() or QApplication([])
     win = ScanWindow(app_config.AppConfig())
     tile = win.clipped_tile
+    resets = []
+    tile.peak_reset.connect(lambda: resets.append(True))
     assert tile.max_label.text() == "\u2014"
-    frame = np.zeros((10, 100), np.uint16)
-    frame[0, :30] = 65535
-    tile.update_histogram(frame)                               # 3 % clipped
-    tile.update_histogram(np.zeros((10, 100), np.uint16))      # then none
-    assert tile.value_label.text() == "0.00 %" and tile.max_label.text() == "3.00 %"
+    tile.set_raw_saturation(_raw_stats(clipped=0, saturated_frames=4, peak_clipped_percent=3.0))
+    assert tile.value_label.text() == "0.00 %" and tile.max_label.text() == "max 3.00 %"
+    assert tile.frames_label.text() == "4 fr"                   # frames that clipped: in the title row
     assert "#F85149" in tile.max_label.styleSheet()             # it clipped on the way: red
-    assert tile.max_saturated_percent() == 3.0
+    assert tile.max_saturated_percent() == 3.0 and tile.saturated_frames() == 4
     tile.reset_btn.click()
     assert tile.max_label.text() == "\u2014" and "#F85149" not in tile.max_label.styleSheet()   # grey
-    tile.update_histogram(frame)
+    assert resets == [True]
+    tile.set_raw_saturation(_raw_stats(saturated_frames=1, peak_clipped_percent=3.0))
     win.set_scanning(True)                                     # Start scan: the max starts again
-    assert tile.max_saturated_percent() is None
-    tile.update_histogram(np.zeros((10, 100), np.uint16))
+    assert tile.max_saturated_percent() is None and resets == [True, True]
+    tile.set_raw_saturation(_raw_stats(peak_clipped_percent=0.0))
     win.set_scanning(True)                                     # already scanning: no reset
-    assert tile.max_saturated_percent() == 0.0
+    assert tile.max_saturated_percent() == 0.0 and resets == [True, True]
     win.set_scanning(False)
     assert tile.max_saturated_percent() == 0.0                 # the scan's max stays readable after it
     win.close()

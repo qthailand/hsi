@@ -420,14 +420,29 @@ class _MiniHistogram(QWidget):
 
 
 class ClippedTile(QFrame):
-    """Clipped card: the share of saturated pixels in the live frame, and the exposure histogram.
+    """Clipped card: confirmed clipping of the raw frames, and the exposure histogram.
 
-    It is the scan window's exposure histogram: feed it frames with :meth:`update_histogram`
-    (the maths is :func:`modules.live_view.exposure_histogram`), read
-    :meth:`saturated_percent`. Two questions, two numbers: is the slit clipped *now* (the big
-    number, this frame) and was it clipped *on the way* (the small number: the highest share since
-    :meth:`reset_peak`, which its button and every Start scan call; grey, red once it clipped).
+    The numbers come from the acquisition engine's basic detection (every acquired raw frame
+    counted before any correction against the camera's stated full scale), handed over with
+    :meth:`set_raw_saturation` from its mailbox
+    (:class:`modules.acquisition.saturation_tracking.RawSaturationStats`):
+
+    * the big number: clipped share of the newest frame (``raw >= level``); red above
+      ``warn_percent``, amber when only near full scale (``raw >= 98 %`` of it: the exposure
+      warning), *not checked* (grey) when the camera states no level;
+    * the small number: the highest clipped share and the frames that clipped since the last
+      reset (the engine keeps it over every frame, not only the displayed ones; its button and
+      every Start scan reset it), ``partial`` when some of those frames were not checked.
+
+    The bars are the histogram of the displayed frame (:meth:`update_histogram`, the maths is
+    :func:`modules.live_view.exposure_histogram`); they no longer set the numbers.
+
+    Signals:
+        peak_reset(): the max was reset (button or :meth:`reset_peak`); the host resets the
+            engine's peak.
     """
+
+    peak_reset = pyqtSignal()
 
     def __init__(self, warn_percent: float = 0.1, parent=None):
         super().__init__(parent)
@@ -435,7 +450,9 @@ class ClippedTile(QFrame):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.warn_percent = float(warn_percent)
         self._bit_depth = 16
+        self._stats = None
         self._percent = None
+        self._near_percent = None
         self._max_percent = None
         self.counts = None
         self.saturated_counts = None
@@ -449,17 +466,16 @@ class ClippedTile(QFrame):
         self.reset_btn.setIcon(qta.icon("fa5s.redo-alt", color=DIM))
         self.reset_btn.setToolTip("Reset the max (also done at every Start scan)")
         self.reset_btn.clicked.connect(self.reset_peak)
-        head.addWidget(title)
+        self.frames_label = QLabel()          # frames that clipped since the reset: in the title
+        head.addWidget(title)                 # row, so the value row fits a narrow tile
         head.addStretch(1)
+        head.addWidget(self.frames_label)
         head.addWidget(self.reset_btn)
         layout.addLayout(head)
         value_row = QHBoxLayout()
         value_row.setSpacing(6)
-        self.value_label = QLabel("—")
-        self.value_label.setToolTip("Clipped pixels in the live frame now")
+        self.value_label = QLabel("\u2014")
         self.max_label = QLabel()
-        self.max_label.setToolTip("Highest share of clipped pixels since the last reset (reset at every "
-                                  "Start scan): grey, or red if the slit clipped anywhere on the way")
         value_row.addWidget(self.value_label)
         value_row.addStretch(1)
         value_row.addWidget(self.max_label, 0, Qt.AlignBottom)
@@ -467,29 +483,111 @@ class ClippedTile(QFrame):
         self.bars = _MiniHistogram()
         layout.addWidget(self.bars)
         self._shown = None
-        self._style(False)
+        self._show_value()
         self._show_max()
-        self.bars.setToolTip("Histogram of the live frame; clipped pixels red")
+        self.bars.setToolTip("Histogram of the displayed frame; pixels at the display ceiling red")
 
-    def _style(self, warn: bool):
-        color = _AMBER if warn else TEXT
-        self.value_label.setStyleSheet(f"color: {color}; font-size: 22px; font-weight: 500; "
-                                       f"font-family: {MONO_FAMILY};")
+    # ── the numbers (engine's basic detection) ──────────────────
+
+    def set_raw_saturation(self, stats) -> None:
+        """Show the engine's basic detection (``RawSaturationStats``, or ``None``: no frame yet)."""
+        self._stats = stats
+        checked = stats is not None and stats.checked
+        self._percent = stats.clipped_percent if checked else None
+        self._near_percent = stats.near_percent if checked else None
+        self._max_percent = stats.peak_clipped_percent if stats is not None else None
+        self._show_value()
+        self._show_max()
+
+    def _show_value(self):
+        stats = self._stats
+        if stats is None:
+            text, color, size, tip = "\u2014", TEXT, 22, "Clipped pixels of the newest raw frame (no frame yet)"
+        elif not stats.checked:
+            text, color, size = "not checked", DIM, 13
+            tip = f"Clipping not checked: {stats.reason}"
+        else:
+            percent, near, size = self._percent, self._near_percent, 22
+            text = f"{percent:.2f} %"
+            if percent > self.warn_percent:
+                color = _RED_BAR                     # confirmed clipping
+            elif near > self.warn_percent:
+                color = _AMBER                       # near full scale: exposure warning
+            else:
+                color = TEXT
+            tip = (f"Clipped raw pixels (\u2265 {stats.level}) in the newest frame: {stats.clipped:,} of "
+                   f"{stats.pixels:,}\nNear full scale (\u2265 {stats.near_level}): {near:.2f} %"
+                   f"{' - lower the exposure' if near > self.warn_percent else ''}\nLevel: {stats.provenance}")
+        shown = (text, color, size)
+        if shown != self._shown:
+            self._shown = shown
+            self.value_label.setText(text)
+            self.value_label.setStyleSheet(f"color: {color}; font-size: {size}px; font-weight: 500; "
+                                           f"font-family: {MONO_FAMILY};")
+        self.value_label.setToolTip(tip)
+
+    def _show_max(self):
+        """Peak since the reset and the frames that clipped: grey, red once the slit clipped on
+        the way (above ``warn_percent``); prefixed ``\u2265`` when some frames were not checked
+        (partial: the true values are at least these)."""
+        stats, peak = self._stats, self._max_percent
+        clipped = peak is not None and peak > self.warn_percent
+        if peak is None:
+            text, frames = "\u2014", ""
+            tip = "Highest share of clipped pixels since the last reset (reset at every Start scan)"
+        else:
+            partial = stats.window_status == "partial"
+            at_least = "\u2265" if partial else ""
+            text = f"max {at_least}{peak:.2f} %"
+            frames = f"{at_least}{stats.saturated_frames} fr"
+            tip = (f"Since the last reset (every Start scan): highest clipped share {peak:.3f} %, "
+                   f"{stats.saturated_frames} of {stats.checked_frames} checked frames clipped, "
+                   f"{stats.near_frames} near full scale"
+                   + (f"\nPartial: {stats.frames - stats.checked_frames} of {stats.frames} frames not checked "
+                      f"(no stated level), so the true values are at least these" if partial else ""))
+        style = (f"color: {_RED_BAR if clipped else DIM}; font-size: 11px; "
+                 f"font-family: {MONO_FAMILY}; font-weight: {600 if clipped else 400};")
+        for label, value in ((self.max_label, text), (self.frames_label, frames)):
+            label.setText(value)
+            label.setToolTip(tip)
+            label.setStyleSheet(style)
+
+    def saturated_percent(self):
+        """Clipped share of the newest raw frame (%), or ``None`` (no frame, or not checked)."""
+        return self._percent
+
+    def near_percent(self):
+        """Near-full-scale share of the newest raw frame (%, clipped included), or ``None``."""
+        return self._near_percent
+
+    def check_status(self):
+        """``'checked'`` / ``'not_checked'`` of the newest frame, or ``None`` before one."""
+        return None if self._stats is None else self._stats.status
+
+    def max_saturated_percent(self):
+        """Highest clipped share (%) since the last reset, or ``None`` (no checked frame since)."""
+        return self._max_percent
+
+    def saturated_frames(self):
+        """Frames that clipped since the last reset, or ``None`` before the first frame."""
+        return None if self._stats is None else self._stats.saturated_frames
+
+    def reset_peak(self):
+        """Forget the max (the button, and every Start scan) and ask the engine to do so."""
+        self._max_percent = None
+        stats = self._stats
+        if stats is not None:
+            from dataclasses import replace
+            self._stats = replace(stats, frames=0, checked_frames=0, saturated_frames=0, near_frames=0,
+                                  peak_clipped_percent=None, peak_near_percent=None)
+        self._show_max()
+        self.peak_reset.emit()
+
+    # ── the bars (displayed frame) ──────────────────────────────
 
     def set_values(self, percent, counts=None, saturated=None):
-        """Show ``percent`` (``None``: no frame yet) and a 256-bin histogram, summed into bars.
-
-        Args:
-            percent: Saturated share of the frame (%), or ``None``.
-            counts: Pixels per display bin (any length), or ``None`` to keep the bars.
-            saturated: Saturated pixels per bin (same length), or ``None``: then the top bar
-                counts as saturated while ``percent`` is above zero.
-        """
-        text = "—" if percent is None else f"{percent:.2f} %"
-        if text != self._shown:
-            self._shown = text
-            self.value_label.setText(text)
-            self._style(percent is not None and percent > self.warn_percent)
+        """Draw a 256-bin histogram summed into bars (``percent``: share at the ceiling, used to
+        colour the top bar when ``saturated`` is not given; the numbers are not changed)."""
         if counts is None or not len(counts):
             return
         groups = np.array_split(np.asarray(counts, dtype=np.float64), CLIPPED_BARS)
@@ -504,41 +602,15 @@ class ClippedTile(QFrame):
             self.bars.saturated = sat
         self.bars.update()
 
-    # ── the exposure histogram ──────────────────────────────────
-
     def set_bit_depth(self, bit_depth: int):
         """Sensor bit depth used to scale frames to the 256 display bins (next frame on)."""
         self._bit_depth = int(bit_depth)
 
     def update_histogram(self, frame, ceiling=None):
-        """Count a raw frame: saturated share (per-pixel ``ceiling`` when given) and the bins."""
+        """Bars of the displayed frame (per-pixel ``ceiling`` colours the top red when given)."""
         from modules.live_view import exposure_histogram
-        self.counts, self.saturated_counts, self._percent = exposure_histogram(frame, self._bit_depth, ceiling)
-        if self._max_percent is None or self._percent > self._max_percent:
-            self._max_percent = self._percent
-            self._show_max()
-        self.set_values(self._percent, self.counts, self.saturated_counts)
-
-    def saturated_percent(self):
-        """Share of saturated pixels in the last frame (%), or ``None`` before the first frame."""
-        return self._percent
-
-    def max_saturated_percent(self):
-        """Highest share of saturated pixels (%) since :meth:`reset_peak`, or ``None`` (no frame since)."""
-        return self._max_percent
-
-    def reset_peak(self):
-        """Forget the max: it counts again from the next frame (the button, and every Start scan)."""
-        self._max_percent = None
-        self._show_max()
-
-    def _show_max(self):
-        """The max as a bare number: grey, red once the slit clipped on the way (above ``warn_percent``)."""
-        peak = self._max_percent
-        clipped = peak is not None and peak > self.warn_percent
-        self.max_label.setText("—" if peak is None else f"{peak:.2f} %")
-        self.max_label.setStyleSheet(f"color: {_RED_BAR if clipped else DIM}; font-size: 11px; "
-                                     f"font-family: {MONO_FAMILY}; font-weight: {600 if clipped else 400};")
+        self.counts, self.saturated_counts, ceiling_percent = exposure_histogram(frame, self._bit_depth, ceiling)
+        self.set_values(ceiling_percent, self.counts, self.saturated_counts)
 
 
 __all__ += ["SharpnessTile", "ClippedTile", "live_column_stylesheet", "card_frame", "format_sharpness"]
